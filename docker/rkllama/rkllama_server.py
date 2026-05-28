@@ -788,15 +788,15 @@ async def transcribe():
 @app.post("/api/embed")
 @app.post("/api/embeddings")
 async def embed(request: Request):
-    """Embedding 端点 (BGE-small-zh, 384 维).
+    """Embedding 端点 (bge-m3, 1024 维).
 
     DeepTutor RAG 管道通过此端点获取文本向量.
     PC 开发模式返回零向量桩; 生产环境需 rknn-llm embedding API.
 
     v6.9: 接入 model_registry, 验证模型文件存在性.
     """
-    EMBED_MODEL = "bge-small-zh"
-    EMBED_DIM = 384
+    EMBED_MODEL = "bge-m3"
+    EMBED_DIM = 1024
 
     try:
         body = await request.json()

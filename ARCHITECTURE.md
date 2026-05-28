@@ -123,7 +123,7 @@
 │  │  r1-distill    │  │  ◆ FastAPI 后端   │  │   错题本              │  │
 │  │  deepseekocr   │  │  ◆ Next.js 前端   │  │   每日统计            │  │
 │  │  qwen3-vl      │  │  ◆ 多用户系统     │  │   Ebbinghaus 复习     │  │
-│  │  bge-small-zh  │  │  ◆ 知识库索引     │  │   家长报告            │  │
+│  │  bge-m3         │  │  ◆ 知识库索引     │  │   家长报告            │  │
 │  └────────────────┘  └──────────────────┘  └────────────────────────┘  │
 │                                                                         │
 │  图例:                                                                  │
@@ -361,7 +361,7 @@ NPU LLM 服务，运行在 RK3576 NPU 上。
 | r1-distill-1.5b | 1.5B | text | 591 MB | 常驻 |
 | deepseekocr-3b | 3B | OCR | 1.8 GB | 惰性 |
 | qwen3-vl-2b | 2B | vision | 1.1 GB | 惰性 |
-| bge-small-zh | — | embedding | — | — |
+| bge-m3 | — | embedding | — | — |
 
 非文本模型惰性加载以节省内存。
 
