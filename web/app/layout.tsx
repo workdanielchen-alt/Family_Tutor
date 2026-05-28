@@ -29,10 +29,8 @@ export default function RootLayout({
       suppressHydrationWarning
       data-scroll-behavior="smooth"
     >
-      <head>
-        <ThemeScript />
-      </head>
       <body className="font-sans bg-[var(--background)] text-[var(--foreground)]">
+        <ThemeScript />
         <AppShellProvider>
           <I18nClientBridge>{children}</I18nClientBridge>
           <ToastViewport />

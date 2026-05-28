@@ -1,16 +1,24 @@
 /**
  * Knowledge base page.
- *
- * Intentionally server-rendered without a Suspense boundary so React 19
- * never needs to interleave concurrent Suspense resolution with route
- * transitions — this avoids the commitPlacement insertBefore crash
- * (Space → Knowledge → Space). The inner <KnowledgePage /> client
- * component handles its own deferred loading state.
  */
+import { Suspense } from "react";
+import { Loader2 } from "lucide-react";
 import KnowledgePage from "@/components/knowledge/KnowledgePage";
 
 export const dynamic = "force-dynamic";
 
+function LoadingFallback() {
+  return (
+    <div className="flex h-full items-center justify-center bg-[var(--background)]">
+      <Loader2 className="h-5 w-5 animate-spin text-[var(--muted-foreground)]" />
+    </div>
+  );
+}
+
 export default function Page() {
-  return <KnowledgePage />;
+  return (
+    <Suspense fallback={<LoadingFallback />}>
+      <KnowledgePage />
+    </Suspense>
+  );
 }
