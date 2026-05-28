@@ -24,13 +24,19 @@ FROM --platform=$BUILDPLATFORM node:22-slim AS frontend-builder
 
 WORKDIR /app/web
 
+ARG NPM_REGISTRY
+
 # Copy package files first for better caching
 COPY web/package.json web/package-lock.json* ./
 
 # Install dependencies with generous timeout for CI environments
+# Use npmmirror mirror in China (override via build-arg NPM_REGISTRY=...)
+# HTTP_PROXY/HTTPS_PROXY build-args automatically become env vars in BuildKit
+# and are used by npm/node for SWC binary download.
 RUN npm config set fetch-timeout 600000 && \
     npm config set fetch-retries 5 && \
-    npm ci --legacy-peer-deps
+    npm config set registry "${NPM_REGISTRY:-https://registry.npmmirror.com}" && \
+    npm install --legacy-peer-deps
 
 # Copy frontend source code
 COPY web/ ./
@@ -53,7 +59,10 @@ RUN printf '%s\n' \
     > .env.local
 
 # Build Next.js for production with standalone output
-RUN npm run build
+# HTTP_PROXY for SWC binary download (passed via build-arg from docker-compose)
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+RUN env http_proxy=${HTTP_PROXY:-} https_proxy=${HTTPS_PROXY:-} npm run build
 
 # ============================================
 # Stage 1b: Node Runtime for Target Platform
@@ -67,6 +76,12 @@ FROM node:22-slim AS node-runtime
 # Stage 2: Python Base with Dependencies
 # ============================================
 FROM python:3.11-slim AS python-base
+
+# HTTP_PROXY build-arg for apt/pip/rustup (China network)
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ENV HTTP_PROXY=${HTTP_PROXY} \
+    HTTPS_PROXY=${HTTPS_PROXY}
 
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -102,6 +117,9 @@ COPY requirements/ ./requirements/
 COPY requirements.txt ./
 RUN pip install --upgrade pip && \
     pip install -r requirements.txt
+
+# Unset proxy at end of stage so downstream stages don't inherit it
+ENV HTTP_PROXY= HTTPS_PROXY=
 
 # ============================================
 # Stage 3: Production Image
@@ -225,8 +243,8 @@ BACKEND_PORT=${BACKEND_PORT:-8001}
 
 echo "[Backend]  🚀 Starting FastAPI backend on port ${BACKEND_PORT}..."
 
-# Apply platform extraction hook and start uvicorn in the SAME process so the
-# monkey-patch of extract_text_from_bytes survives into the server runtime.
+# Apply platform extraction hook + platform API proxy and start uvicorn
+# in the SAME process so all monkey-patches survive into the server runtime.
 exec python -c "
 import scripts.extractor_platform_hook
 import uvicorn

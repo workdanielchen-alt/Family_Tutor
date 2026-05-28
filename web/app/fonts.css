@@ -1,0 +1,160 @@
+/*
+ * Self-hosted Google Fonts for offline Docker build.
+ * Fonts: Plus Jakarta Sans, Lora
+ */
+:root {
+  --font-sans: 'plus-jakarta-sans', system-ui, sans-serif;
+  --font-serif: 'lora', Georgia, serif;
+}
+
+@font-face {
+  font-family: 'plus-jakarta-sans';
+  font-style: normal;
+  font-weight: 200;
+  font-display: swap;
+  src: url(/fonts/plus-jakarta-sans-200.ttf) format('truetype');
+}
+
+@font-face {
+  font-family: 'plus-jakarta-sans';
+  font-style: italic;
+  font-weight: 200;
+  font-display: swap;
+  src: url(/fonts/plus-jakarta-sans-200-italic.ttf) format('truetype');
+}
+
+@font-face {
+  font-family: 'plus-jakarta-sans';
+  font-style: normal;
+  font-weight: 300;
+  font-display: swap;
+  src: url(/fonts/plus-jakarta-sans-300.ttf) format('truetype');
+}
+
+@font-face {
+  font-family: 'plus-jakarta-sans';
+  font-style: italic;
+  font-weight: 300;
+  font-display: swap;
+  src: url(/fonts/plus-jakarta-sans-300-italic.ttf) format('truetype');
+}
+
+@font-face {
+  font-family: 'plus-jakarta-sans';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url(/fonts/plus-jakarta-sans-400.ttf) format('truetype');
+}
+
+@font-face {
+  font-family: 'plus-jakarta-sans';
+  font-style: italic;
+  font-weight: 400;
+  font-display: swap;
+  src: url(/fonts/plus-jakarta-sans-400-italic.ttf) format('truetype');
+}
+
+@font-face {
+  font-family: 'plus-jakarta-sans';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url(/fonts/plus-jakarta-sans-500.ttf) format('truetype');
+}
+
+@font-face {
+  font-family: 'plus-jakarta-sans';
+  font-style: italic;
+  font-weight: 500;
+  font-display: swap;
+  src: url(/fonts/plus-jakarta-sans-500-italic.ttf) format('truetype');
+}
+
+@font-face {
+  font-family: 'plus-jakarta-sans';
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url(/fonts/plus-jakarta-sans-600.ttf) format('truetype');
+}
+
+@font-face {
+  font-family: 'plus-jakarta-sans';
+  font-style: italic;
+  font-weight: 600;
+  font-display: swap;
+  src: url(/fonts/plus-jakarta-sans-600-italic.ttf) format('truetype');
+}
+
+@font-face {
+  font-family: 'plus-jakarta-sans';
+  font-style: italic;
+  font-weight: 700;
+  font-display: swap;
+  src: url(/fonts/plus-jakarta-sans-700-italic.ttf) format('truetype');
+}
+
+@font-face {
+  font-family: 'lora';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url(/fonts/lora-400.ttf) format('truetype');
+}
+
+@font-face {
+  font-family: 'lora';
+  font-style: italic;
+  font-weight: 400;
+  font-display: swap;
+  src: url(/fonts/lora-400-italic.ttf) format('truetype');
+}
+
+@font-face {
+  font-family: 'lora';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url(/fonts/lora-500.ttf) format('truetype');
+}
+
+@font-face {
+  font-family: 'lora';
+  font-style: italic;
+  font-weight: 500;
+  font-display: swap;
+  src: url(/fonts/lora-500-italic.ttf) format('truetype');
+}
+
+@font-face {
+  font-family: 'lora';
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url(/fonts/lora-600.ttf) format('truetype');
+}
+
+@font-face {
+  font-family: 'lora';
+  font-style: italic;
+  font-weight: 600;
+  font-display: swap;
+  src: url(/fonts/lora-600-italic.ttf) format('truetype');
+}
+
+@font-face {
+  font-family: 'lora';
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url(/fonts/lora-700.ttf) format('truetype');
+}
+
+@font-face {
+  font-family: 'lora';
+  font-style: italic;
+  font-weight: 700;
+  font-display: swap;
+  src: url(/fonts/lora-700-italic.ttf) format('truetype');
+}

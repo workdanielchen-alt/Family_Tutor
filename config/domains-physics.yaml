@@ -1,0 +1,748 @@
+domain: physics
+title: 初中物理（人教版）
+description: 八年级至九年级完整知识点体系，覆盖中考全部考点
+grades:
+- id: 8
+  name: 八年级
+  semesters:
+  - id: s1
+    name: 八年级上册
+    chapters:
+    - id: ch01
+      number: 1
+      title: 机械运动
+      description: 长度与时间的测量、运动的描述、速度
+      importance: 运动学基础，中考常考
+      knowledge_points:
+      - id: length_time_measurement
+        name: 长度和时间的测量
+        description: 刻度尺的量程与分度值、读数估读、秒表读数、误差与多次测量取平均值
+        prerequisites: []
+        importance: 核心
+      - id: motion_description
+        name: 运动的描述
+        description: 参照物的选择、机械运动的概念、运动和静止的相对性（参照物不同结论不同）
+        prerequisites:
+        - physics/g8s1/ch01/length_time_measurement
+        importance: 核心
+      - id: motion_speed
+        name: 运动的快慢
+        description: 速度公式 v=s/t、单位换算 m/s→km/h、匀速直线运动与变速运动、平均速度
+        prerequisites:
+        - physics/g8s1/ch01/motion_description
+        importance: 核心
+      - id: average_speed_measurement
+        name: 测量平均速度
+        description: 斜面小车实验：原理 v=s/t、刻度尺测路程、秒表测时间、实验步骤与数据处理
+        prerequisites:
+        - physics/g8s1/ch01/motion_speed
+        importance: 核心
+    - id: ch02
+      number: 2
+      title: 声现象
+      description: 声音的产生与传播、特性、利用及噪声控制
+      importance: 基础考点，占 3-5 分
+      knowledge_points:
+      - id: sound_production_propagation
+        name: 声音的产生与传播
+        description: 声源概念、声音由物体振动产生、介质传声、真空不能传声、声速（固>液>气、15℃空气340m/s）
+        prerequisites: []
+        importance: 核心
+      - id: sound_characteristics
+        name: 声音的特性
+        description: 音调（频率决定、Hz）、响度（振幅决定、dB）、音色（发声体材料结构决定）、三种特性的区分
+        prerequisites:
+        - physics/g8s1/ch02/sound_production_propagation
+        importance: 核心
+      - id: sound_utilization
+        name: 声的利用
+        description: 超声波（回声定位、B超、声呐、清洗）、次声波（自然灾害预警）、声音传递信息与能量
+        prerequisites:
+        - physics/g8s1/ch02/sound_characteristics
+        importance: 基础
+      - id: noise_control
+        name: 噪声的危害和控制
+        description: 噪声来源（物理学角度和环保角度）、dB等级、控制三途径（声源处、传播过程中、人耳处）
+        prerequisites:
+        - physics/g8s1/ch02/sound_characteristics
+        importance: 基础
+    - id: ch03
+      number: 3
+      title: 物态变化
+      description: 温度、熔化和凝固、汽化和液化、升华和凝华
+      importance: 中考重点，占 5-8 分
+      knowledge_points:
+      - id: temperature
+        name: 温度
+        description: 温度的概念、摄氏温标规定、体温计与实验室温度计的区别与使用、量程和分度值
+        prerequisites: []
+        importance: 核心
+      - id: melting_freezing
+        name: 熔化和凝固
+        description: 晶体（有固定熔点）与非晶体（无固定熔点）的区别、熔化吸热凝固放热、熔点和凝固点、海波/冰/蜡的熔化实验
+        prerequisites:
+        - physics/g8s1/ch03/temperature
+        importance: 核心
+      - id: vaporization_liquefaction
+        name: 汽化和液化
+        description: 蒸发（任何温度下进行、吸热、影响蒸发快慢因素）与沸腾（达到沸点继续吸热）、液化放热两种方式（降温、压缩体积）
+        prerequisites:
+        - physics/g8s1/ch03/melting_freezing
+        importance: 核心
+      - id: sublimation_deposition
+        name: 升华和凝华
+        description: 升华（固态直接变气态、吸热，如干冰、碘、樟脑丸）与凝华（气态直接变固态、放热，如霜、雾凇、雪）
+        prerequisites:
+        - physics/g8s1/ch03/vaporization_liquefaction
+        importance: 核心
+      - id: phase_transition_water
+        name: 水的物态变化综合
+        description: 自然界水的三态循环（云雨雪雾露霜雹）、物态变化中的吸放热规律
+        prerequisites:
+        - physics/g8s1/ch03/sublimation_deposition
+        importance: 应用
+    - id: ch04
+      number: 4
+      title: 光现象
+      description: 光的直线传播、反射、折射、色散
+      importance: 中考重点，占 6-10 分
+      knowledge_points:
+      - id: light_rectilinear_propagation
+        name: 光的直线传播
+        description: 光源的概念、光在同种均匀介质中沿直线传播、影子的形成、日食月食、小孔成像、光速 3×10⁸m/s
+        prerequisites: []
+        importance: 核心
+      - id: light_reflection
+        name: 光的反射
+        description: 反射定律（三线共面、两线分居、两角相等）、镜面反射与漫反射、光路可逆、反射作图
+        prerequisites:
+        - physics/g8s1/ch04/light_rectilinear_propagation
+        importance: 核心
+      - id: plane_mirror_imaging
+        name: 平面镜成像
+        description: 平面镜成像特点（等大、等距、垂直、虚像）、实验探究方法（等效替代法）、成像作图、球面镜应用
+        prerequisites:
+        - physics/g8s1/ch04/light_reflection
+        importance: 核心
+      - id: light_refraction
+        name: 光的折射
+        description: 折射规律（三线共面、气→水折向法线、水→气远离法线）、光路可逆、池水变浅、筷子折断、海市蜃楼
+        prerequisites:
+        - physics/g8s1/ch04/light_reflection
+        importance: 核心
+      - id: light_dispersion
+        name: 光的色散
+        description: 白光通过三棱镜分解为七色光（红橙黄绿蓝靛紫）、色光三原色（红绿蓝）、红外线与紫外线的应用
+        prerequisites:
+        - physics/g8s1/ch04/light_refraction
+        importance: 基础
+    - id: ch05
+      number: 5
+      title: 透镜及其应用
+      description: 凸透镜和凹透镜、凸透镜成像规律、眼睛
+      importance: 中考重难点，占 6-10 分
+      knowledge_points:
+      - id: lens_concept
+        name: 透镜
+        description: 凸透镜（中间厚边缘薄、会聚作用）与凹透镜（中间薄边缘厚、发散作用）、主光轴、光心、焦点、焦距
+        prerequisites:
+        - physics/g8s1/ch04/light_refraction
+        importance: 核心
+      - id: convex_lens_imaging_law
+        name: 凸透镜成像规律
+        description: 物距与像距的关系（u>2f 倒立缩小实像、u=2f 等大、f<u<2f 放大实像、u<f 正立放大虚像）、规律总结（一倍焦距分虚实、二倍焦距分大小）
+        prerequisites:
+        - physics/g8s1/ch05/lens_concept
+        importance: 核心
+      - id: lens_applications
+        name: 生活中的透镜
+        description: 照相机（u>2f）、投影仪（f<u<2f）、放大镜（u<f）、显微镜和望远镜的成像原理
+        prerequisites:
+        - physics/g8s1/ch05/convex_lens_imaging_law
+        importance: 应用
+      - id: eye_glasses
+        name: 眼睛和眼镜
+        description: 眼睛成像原理（晶状体相当于凸透镜）、近视眼（凹透镜矫正）、远视眼/老花眼（凸透镜矫正）
+        prerequisites:
+        - physics/g8s1/ch05/convex_lens_imaging_law
+        importance: 应用
+    - id: ch06
+      number: 6
+      title: 质量与密度
+      description: 质量的概念、密度的定义与测量
+      importance: 中考重点，占 8-12 分
+      knowledge_points:
+      - id: mass_concept
+        name: 质量
+        description: 质量是物体的属性（不随位置形状状态温度改变）、单位（t、kg、g、mg）、托盘天平的使用方法（放、拨、调、称、读、收）
+        prerequisites: []
+        importance: 核心
+      - id: density_concept
+        name: 密度
+        description: 密度 ρ=m/V、同种物质质量与体积成正比、密度是物质特性（与质量和体积无关）、单位换算 1g/cm³=10³kg/m³
+        prerequisites:
+        - physics/g8s1/ch06/mass_concept
+        importance: 核心
+      - id: density_measurement
+        name: 测量物质的密度
+        description: 量筒的使用、测量固体密度（排水法）和液体密度（剩余法）的实验步骤、误差分析（先测质量还是先测体积）
+        prerequisites:
+        - physics/g8s1/ch06/density_concept
+        importance: 核心
+      - id: density_applications
+        name: 密度的应用
+        description: 鉴别物质、空心实心判断、合金/混合物密度计算、密度的社会应用（盐水选种、材料选择）
+        prerequisites:
+        - physics/g8s1/ch06/density_measurement
+        importance: 应用
+  - id: s2
+    name: 八年级下册
+    chapters:
+    - id: ch07
+      number: 7
+      title: 力
+      description: 力的概念、弹力、重力
+      importance: 力学基础，中考必考
+      knowledge_points:
+      - id: force_concept
+        name: 力
+        description: 力的定义（物体对物体的作用）、力的作用是相互的、力的作用效果（形变和改变运动状态）、力的三要素（大小方向作用点）、力的示意图
+        prerequisites: []
+        importance: 核心
+      - id: elasticity
+        name: 弹力
+        description: 弹力定义（发生弹性形变的物体产生的力）、弹簧测力计的原理（在弹性限度内伸长量与拉力成正比）、使用与读数
+        prerequisites:
+        - physics/g8s2/ch07/force_concept
+        importance: 核心
+      - id: gravity
+        name: 重力
+        description: 重力定义（由于地球吸引而受到的力）、重力方向（竖直向下、铅垂线）、重心、G=mg 公式（g=9.8N/kg）、重力与质量的区别
+        prerequisites:
+        - physics/g8s2/ch07/elasticity
+        importance: 核心
+    - id: ch08
+      number: 8
+      title: 运动和力
+      description: 牛顿第一定律、二力平衡、摩擦力
+      importance: 力学核心，中考重点
+      knowledge_points:
+      - id: newton_first_law
+        name: 牛顿第一定律
+        description: 阻力对物体运动的影响实验（斜面小车）、牛顿第一定律内容（一切物体在不受力时总保持匀速直线运动或静止状态）、惯性概念及现象解释
+        prerequisites:
+        - physics/g8s2/ch07/force_concept
+        importance: 核心
+      - id: force_balance
+        name: 二力平衡
+        description: 平衡状态（静止或匀速直线运动）、二力平衡条件（同体等大反向共线）、平衡力与相互作用力的区别
+        prerequisites:
+        - physics/g8s2/ch08/newton_first_law
+        importance: 核心
+      - id: friction
+        name: 摩擦力
+        description: 摩擦力的定义及分类（静摩擦、滑动摩擦、滚动摩擦）、滑动摩擦力的大小（压力大小和接触面粗糙程度决定）、增大/减小摩擦的方法
+        prerequisites:
+        - physics/g8s2/ch08/force_balance
+        importance: 核心
+    - id: ch09
+      number: 9
+      title: 压强
+      description: 压强概念、液体压强、大气压强、流体压强
+      importance: 力学核心，中考重点占 8-12 分
+      knowledge_points:
+      - id: pressure_concept
+        name: 压强
+        description: 压力与重力的区别、压强 p=F/S（定义、单位Pa）、增大/减小压强的方法、压强计算
+        prerequisites:
+        - physics/g8s2/ch07/force_concept
+        importance: 核心
+      - id: liquid_pressure
+        name: 液体的压强
+        description: 液体压强特点（液体内部向各个方向都有压强、深度越大压强越大、同一深度各方向相等）、p=ρgh公式推导与应用、连通器原理及应用
+        prerequisites:
+        - physics/g8s2/ch09/pressure_concept
+        importance: 核心
+      - id: atmospheric_pressure
+        name: 大气压强
+        description: 大气压的存在（马德堡半球实验）、托里拆利实验测大气压值（1标准大气压=760mmHg=1.013×10⁵Pa）、大气压随高度升高而降低、沸点与气压的关系
+        prerequisites:
+        - physics/g8s2/ch09/pressure_concept
+        importance: 核心
+      - id: fluid_pressure_velocity
+        name: 流体压强与流速的关系
+        description: 流体流速越大的位置压强越小（伯努利原理）、飞机升力（机翼上下表面流速差产生压强差）、火车站安全线、船吸现象
+        prerequisites:
+        - physics/g8s2/ch09/atmospheric_pressure
+        importance: 核心
+    - id: ch10
+      number: 10
+      title: 浮力
+      description: 浮力的概念、阿基米德原理、物体的浮沉条件
+      importance: 力学重难点，中考占 10-15 分
+      knowledge_points:
+      - id: buoyancy_concept
+        name: 浮力
+        description: 浮力的定义（液体/气体对浸入其中的物体向上的托力）、浮力产生原因（上下表面压力差）、称重法测浮力 F浮=G-F示
+        prerequisites:
+        - physics/g8s2/ch09/liquid_pressure
+        importance: 核心
+      - id: archimedes_principle
+        name: 阿基米德原理
+        description: 阿基米德原理实验探究、F浮=G排=ρ液gV排公式及应用、影响浮力大小的因素（液体密度和排开液体体积）
+        prerequisites:
+        - physics/g8s2/ch10/buoyancy_concept
+        importance: 核心
+      - id: floating_conditions
+        name: 物体的浮沉条件及应用
+        description: 浮沉条件（F浮>G上浮、F浮=G悬浮/漂浮、F浮<G下沉）、密度与浮沉的关系、轮船（空心法增大V排）、潜水艇（改变自重）、气球飞艇（改变浮力）、密度计
+        prerequisites:
+        - physics/g8s2/ch10/archimedes_principle
+        importance: 核心
+      - id: buoyancy_calculation
+        name: 浮力综合计算
+        description: 浮力四种计算方法（称重法、阿基米德原理法、平衡法、压力差法）、浮力与压强密度综合题、液面升降问题
+        prerequisites:
+        - physics/g8s2/ch10/floating_conditions
+        importance: 应用
+    - id: ch11
+      number: 11
+      title: 功和机械能
+      description: 功和功率、动能和势能、机械能转化
+      importance: 中考重点，占 8-12 分
+      knowledge_points:
+      - id: work_concept
+        name: 功
+        description: 做功的两个必要因素（力和在力的方向上移动的距离）、W=Fs公式、不做功的三种情况（有力无距、有距无力、力距垂直）
+        prerequisites:
+        - physics/g8s2/ch07/force_concept
+        importance: 核心
+      - id: power
+        name: 功率
+        description: 功率 P=W/t 表示做功快慢、单位W和kW、P=Fv推导公式、功率的计算与实际应用
+        prerequisites:
+        - physics/g8s2/ch11/work_concept
+        importance: 核心
+      - id: kinetic_potential_energy
+        name: 动能和势能
+        description: 动能（质量越大速度越大动能越大）、重力势能（质量越大高度越大势能越大）、弹性势能（弹性形变越大势能越大）、决定因素实验探究
+        prerequisites:
+        - physics/g8s2/ch11/work_concept
+        importance: 核心
+      - id: mechanical_energy_conversion
+        name: 机械能及其转化
+        description: 动能与势能相互转化（滚摆、单摆、过山车）、机械能守恒（只有动能势能转化时机械能总量不变）、水能和风能的利用
+        prerequisites:
+        - physics/g8s2/ch11/kinetic_potential_energy
+        importance: 核心
+    - id: ch12
+      number: 12
+      title: 简单机械
+      description: 杠杆、滑轮、机械效率
+      importance: 中考重点，占 8-12 分
+      knowledge_points:
+      - id: lever
+        name: 杠杆
+        description: 杠杆五要素（支点、动力、阻力、动力臂、阻力臂）、杠杆平衡条件 F1L1=F2L2 实验探究、三类杠杆（省力/费力/等臂杠杆）及实例
+        prerequisites:
+        - physics/g8s2/ch07/force_concept
+        importance: 核心
+      - id: pulley
+        name: 滑轮
+        description: 定滑轮（不省力但改变方向）、动滑轮（省一半力但费距离）、滑轮组的绕绳方法及省力规律 F=G/n、s=nh
+        prerequisites:
+        - physics/g8s2/ch12/lever
+        importance: 核心
+      - id: mechanical_efficiency
+        name: 机械效率
+        description: 有用功、额外功、总功的概念、机械效率 η=W有用/W总、滑轮组和斜面的机械效率计算与影响因素、提高机械效率的方法
+        prerequisites:
+        - physics/g8s2/ch12/pulley
+        importance: 核心
+- id: 9
+  name: 九年级
+  semesters:
+  - id: s1
+    name: 九年级上册
+    chapters:
+    - id: ch13
+      number: 13
+      title: 内能
+      description: 分子热运动、内能、比热容
+      importance: 热学基础，中考占 5-8 分
+      knowledge_points:
+      - id: molecular_thermal_motion
+        name: 分子热运动
+        description: 扩散现象（分子无规则运动）、分子热运动与温度的关系（温度越高运动越剧烈）、分子间的作用力（引力和斥力同时存在）
+        prerequisites: []
+        importance: 核心
+      - id: internal_energy
+        name: 内能
+        description: 内能的定义（物体内部所有分子热运动的动能与分子势能总和）、内能与温度质量状态的关系、改变内能的两种方式（做功和热传递）
+        prerequisites:
+        - physics/g9s1/ch13/molecular_thermal_motion
+        importance: 核心
+      - id: specific_heat_capacity
+        name: 比热容
+        description: 比热容的定义与物理意义、c=Q/mΔt公式、水的比热容大的应用（散热/供暖/调节气候）、热量的计算 Q=cmΔt
+        prerequisites:
+        - physics/g9s1/ch13/internal_energy
+        importance: 核心
+      - id: heat_calculation
+        name: 热量的综合计算
+        description: 吸热放热公式 Q=cmΔt 的灵活运用、温度变化量的计算、热平衡方程 Q吸=Q放
+        prerequisites:
+        - physics/g9s1/ch13/specific_heat_capacity
+        importance: 应用
+    - id: ch14
+      number: 14
+      title: 内能的利用
+      description: 热机、热机效率、能量守恒
+      importance: 热学应用，中考占 3-5 分
+      knowledge_points:
+      - id: heat_engine
+        name: 热机
+        description: 热机的定义与种类（蒸汽机、内燃机、汽轮机等）、四冲程汽油机（吸气压缩做功排气）的工作过程、压缩冲程机械能→内能、做功冲程内能→机械能
+        prerequisites:
+        - physics/g9s1/ch13/internal_energy
+        importance: 核心
+      - id: heat_engine_efficiency
+        name: 热机的效率
+        description: 热值 q=Q/m（燃料完全燃烧放热）、热机效率 η=W有用/Q放、提高热机效率的途径、Q=qm 和 Q=qV 的计算
+        prerequisites:
+        - physics/g9s1/ch14/heat_engine
+        importance: 核心
+      - id: energy_conservation
+        name: 能量的转化和守恒
+        description: 各种形式的能量转化实例、能量守恒定律（能量既不会凭空产生也不会凭空消失、总量不变）、永动机不可能制成的原因
+        prerequisites:
+        - physics/g9s1/ch14/heat_engine_efficiency
+        importance: 核心
+    - id: ch15
+      number: 15
+      title: 电流和电路
+      description: 电荷、电流、电路、串并联
+      importance: 电学基础，中考必考
+      knowledge_points:
+      - id: electric_charge
+        name: 两种电荷
+        description: 正电荷与负电荷（丝绸摩擦玻璃棒带正电、毛皮摩擦橡胶棒带负电）、电荷间的相互作用（同种相斥异种相吸）、摩擦起电的实质（电子转移）、导体与绝缘体
+        prerequisites: []
+        importance: 核心
+      - id: current_circuit
+        name: 电流和电路
+        description: 电流方向（正电荷定向移动方向）、电路的组成（电源导线开关用电器）、电路图绘制规范、三种电路状态（通路断路短路）
+        prerequisites:
+        - physics/g9s1/ch15/electric_charge
+        importance: 核心
+      - id: series_parallel
+        name: 串联和并联
+        description: 串联电路（电流只有一条路径）和并联电路（电流有多条路径）的区分、串并联电路的特点、根据电路图连接实物图和根据实物图画电路图
+        prerequisites:
+        - physics/g9s1/ch15/current_circuit
+        importance: 核心
+      - id: current_measurement
+        name: 电流的测量
+        description: 电流表的使用规则（串联、正进负出、不超量程、不直接接电源两极）、电流表的读数方法、串并联电路中电流的规律实验探究
+        prerequisites:
+        - physics/g9s1/ch15/series_parallel
+        importance: 核心
+    - id: ch16
+      number: 16
+      title: 电压 电阻
+      description: 电压、电阻、变阻器
+      importance: 电学核心，中考必考
+      knowledge_points:
+      - id: voltage
+        name: 电压
+        description: 电压的作用（使自由电荷定向移动形成电流）、电压表使用规则（并联、正进负出、不超量程）、串并联电路中电压的规律实验探究
+        prerequisites:
+        - physics/g9s1/ch15/current_circuit
+        importance: 核心
+      - id: voltage_law
+        name: 串并联电路中电压的规律
+        description: 串联电路总电压等于各用电器两端电压之和 U=U1+U2、并联电路各支路两端电压相等 U=U1=U2
+        prerequisites:
+        - physics/g9s1/ch16/voltage
+        importance: 核心
+      - id: resistance
+        name: 电阻
+        description: 电阻的定义（导体对电流的阻碍作用）、单位Ω、影响电阻大小的因素（材料长度横截面积温度）、导体半导体超导体的概念
+        prerequisites:
+        - physics/g9s1/ch16/voltage
+        importance: 核心
+      - id: rheostat
+        name: 变阻器
+        description: 滑动变阻器的原理（改变接入电路中的电阻丝长度来改变电阻）、结构示意图和电路符号、连接方法（一上一下）、铭牌含义（最大阻值和允许通过最大电流）、应用（电位器）
+        prerequisites:
+        - physics/g9s1/ch16/resistance
+        importance: 核心
+    - id: ch17
+      number: 17
+      title: 欧姆定律
+      description: 电流与电压和电阻的关系、欧姆定律、电阻测量
+      importance: 电学核心，中考占 12-18 分
+      knowledge_points:
+      - id: ohm_law_concept
+        name: 电流与电压和电阻的关系
+        description: 控制变量法探究电流与电压的关系（电阻一定时I∝U）、电流与电阻的关系（电压一定时I∝1/R）
+        prerequisites:
+        - physics/g9s1/ch16/voltage
+        - physics/g9s1/ch16/resistance
+        importance: 核心
+      - id: ohm_law
+        name: 欧姆定律
+        description: 欧姆定律内容 I=U/R（导体中的电流与导体两端电压成正比与导体电阻成反比）、公式变形 U=IR 和 R=U/I、串并联电路的电阻特点
+        prerequisites:
+        - physics/g9s1/ch17/ohm_law_concept
+        importance: 核心
+      - id: resistance_measurement
+        name: 电阻的测量
+        description: 伏安法测电阻原理 R=U/I、电路图与实物连接、滑动变阻器的作用（改变电压和电流、保护电路）、多次测量求平均值减小误差、特殊方法测电阻
+        prerequisites:
+        - physics/g9s1/ch17/ohm_law
+        importance: 核心
+      - id: circuit_analysis
+        name: 动态电路分析
+        description: 滑动变阻器引起的电路变化分析、开关通断引起的电路变化、串并联电路综合分析与计算
+        prerequisites:
+        - physics/g9s1/ch17/ohm_law
+        importance: 应用
+    - id: ch18
+      number: 18
+      title: 电功率
+      description: 电能、电功率、焦耳定律
+      importance: 电学重难点，中考占 15-20 分
+      knowledge_points:
+      - id: electric_energy
+        name: 电能 电功
+        description: 电能表（电度表）的读数与参数含义、电功 W=UIt、单位换算 1kW·h=3.6×10⁶J
+        prerequisites:
+        - physics/g9s1/ch17/ohm_law
+        importance: 核心
+      - id: electric_power
+        name: 电功率
+        description: 电功率 P=W/t=UI、额定功率与实际功率的区别与计算、P=I²R 和 P=U²/R 的推导与选用、用电器铭牌的含义
+        prerequisites:
+        - physics/g9s1/ch18/electric_energy
+        importance: 核心
+      - id: lamp_power_measurement
+        name: 测量小灯泡的电功率
+        description: 伏安法测小灯泡电功率实验（原理 P=UI）、额定功率与实际功率的测量、U-I图像分析、灯泡亮暗由实际功率决定
+        prerequisites:
+        - physics/g9s1/ch18/electric_power
+        importance: 核心
+      - id: joule_law
+        name: 焦耳定律
+        description: 电流热效应、焦耳定律 Q=I²Rt 实验探究与公式应用、电热与电功的关系（纯电阻电路Q=W、非纯电阻电路Q<W）、电热的利用与防止
+        prerequisites:
+        - physics/g9s1/ch18/electric_power
+        importance: 核心
+      - id: electric_power_comprehensive
+        name: 电功率综合计算
+        description: 多档位用电器（高低档）分析、电热综合计算、电功率与欧姆定律的综合应用
+        prerequisites:
+        - physics/g9s1/ch18/joule_law
+        importance: 应用
+    - id: ch19
+      number: 19
+      title: 生活用电
+      description: 家庭电路、安全用电
+      importance: 电学应用，中考占 3-5 分
+      knowledge_points:
+      - id: household_circuit
+        name: 家庭电路
+        description: 家庭电路的组成（进户线→电能表→总开关→保险装置→用电器）、火线和零线（测电笔的使用）、三线插头与漏电保护器、空气开关
+        prerequisites:
+        - physics/g9s1/ch15/electric_charge
+        importance: 核心
+      - id: safe_electricity
+        name: 安全用电
+        description: 人体安全电压不高于36V、触电类型（单线触电和双线触电）、安全用电原则（不接触低压带电体不靠近高压带电体）、防雷（避雷针）
+        prerequisites:
+        - physics/g9s1/ch19/household_circuit
+        importance: 核心
+  - id: s2
+    name: 九年级下册
+    chapters:
+    - id: ch20
+      number: 20
+      title: 电与磁
+      description: 磁现象、电生磁、磁生电、电动机发电机
+      importance: 电磁学核心，中考占 8-12 分
+      knowledge_points:
+      - id: magnetism
+        name: 磁现象 磁场
+        description: 磁极间的相互作用（同名相斥异名相吸）、磁场（磁体周围存在看不见的物质）、磁感线的方向（从N极出发回到S极）、地磁场（指南针原理）
+        prerequisites: []
+        importance: 核心
+      - id: electric_magnetism
+        name: 电生磁
+        description: 奥斯特实验（电流的磁效应）、通电螺线管的磁场（安培定则判断N/S极）、电磁铁（磁性强弱与电流线圈匝数铁芯的关系）及应用（电磁继电器）
+        prerequisites:
+        - physics/g9s2/ch20/magnetism
+        - physics/g9s1/ch15/current_circuit
+        importance: 核心
+      - id: electric_motor
+        name: 电动机
+        description: 磁场对通电导体的作用（安培力）、通电线圈在磁场中受力转动、直流电动机的基本构造（磁体线圈换向器电刷）和工作原理（电能→机械能）
+        prerequisites:
+        - physics/g9s2/ch20/electric_magnetism
+        importance: 核心
+      - id: electromagnetic_induction
+        name: 磁生电
+        description: 法拉第电磁感应现象（闭合电路的部分导体在磁场中做切割磁感线运动产生感应电流）、感应电流方向与磁场方向和导体运动方向有关、发电机原理（机械能→电能）
+        prerequisites:
+        - physics/g9s2/ch20/electric_magnetism
+        importance: 核心
+      - id: electromagnetic_waves
+        name: 电磁波
+        description: 电磁波的产生（迅速变化的电流产生电磁波）、电磁波在真空中的传播速度 c=3×10⁸m/s、波长频率波速的关系 c=λf、电磁波谱及其应用
+        prerequisites:
+        - physics/g9s2/ch20/electromagnetic_induction
+        importance: 基础
+    - id: ch21
+      number: 21
+      title: 信息的传递
+      description: 电话、电磁波、通信方式
+      importance: 基础考点，占 3-5 分
+      knowledge_points:
+      - id: telephone
+        name: 电话
+        description: 电话的基本原理（话筒把声信号→电信号、听筒把电信号→声信号）、电话交换机的作用、模拟通信与数字通信的区别
+        prerequisites:
+        - physics/g9s2/ch20/electromagnetic_waves
+        importance: 基础
+      - id: modern_communication
+        name: 现代通信方式
+        description: 微波通信（需要中继站）、卫星通信（地球同步卫星作为中继站）、光纤通信（光在光导纤维中多次全反射传输）、网络通信
+        prerequisites:
+        - physics/g9s2/ch21/telephone
+        importance: 基础
+    - id: ch22
+      number: 22
+      title: 能源与可持续发展
+      description: 能源分类、核能、能源与可持续发展
+      importance: 基础考点，占 3-5 分
+      knowledge_points:
+      - id: energy_types
+        name: 能源
+        description: 一次能源与二次能源、可再生能源与不可再生能源（煤石油天然气为不可再生、风能水能太阳能为可再生）、能源在人类社会发展中的作用
+        prerequisites: []
+        importance: 基础
+      - id: nuclear_energy
+        name: 核能
+        description: 核裂变（原子弹、核电站链式反应）与核聚变（氢弹、太阳内部热核反应）、核电站原理（核能→内能→机械能→电能）
+        prerequisites:
+        - physics/g9s2/ch22/energy_types
+        importance: 基础
+      - id: sustainable_energy
+        name: 能源与可持续发展
+        description: 太阳能（直接利用方式：光热转换光电转换）、能源消耗对环境的影响、未来能源发展方向（节能+新能源开发）
+        prerequisites:
+        - physics/g9s2/ch22/nuclear_energy
+        importance: 基础
+exam_topics:
+- id: phys_mechanics_basics
+  title: 机械运动与力
+  kp_list:
+  - physics/g8s1/ch01/motion_speed
+  - physics/g8s2/ch07/force_concept
+  - physics/g8s2/ch08/newton_first_law
+  - physics/g8s2/ch08/force_balance
+  - physics/g8s2/ch08/friction
+  description: 速度计算、力的示意图、二力平衡与摩擦力的综合应用
+  分值: 10-15
+- id: phys_pressure_buoyancy
+  title: 压强与浮力综合
+  kp_list:
+  - physics/g8s2/ch09/pressure_concept
+  - physics/g8s2/ch09/liquid_pressure
+  - physics/g8s2/ch09/atmospheric_pressure
+  - physics/g8s2/ch10/archimedes_principle
+  - physics/g8s2/ch10/floating_conditions
+  - physics/g8s2/ch10/buoyancy_calculation
+  description: 固体液体压强计算、浮力四种计算方法、浮沉条件的综合应用
+  分值: 15-20
+- id: phys_work_energy
+  title: 功、功率与机械效率
+  kp_list:
+  - physics/g8s2/ch11/work_concept
+  - physics/g8s2/ch11/power
+  - physics/g8s2/ch12/lever
+  - physics/g8s2/ch12/pulley
+  - physics/g8s2/ch12/mechanical_efficiency
+  description: 功和功率的计算、杠杆平衡条件应用、滑轮组绕绳与机械效率计算
+  分值: 10-15
+- id: phys_optics
+  title: 光学综合
+  kp_list:
+  - physics/g8s1/ch04/light_reflection
+  - physics/g8s1/ch04/plane_mirror_imaging
+  - physics/g8s1/ch04/light_refraction
+  - physics/g8s1/ch05/convex_lens_imaging_law
+  description: 光的反射折射定律作图、平面镜成像特点、凸透镜成像规律应用
+  分值: 8-12
+- id: phys_thermal
+  title: 热学综合
+  kp_list:
+  - physics/g8s1/ch03/melting_freezing
+  - physics/g8s1/ch03/vaporization_liquefaction
+  - physics/g9s1/ch13/specific_heat_capacity
+  - physics/g9s1/ch14/heat_engine_efficiency
+  description: 物态变化辨析、比热容和热值的综合计算、热机效率
+  分值: 8-12
+- id: phys_ohm_power
+  title: 欧姆定律与电功率
+  kp_list:
+  - physics/g9s1/ch17/ohm_law
+  - physics/g9s1/ch17/circuit_analysis
+  - physics/g9s1/ch18/electric_power
+  - physics/g9s1/ch18/joule_law
+  - physics/g9s1/ch18/electric_power_comprehensive
+  description: 动态电路分析、额定功率与实际功率、电热综合计算、多档位用电器
+  分值: 18-25
+- id: phys_electromagnetism
+  title: 电磁学综合
+  kp_list:
+  - physics/g9s2/ch20/electric_magnetism
+  - physics/g9s2/ch20/electric_motor
+  - physics/g9s2/ch20/electromagnetic_induction
+  description: 安培定则、电动机与发电机的原理对比、电磁感应现象
+  分值: 8-12
+levels:
+- id: foundation
+  name: 基础层
+  description: 概念理解、公式记忆、基本实验操作，中考 70% 基础题覆盖范围
+  typical_mastery_target: 0.9
+- id: core
+  name: 核心层
+  description: 核心规律应用、中档综合题，中考 20% 中档题覆盖范围
+  typical_mastery_target: 0.8
+- id: advanced
+  name: 拔高层
+  description: 电学压轴综合、力学浮力综合、实验探究题，中考 10% 难题覆盖范围
+  typical_mastery_target: 0.7
+review_strategy:
+  ch01_priority: high
+  ch02_priority: normal
+  ch03_priority: high
+  ch04_priority: high
+  ch05_priority: high
+  ch06_priority: high
+  ch07_priority: high
+  ch08_priority: high
+  ch09_priority: high
+  ch10_priority: high
+  ch11_priority: high
+  ch12_priority: high
+  ch13_priority: normal
+  ch14_priority: normal
+  ch15_priority: high
+  ch16_priority: high
+  ch17_priority: high
+  ch18_priority: high
+  ch19_priority: low
+  ch20_priority: high
+  ch21_priority: low
+  ch22_priority: low

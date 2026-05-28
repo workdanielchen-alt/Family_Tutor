@@ -1,0 +1,378 @@
+domain: chemistry
+title: 初中化学（人教版）
+description: 九年级全一册，覆盖中考全部考点
+grades:
+- id: 9
+  name: 九年级
+  semesters:
+  - id: s1
+    name: 九年级上册
+    chapters:
+    - id: ch01
+      number: 1
+      title: 走进化学世界
+      description: 物质的变化和性质、化学实验基本操作
+      importance: 化学入门基础
+      knowledge_points:
+      - id: chemical_changes
+        name: 物质的变化和性质
+        description: 物理变化（无新物质）与化学变化（有新物质）的区别，物理性质和化学性质的判断
+        prerequisites: []
+        importance: 核心
+      - id: chemistry_experiment_basics
+        name: 化学是一门以实验为基础的科学
+        description: 对蜡烛及其燃烧的探究、对人体吸入和呼出气体的探究，观察与描述实验现象
+        prerequisites:
+        - chemistry/g9s1/ch01/chemical_changes
+        importance: 核心
+      - id: lab_equipment_operations
+        name: 走进化学实验室
+        description: 常见仪器识别（试管、酒精灯、烧杯、量筒等）、基本操作（药品取用、加热、连接仪器、洗涤）
+        prerequisites:
+        - chemistry/g9s1/ch01/chemistry_experiment_basics
+        importance: 核心
+    - id: ch02
+      number: 2
+      title: 我们周围的空气
+      description: 空气的组成、氧气的性质与制取
+      importance: 元素化合物基础
+      knowledge_points:
+      - id: air_composition
+        name: 空气
+        description: 空气的成分（N₂约78%、O₂约21%）、空气中氧气含量的测定实验、纯净物与混合物的概念
+        prerequisites:
+        - chemistry/g9s1/ch01/lab_equipment_operations
+        importance: 核心
+      - id: oxygen_properties
+        name: 氧气
+        description: 氧气的物理性质（无色无味气体、密度比空气大、不易溶于水）、化学性质（与C、S、P、Fe反应）、化合反应与氧化反应
+        prerequisites:
+        - chemistry/g9s1/ch02/air_composition
+        importance: 核心
+      - id: oxygen_preparation
+        name: 制取氧气
+        description: 实验室制法（加热KMnO₄、H₂O₂+MnO₂）、催化剂与催化作用、分解反应、收集与验满方法
+        prerequisites:
+        - chemistry/g9s1/ch02/oxygen_properties
+        importance: 核心
+    - id: ch03
+      number: 3
+      title: 物质构成的奥秘
+      description: 分子原子、原子结构、元素
+      importance: 微观理论核心
+      knowledge_points:
+      - id: molecules_atoms
+        name: 分子和原子
+        description: 分子的性质（小、动、间隔）、原子的概念（化学变化中的最小粒子）、化学变化的微观实质（分子分裂→原子重组）
+        prerequisites:
+        - chemistry/g9s1/ch02/oxygen_properties
+        importance: 核心
+      - id: atomic_structure
+        name: 原子的结构
+        description: 原子核（质子+中子）与核外电子、核外电子排布（2-8-8规律）、离子（阳离子与阴离子）、相对原子质量
+        prerequisites:
+        - chemistry/g9s1/ch03/molecules_atoms
+        importance: 核心
+      - id: elements
+        name: 元素
+        description: 元素的概念（核电荷数相同的一类原子）、元素符号书写、元素周期表简介（周期与族）
+        prerequisites:
+        - chemistry/g9s1/ch03/atomic_structure
+        importance: 核心
+    - id: ch04
+      number: 4
+      title: 自然界的水
+      description: 水的净化、组成、化学式与化合价
+      importance: 化学用语起点
+      knowledge_points:
+      - id: water_purification
+        name: 水的净化
+        description: 沉淀、过滤（一贴二低三靠）、吸附（活性炭）、蒸馏、硬水与软水的区分与软化
+        prerequisites:
+        - chemistry/g9s1/ch01/lab_equipment_operations
+        importance: 核心
+      - id: water_composition
+        name: 水的组成
+        description: 电解水实验（正极O₂、负极H₂、体积比1:2）、水的组成结论、单质与化合物的概念、氧化物
+        prerequisites:
+        - chemistry/g9s1/ch04/water_purification
+        importance: 核心
+      - id: chemical_formula
+        name: 化学式与化合价
+        description: 化学式的意义与书写、常见元素化合价口诀、根据化学式的计算（相对分子质量、元素质量比、质量分数）
+        prerequisites:
+        - chemistry/g9s1/ch04/water_composition
+        importance: 核心
+      - id: water_resource_protection
+        name: 爱护水资源
+        description: 水资源概况、水体污染来源与防治措施、节约用水
+        prerequisites:
+        - chemistry/g9s1/ch04/water_purification
+        importance: 基础
+    - id: ch05
+      number: 5
+      title: 化学方程式
+      description: 质量守恒定律、化学方程式的书写与计算
+      importance: 化学计算核心
+      knowledge_points:
+      - id: mass_conservation_law
+        name: 质量守恒定律
+        description: 参加反应的各物质质量总和等于生成的各物质质量总和，微观本质（原子种类/数目/质量不变）
+        prerequisites:
+        - chemistry/g9s1/ch03/atomic_structure
+        importance: 核心
+      - id: chemical_equation_writing
+        name: 如何正确书写化学方程式
+        description: 书写原则（依据客观事实、遵循质量守恒）、配平方法（最小公倍数法、观察法），反应条件标注
+        prerequisites:
+        - chemistry/g9s1/ch05/mass_conservation_law
+        importance: 核心
+      - id: chemical_equation_calculation
+        name: 利用化学方程式的简单计算
+        description: 计算步骤：设未知→写方程式→找质量关系→列比例→求解→答，纯物质质量的计算
+        prerequisites:
+        - chemistry/g9s1/ch05/chemical_equation_writing
+        importance: 核心
+    - id: ch06
+      number: 6
+      title: 碳和碳的氧化物
+      description: 碳单质、二氧化碳的制取与性质、一氧化碳
+      importance: 元素化合物重点
+      knowledge_points:
+      - id: carbon_allotropes
+        name: 金刚石、石墨和C₆₀
+        description: 碳单质的物理性质差异（结构决定性质）、碳的化学性质（稳定性、可燃性、还原性）
+        prerequisites:
+        - chemistry/g9s1/ch03/elements
+        importance: 核心
+      - id: carbon_dioxide_preparation
+        name: 二氧化碳制取的研究
+        description: 实验室制法（CaCO₃+稀HCl）、发生装置与收集装置的选择、验满方法、工业制法
+        prerequisites:
+        - chemistry/g9s1/ch06/carbon_allotropes
+        importance: 核心
+      - id: carbon_oxides
+        name: 二氧化碳和一氧化碳
+        description: CO₂性质（不燃烧不支持燃烧、与水反应、与石灰水反应、温室效应）、CO性质（毒性、可燃性、还原性）
+        prerequisites:
+        - chemistry/g9s1/ch06/carbon_dioxide_preparation
+        importance: 核心
+    - id: ch07
+      number: 7
+      title: 燃料及其利用
+      description: 燃烧与灭火、化石燃料、新能源
+      importance: 化学与能源结合
+      knowledge_points:
+      - id: combustion_extinguishing
+        name: 燃烧和灭火
+        description: 燃烧条件（可燃物、氧气、温度达着火点）、灭火原理（隔离可燃物/隔绝氧气/降温）、易燃易爆物安全
+        prerequisites:
+        - chemistry/g9s1/ch06/carbon_oxides
+        importance: 核心
+      - id: fuel_energy
+        name: 燃料的合理利用与开发
+        description: 化石燃料（煤、石油、天然气）、化学反应中的能量变化（放热与吸热）、乙醇、氢能等新能源
+        prerequisites:
+        - chemistry/g9s1/ch07/combustion_extinguishing
+        importance: 核心
+  - id: s2
+    name: 九年级下册
+    chapters:
+    - id: ch08
+      number: 8
+      title: 金属和金属材料
+      description: 金属的性质、金属活动性顺序、金属资源的保护
+      importance: 元素化合物核心
+      knowledge_points:
+      - id: metal_materials
+        name: 金属材料
+        description: 金属的物理共性（导电、导热、延展性）、合金的概念与特性（硬度大、熔点低）
+        prerequisites:
+        - chemistry/g9s1/ch03/elements
+        importance: 基础
+      - id: metal_chemical_properties
+        name: 金属的化学性质
+        description: 与O₂反应（Mg/Al/Fe/Cu）、与酸反应（置换反应）、与盐溶液反应、金属活动性顺序表及其应用
+        prerequisites:
+        - chemistry/g9s1/ch05/chemical_equation_writing
+        importance: 核心
+      - id: metal_resources
+        name: 金属资源的利用和保护
+        description: 铁的冶炼（CO还原Fe₂O₃）、生铁与钢的区别、铁生锈条件与防锈措施、金属资源保护
+        prerequisites:
+        - chemistry/g9s2/ch08/metal_chemical_properties
+        importance: 核心
+    - id: ch09
+      number: 9
+      title: 溶液
+      description: 溶液的概念、溶解度、溶质质量分数
+      importance: 化学计算应用重点
+      knowledge_points:
+      - id: solution_formation
+        name: 溶液的形成
+        description: 溶液的概念（均一稳定的混合物）、溶质与溶剂、溶解过程中的放热与吸热（NaOH放热、NH₄NO₃吸热）、乳化现象
+        prerequisites:
+        - chemistry/g9s1/ch04/water_composition
+        importance: 核心
+      - id: solubility
+        name: 溶解度
+        description: 饱和溶液与不饱和溶液的转化、固体溶解度的概念（100g溶剂中溶解质量）、溶解度曲线及其应用、结晶方法（蒸发结晶/降温结晶）
+        prerequisites:
+        - chemistry/g9s2/ch09/solution_formation
+        importance: 核心
+      - id: solution_concentration
+        name: 溶液的浓度
+        description: 溶质质量分数=溶质质量/溶液质量×100%、配制一定质量分数的溶液步骤（计算→称量→溶解→装瓶）、稀释与浓缩计算
+        prerequisites:
+        - chemistry/g9s2/ch09/solubility
+        importance: 核心
+    - id: ch10
+      number: 10
+      title: 酸和碱
+      description: 常见的酸和碱、中和反应与pH
+      importance: 中考重点，占10-15分
+      knowledge_points:
+      - id: common_acids_bases
+        name: 常见的酸和碱
+        description: 盐酸（HCl）和硫酸（H₂SO₄）的性质与用途、氢氧化钠（NaOH）和氢氧化钙[Ca(OH)₂]的性质与用途、酸碱指示剂（紫色石蕊和酚酞）
+        prerequisites:
+        - chemistry/g9s1/ch05/chemical_equation_writing
+        importance: 核心
+      - id: neutralization_ph
+        name: 酸和碱的中和反应
+        description: 中和反应（酸+碱→盐+水）的实质（H⁺+OH⁻→H₂O）、pH与溶液酸碱性的关系、pH试纸的使用、中和反应在生活中的应用
+        prerequisites:
+        - chemistry/g9s2/ch10/common_acids_bases
+        importance: 核心
+    - id: ch11
+      number: 11
+      title: 盐 化肥
+      description: 常见的盐、复分解反应、化肥
+      importance: 中考重点，占8-12分
+      knowledge_points:
+      - id: common_salts
+        name: 生活中常见的盐
+        description: NaCl（用途、粗盐提纯）、Na₂CO₃（纯碱）、NaHCO₃（小苏打）、CaCO₃（石灰石），复分解反应的条件与判断、溶解性表的使用
+        prerequisites:
+        - chemistry/g9s2/ch10/neutralization_ph
+        importance: 核心
+      - id: chemical_fertilizers
+        name: 化学肥料
+        description: 氮肥（尿素、铵盐）、磷肥、钾肥、复合肥料，铵盐的鉴别（加碱研磨闻氨味），化肥的合理施用
+        prerequisites:
+        - chemistry/g9s2/ch11/common_salts
+        importance: 基础
+    - id: ch12
+      number: 12
+      title: 化学与生活
+      description: 营养物质、化学元素与健康、有机合成材料
+      importance: 基础考点，占4-8分
+      knowledge_points:
+      - id: nutrients
+        name: 人类重要的营养物质
+        description: 六大营养素（蛋白质、糖类、油脂、维生素、无机盐、水）及其生理功能、蛋白质变性与甲醛/重金属中毒
+        prerequisites: []
+        importance: 基础
+      - id: chemical_elements_health
+        name: 化学元素与人体健康
+        description: 常量元素（Ca、K、Na）与微量元素（Fe、Zn、I、Se）的生理作用、缺乏症与补充来源
+        prerequisites:
+        - chemistry/g9s2/ch12/nutrients
+        importance: 基础
+      - id: synthetic_materials
+        name: 有机合成材料
+        description: 有机化合物（有机小分子与有机高分子）、塑料（热塑性/热固性）、合成纤维与天然纤维的鉴别（灼烧法）、合成橡胶、白色污染与防治
+        prerequisites:
+        - chemistry/g9s2/ch12/nutrients
+        importance: 核心
+exam_topics:
+- id: chem_materials_properties
+  title: 物质的性质与变化
+  kp_list:
+  - chemistry/g9s1/ch01/chemical_changes
+  - chemistry/g9s1/ch01/lab_equipment_operations
+  - chemistry/g9s1/ch02/air_composition
+  - chemistry/g9s1/ch06/carbon_allotropes
+  - chemistry/g9s1/ch06/carbon_oxides
+  description: 中考第1-3题常规考点，常见物质的性质与鉴别
+  分值: 8-12
+- id: chem_micro_particles
+  title: 微观粒子与元素
+  kp_list:
+  - chemistry/g9s1/ch03/molecules_atoms
+  - chemistry/g9s1/ch03/atomic_structure
+  - chemistry/g9s1/ch03/elements
+  - chemistry/g9s1/ch04/chemical_formula
+  description: 分子原子离子、元素周期表、化合价与化学式
+  分值: 10-15
+- id: chem_equation_calculation
+  title: 化学方程式与计算
+  kp_list:
+  - chemistry/g9s1/ch05/mass_conservation_law
+  - chemistry/g9s1/ch05/chemical_equation_writing
+  - chemistry/g9s1/ch05/chemical_equation_calculation
+  - chemistry/g9s2/ch09/solution_concentration
+  description: 质量守恒定律、化学方程式的配平与计算、溶液浓度计算综合
+  分值: 12-18
+- id: chem_carbon_compounds
+  title: 碳及其化合物
+  kp_list:
+  - chemistry/g9s1/ch06/carbon_allotropes
+  - chemistry/g9s1/ch06/carbon_dioxide_preparation
+  - chemistry/g9s1/ch06/carbon_oxides
+  - chemistry/g9s1/ch07/combustion_extinguishing
+  description: 碳单质、CO₂实验室制法、CO与CO₂性质的综合考查
+  分值: 8-12
+- id: chem_metal_solution
+  title: 金属与溶液
+  kp_list:
+  - chemistry/g9s2/ch08/metal_chemical_properties
+  - chemistry/g9s2/ch08/metal_resources
+  - chemistry/g9s2/ch09/solubility
+  - chemistry/g9s2/ch09/solution_concentration
+  description: 金属活动性顺序、溶解度曲线、溶液浓度相关计算
+  分值: 15-20
+- id: chem_acid_base_salt
+  title: 酸碱盐综合
+  kp_list:
+  - chemistry/g9s2/ch10/common_acids_bases
+  - chemistry/g9s2/ch10/neutralization_ph
+  - chemistry/g9s2/ch11/common_salts
+  - chemistry/g9s2/ch11/chemical_fertilizers
+  description: 复分解反应、离子鉴别、除杂、酸碱盐的综合推断题
+  分值: 20-25
+- id: chem_experiment_inquiry
+  title: 实验探究综合
+  kp_list:
+  - chemistry/g9s1/ch02/oxygen_preparation
+  - chemistry/g9s1/ch06/carbon_dioxide_preparation
+  - chemistry/g9s1/ch04/water_purification
+  - chemistry/g9s2/ch08/metal_resources
+  description: 实验设计、现象分析、气体制取与净化综合探究
+  分值: 15-20
+levels:
+- id: foundation
+  name: 基础层
+  description: 概念理解、物质性质记忆、基本实验操作
+  typical_mastery_target: 0.9
+- id: core
+  name: 核心层
+  description: 化学方程式书写、计算、物质鉴别、核心实验
+  typical_mastery_target: 0.8
+- id: advanced
+  name: 拔高层
+  description: 酸碱盐推断、实验探究综合题
+  typical_mastery_target: 0.7
+review_strategy:
+  ch01_priority: high
+  ch02_priority: high
+  ch03_priority: high
+  ch04_priority: normal
+  ch05_priority: high
+  ch06_priority: high
+  ch07_priority: normal
+  ch08_priority: high
+  ch09_priority: high
+  ch10_priority: high
+  ch11_priority: high
+  ch12_priority: low

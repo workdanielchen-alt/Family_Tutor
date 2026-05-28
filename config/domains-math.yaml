@@ -1,0 +1,1399 @@
+domain: math
+title: 初中数学（人教版）
+description: 七年级至九年级完整知识点体系，覆盖中考全部考点
+grades:
+- id: 7
+  name: 七年级
+  semesters:
+  - id: s1
+    name: 七年级上册
+    chapters:
+    - id: ch01
+      number: 1
+      title: 有理数
+      description: 正负数、数轴、相反数、绝对值、有理数运算及科学记数法
+      importance: 中学数学基础，贯穿全部计算
+      knowledge_points:
+      - id: positive_negative_numbers
+        name: 正数和负数
+        description: 理解正负数表示相反意义的量，0 既不是正数也不是负数
+        prerequisites: []
+        importance: 基础
+      - id: number_line
+        name: 数轴
+        description: 数轴的三要素：原点、正方向、单位长度，能用数轴上的点表示有理数
+        prerequisites:
+        - math/g7s1/ch01/positive_negative_numbers
+        importance: 核心
+      - id: opposite_numbers
+        name: 相反数
+        description: 只有符号不同的两个数互为相反数，0 的相反数是 0
+        prerequisites:
+        - math/g7s1/ch01/number_line
+        importance: 核心
+      - id: absolute_value
+        name: 绝对值
+        description: 数轴上点到原点的距离，|a| 的非负性，几何意义和代数意义
+        prerequisites:
+        - math/g7s1/ch01/number_line
+        importance: 核心
+      - id: rational_comparison
+        name: 有理数的大小比较
+        description: 数轴法、正数>0>负数、两个负数绝对值大的反而小
+        prerequisites:
+        - math/g7s1/ch01/absolute_value
+        importance: 基础
+      - id: rational_addition
+        name: 有理数的加法
+        description: 同号/异号相加法则，加法交换律和结合律
+        prerequisites:
+        - math/g7s1/ch01/absolute_value
+        importance: 核心
+      - id: rational_subtraction
+        name: 有理数的减法
+        description: 减去一个数等于加上它的相反数，加减统一为加法
+        prerequisites:
+        - math/g7s1/ch01/rational_addition
+        importance: 核心
+      - id: rational_multiplication
+        name: 有理数的乘法
+        description: 同号得正异号得负，乘法交换/结合/分配律
+        prerequisites:
+        - math/g7s1/ch01/rational_subtraction
+        importance: 核心
+      - id: rational_division
+        name: 有理数的除法
+        description: 除以一个数等于乘以它的倒数，0 不能作除数
+        prerequisites:
+        - math/g7s1/ch01/rational_multiplication
+        importance: 核心
+      - id: rational_mixed_operations
+        name: 有理数的混合运算
+        description: 先乘方再乘除后加减，括号优先的运算顺序
+        prerequisites:
+        - math/g7s1/ch01/rational_division
+        importance: 核心
+      - id: exponents
+        name: 有理数的乘方
+        description: aⁿ 的意义，底数、指数、幂的概念，乘方运算
+        prerequisites:
+        - math/g7s1/ch01/rational_multiplication
+        importance: 核心
+      - id: scientific_notation
+        name: 科学记数法
+        description: 将一个数写成 a×10ⁿ (1≤a<10)，大数与小数表示法
+        prerequisites:
+        - math/g7s1/ch01/exponents
+        importance: 核心
+      - id: approximation
+        name: 近似数与有效数字
+        description: 四舍五入法取近似值，精确度与有效数字的概念
+        prerequisites:
+        - math/g7s1/ch01/scientific_notation
+        importance: 基础
+    - id: ch02
+      number: 2
+      title: 整式的加减
+      description: 代数式、单项式、多项式、合并同类项、去括号与整式加减
+      importance: 代数运算基础，承上启下
+      knowledge_points:
+      - id: algebraic_expression
+        name: 代数式
+        description: 用字母表示数的意义，列代数式，代数式的值
+        prerequisites:
+        - math/g7s1/ch01/rational_mixed_operations
+        importance: 基础
+      - id: monomial
+        name: 单项式
+        description: 单项式的定义、系数和次数
+        prerequisites:
+        - math/g7s1/ch01/rational_mixed_operations
+        importance: 核心
+      - id: polynomial
+        name: 多项式
+        description: 多项式的定义、项、次数、常数项，升/降幂排列
+        prerequisites:
+        - math/g7s1/ch02/monomial
+        importance: 核心
+      - id: like_terms
+        name: 同类项与合并同类项
+        description: 所含字母相同且相同字母指数相同的项，合并法则
+        prerequisites:
+        - math/g7s1/ch02/polynomial
+        importance: 核心
+      - id: removing_brackets
+        name: 去括号法则
+        description: 括号前为正号去括号不变号，为负号去括号全变号
+        prerequisites:
+        - math/g7s1/ch02/like_terms
+        importance: 核心
+      - id: polynomial_add_sub
+        name: 整式的加减运算
+        description: 去括号、找同类项、合并同类项的完整步骤
+        prerequisites:
+        - math/g7s1/ch02/removing_brackets
+        importance: 核心
+    - id: ch03
+      number: 3
+      title: 一元一次方程
+      description: 方程的概念、等式的性质、解一元一次方程及其应用
+      importance: 方程学习起点，中考基础考点
+      knowledge_points:
+      - id: equation_concept
+        name: 方程与一元一次方程的定义
+        description: 含未知数的等式，ax+b=0 (a≠0) 为标准形式
+        prerequisites:
+        - math/g7s1/ch02/polynomial_add_sub
+        importance: 基础
+      - id: equality_properties
+        name: 等式的性质
+        description: 等式两边同加/减/乘/除（除数不为 0）仍相等
+        prerequisites:
+        - math/g7s1/ch03/equation_concept
+        importance: 核心
+      - id: solving_linear_equation
+        name: 解一元一次方程
+        description: 去分母→去括号→移项→合并同类项→系数化为 1
+        prerequisites:
+        - math/g7s1/ch03/equality_properties
+        importance: 核心
+      - id: linear_equation_app_travel
+        name: 行程与工程问题（列方程）
+        description: 路程=速度×时间，工作总量=效率×时间
+        prerequisites:
+        - math/g7s1/ch03/solving_linear_equation
+        importance: 应用
+      - id: linear_equation_app_profit
+        name: 利润与分配问题（列方程）
+        description: 售价、进价、利润、利润率的关系，和差倍分问题
+        prerequisites:
+        - math/g7s1/ch03/solving_linear_equation
+        importance: 应用
+    - id: ch04
+      number: 4
+      title: 几何图形初步
+      description: 立体与平面图形、直线射线线段、角
+      importance: 几何入门基础
+      knowledge_points:
+      - id: geometric_figures
+        name: 立体图形与平面图形
+        description: 从实物中抽象几何体，展开图与三视图的初步认识
+        prerequisites: []
+        importance: 基础
+      - id: line_ray_segment
+        name: 直线、射线、线段
+        description: 直线无端点、射线一个端点、线段两个端点，两点确定一条直线
+        prerequisites:
+        - math/g7s1/ch04/geometric_figures
+        importance: 核心
+      - id: segment_measurement
+        name: 线段的度量与比较
+        description: 用刻度尺度量、叠合法比较、线段的和差、中点
+        prerequisites:
+        - math/g7s1/ch04/line_ray_segment
+        importance: 核心
+      - id: angle_concept
+        name: 角的概念与度量
+        description: 角的定义、度分秒换算、用量角器度量画图
+        prerequisites:
+        - math/g7s1/ch04/line_ray_segment
+        importance: 核心
+      - id: angle_comparison
+        name: 角的比较与运算
+        description: 叠合法比较、角的和差、角平分线
+        prerequisites:
+        - math/g7s1/ch04/angle_concept
+        importance: 核心
+      - id: complementary_supplementary_angles
+        name: 余角和补角
+        description: 互余（和为 90°）互补（和为 180°），等角的余角/补角相等
+        prerequisites:
+        - math/g7s1/ch04/angle_comparison
+        importance: 核心
+  - id: s2
+    name: 七年级下册
+    chapters:
+    - id: ch05
+      number: 5
+      title: 相交线与平行线
+      description: 对顶角、垂线、平行线的判定与性质、平移
+      importance: 几何推理起点，中考高频基础
+      knowledge_points:
+      - id: intersecting_lines
+        name: 相交线
+        description: 邻补角、对顶角的概念及其性质（对顶角相等）
+        prerequisites:
+        - math/g7s1/ch04/complementary_supplementary_angles
+        importance: 核心
+      - id: perpendicular
+        name: 垂线
+        description: 垂直的定义、垂线的画法、垂线段最短、点到直线的距离
+        prerequisites:
+        - math/g7s2/ch05/intersecting_lines
+        importance: 核心
+      - id: angles_formed_by_transversal
+        name: 同位角、内错角、同旁内角
+        description: 三线八角模型中三类角的位置特征
+        prerequisites:
+        - math/g7s2/ch05/intersecting_lines
+        importance: 核心
+      - id: parallel_lines_judgment
+        name: 平行线的判定
+        description: 同位角相等→平行，内错角相等→平行，同旁内角互补→平行
+        prerequisites:
+        - math/g7s2/ch05/angles_formed_by_transversal
+        importance: 核心
+      - id: parallel_lines_properties
+        name: 平行线的性质
+        description: 两直线平行→同位角/内错角相等、同旁内角互补
+        prerequisites:
+        - math/g7s2/ch05/parallel_lines_judgment
+        importance: 核心
+      - id: parallel_axiom
+        name: 平行公理及其推论
+        description: 过直线外一点有且只有一条平行线，平行于同一直线的两线平行
+        prerequisites:
+        - math/g7s2/ch05/parallel_lines_properties
+        importance: 基础
+      - id: translation
+        name: 平移
+        description: 平移的定义要素、对应点连线平行且相等的性质、平移作图
+        prerequisites:
+        - math/g7s2/ch05/parallel_lines_properties
+        importance: 基础
+    - id: ch06
+      number: 6
+      title: 实数
+      description: 平方根、立方根、实数的分类与运算
+      importance: 数系扩充，中考必考
+      knowledge_points:
+      - id: square_root
+        name: 算术平方根与平方根
+        description: √a 的定义、双重非负性、平方根的性质（正数两个、0 一个、负数无）
+        prerequisites:
+        - math/g7s1/ch01/exponents
+        importance: 核心
+      - id: cube_root
+        name: 立方根
+        description: ∛a 的定义、性质（正负零各一个立方根）
+        prerequisites:
+        - math/g7s1/ch01/exponents
+        importance: 核心
+      - id: irrational_numbers
+        name: 无理数
+        description: 无限不循环小数的概念，π 和 √2 等典型无理数
+        prerequisites:
+        - math/g7s2/ch06/square_root
+        importance: 核心
+      - id: real_numbers
+        name: 实数的分类与运算
+        description: 有理数和无理数统称实数，实数与数轴一一对应，实数运算
+        prerequisites:
+        - math/g7s2/ch06/irrational_numbers
+        importance: 核心
+      - id: approximate_calculation
+        name: 实数的近似计算
+        description: 用计算器求平方根/立方根的近似值，估算
+        prerequisites:
+        - math/g7s2/ch06/real_numbers
+        importance: 基础
+    - id: ch07
+      number: 7
+      title: 平面直角坐标系
+      description: 坐标系的建立、点的坐标、坐标与平移
+      importance: 函数学习基础，数形结合起点
+      knowledge_points:
+      - id: coordinate_system
+        name: 平面直角坐标系
+        description: x 轴、y 轴、原点、象限划分、点的坐标表示
+        prerequisites:
+        - math/g7s1/ch01/number_line
+        importance: 核心
+      - id: coordinate_quadrants
+        name: 各象限内点的坐标特征
+        description: 第一象限(+,+)、第二(−,+)、第三(−,−)、第四(+,−)，坐标轴上点的特征
+        prerequisites:
+        - math/g7s2/ch07/coordinate_system
+        importance: 核心
+      - id: coordinate_translation
+        name: 用坐标表示平移
+        description: 左右平移横坐标加减、上下平移纵坐标加减
+        prerequisites:
+        - math/g7s2/ch07/coordinate_quadrants
+        importance: 核心
+    - id: ch08
+      number: 8
+      title: 二元一次方程组
+      description: 二元一次方程（组）的概念、解法与实际应用
+      importance: 方程体系扩充，中考必考
+      knowledge_points:
+      - id: linear_equation_two_vars
+        name: 二元一次方程（组）的概念
+        description: 含有两个未知数且次数为 1，方程组的定义与解
+        prerequisites:
+        - math/g7s1/ch03/equation_concept
+        importance: 基础
+      - id: substitution_method
+        name: 代入消元法
+        description: 用一个未知数表示另一个，代入求解
+        prerequisites:
+        - math/g7s2/ch08/linear_equation_two_vars
+        importance: 核心
+      - id: elimination_method
+        name: 加减消元法
+        description: 使两个方程某未知数系数相等或相反，相加减消元
+        prerequisites:
+        - math/g7s2/ch08/linear_equation_two_vars
+        importance: 核心
+      - id: linear_system_applications
+        name: 二元一次方程组的应用
+        description: 行程、工程、配套、数字问题，设两个未知数列方程组
+        prerequisites:
+        - math/g7s2/ch08/elimination_method
+        importance: 应用
+    - id: ch09
+      number: 9
+      title: 不等式与不等式组
+      description: 不等式的概念、性质、解法及不等式组的解集
+      importance: 代数推理基础，中考常考
+      knowledge_points:
+      - id: inequality_concept
+        name: 不等式的概念与性质
+        description: 用不等号连接的式子，不等式两边同乘除负数方向改变
+        prerequisites:
+        - math/g7s1/ch03/equality_properties
+        importance: 核心
+      - id: inequality_solving
+        name: 一元一次不等式的解法
+        description: 去分母→去括号→移项→合并→系数化 1（注意乘除负数变号）
+        prerequisites:
+        - math/g7s2/ch09/inequality_concept
+        importance: 核心
+      - id: inequality_solution_set
+        name: 不等式的解集在数轴上的表示
+        description: 空心圈与实心点的区别、方向表示
+        prerequisites:
+        - math/g7s2/ch09/inequality_solving
+        importance: 核心
+      - id: inequality_system
+        name: 一元一次不等式组
+        description: 求公共解集，同大取大同小取小，大小小大中间找，大大小小找不到
+        prerequisites:
+        - math/g7s2/ch09/inequality_solution_set
+        importance: 核心
+      - id: inequality_applications
+        name: 不等式的实际应用
+        description: 至少/至多/不少于/不超过等关键词转化为不等式
+        prerequisites:
+        - math/g7s2/ch09/inequality_system
+        importance: 应用
+    - id: ch10
+      number: 10
+      title: 数据的收集、整理与描述
+      description: 调查方法、统计图表、频数分布
+      importance: 统计初步，中考基础
+      knowledge_points:
+      - id: survey_methods
+        name: 全面调查与抽样调查
+        description: 普查和抽查的适用场景，总体、个体、样本、样本容量
+        prerequisites: []
+        importance: 基础
+      - id: bar_pie_charts
+        name: 条形图和扇形图
+        description: 条形图表示具体数量，扇形图表示比例，能绘制和读取
+        prerequisites:
+        - math/g7s2/ch10/survey_methods
+        importance: 核心
+      - id: frequency_distribution
+        name: 频数分布表与直方图
+        description: 分组、频数累计、画频数分布直方图
+        prerequisites:
+        - math/g7s2/ch10/bar_pie_charts
+        importance: 核心
+- id: 8
+  name: 八年级
+  semesters:
+  - id: s1
+    name: 八年级上册
+    chapters:
+    - id: ch11
+      number: 11
+      title: 三角形
+      description: 三角形的边、角、高线中线角平分线、内角和外角
+      importance: 几何推理核心基础
+      knowledge_points:
+      - id: triangle_concept
+        name: 三角形的定义与分类
+        description: 按角分（锐角/直角/钝角）、按边分（不等边/等腰/等边）
+        prerequisites:
+        - math/g7s1/ch04/line_ray_segment
+        importance: 基础
+      - id: triangle_inequality
+        name: 三角形的三边关系
+        description: 两边之和大于第三边，两边之差小于第三边
+        prerequisites:
+        - math/g7s1/ch04/segment_measurement
+        importance: 核心
+      - id: triangle_height
+        name: 三角形的高、中线与角平分线
+        description: 三条重要线段的定义、画法、交点（垂心重心内心）
+        prerequisites:
+        - math/g8s1/ch11/triangle_concept
+        importance: 核心
+      - id: triangle_stability
+        name: 三角形的稳定性
+        description: 三角形具有稳定性，四边形不具有稳定性
+        prerequisites:
+        - math/g8s1/ch11/triangle_concept
+        importance: 基础
+      - id: triangle_angle_sum
+        name: 三角形的内角和
+        description: 三角形内角和等于 180°，证明方法及推论
+        prerequisites:
+        - math/g8s1/ch11/triangle_concept
+        importance: 核心
+      - id: triangle_exterior_angle
+        name: 三角形的外角
+        description: 外角定义、外角等于不相邻两内角和、外角大于不相邻内角
+        prerequisites:
+        - math/g8s1/ch11/triangle_angle_sum
+        importance: 核心
+      - id: polygon_angle_sum
+        name: 多边形的内角和与外角和
+        description: n 边形内角和 (n-2)×180°，外角和 360°
+        prerequisites:
+        - math/g8s1/ch11/triangle_exterior_angle
+        importance: 核心
+    - id: ch12
+      number: 12
+      title: 全等三角形
+      description: 全等三角形的判定、性质及应用
+      importance: 几何证明核心，中考重点
+      knowledge_points:
+      - id: congruence_concept
+        name: 全等三角形的概念与性质
+        description: 对应边相等、对应角相等、全等用 ≌ 表示
+        prerequisites:
+        - math/g8s1/ch11/triangle_angle_sum
+        importance: 基础
+      - id: congruence_sss
+        name: SSS（边边边）判定
+        description: 三边对应相等的两个三角形全等
+        prerequisites:
+        - math/g8s1/ch12/congruence_concept
+        importance: 核心
+      - id: congruence_sas
+        name: SAS（边角边）判定
+        description: 两边及其夹角对应相等的两个三角形全等
+        prerequisites:
+        - math/g8s1/ch12/congruence_concept
+        importance: 核心
+      - id: congruence_asa_aas
+        name: ASA（角边角）与 AAS（角角边）判定
+        description: 两角及其夹边、两角及其中一角的对边对应相等
+        prerequisites:
+        - math/g8s1/ch12/congruence_concept
+        importance: 核心
+      - id: congruence_hl
+        name: HL（斜边直角边）判定
+        description: 直角三角形专用的判定方法
+        prerequisites:
+        - math/g8s1/ch12/congruence_concept
+        importance: 核心
+      - id: congruence_applications
+        name: 全等三角形的应用
+        description: 利用全等进行测量、证明线段相等和角相等
+        prerequisites:
+        - math/g8s1/ch12/congruence_asa_aas
+        importance: 应用
+      - id: angle_bisector_theorem
+        name: 角平分线的性质与判定
+        description: 角平分线上的点到角两边距离相等，逆定理
+        prerequisites:
+        - math/g8s1/ch12/congruence_asa_aas
+        importance: 核心
+    - id: ch13
+      number: 13
+      title: 轴对称
+      description: 轴对称变换、垂直平分线、等腰三角形和等边三角形
+      importance: 几何变换核心，中考高频
+      knowledge_points:
+      - id: axial_symmetry_concept
+        name: 轴对称的概念与性质
+        description: 轴对称图形与图形成轴对称的区别、对应点连线被对称轴垂直平分
+        prerequisites:
+        - math/g7s2/ch05/perpendicular
+        importance: 核心
+      - id: perpendicular_bisector
+        name: 线段的垂直平分线
+        description: 性质定理和判定定理，尺规作图
+        prerequisites:
+        - math/g8s1/ch13/axial_symmetry_concept
+        importance: 核心
+      - id: isosceles_triangle
+        name: 等腰三角形的性质与判定
+        description: 等边对等角、等角对等边、三线合一
+        prerequisites:
+        - math/g8s1/ch13/perpendicular_bisector
+        importance: 核心
+      - id: equilateral_triangle
+        name: 等边三角形的性质与判定
+        description: 三边相等、三角 60°、三线合一、含 30° 角的直角三角形性质
+        prerequisites:
+        - math/g8s1/ch13/isosceles_triangle
+        importance: 核心
+      - id: shortest_path
+        name: 最短路径问题
+        description: 将军饮马模型，利用轴对称求最短路径
+        prerequisites:
+        - math/g8s1/ch13/axial_symmetry_concept
+        importance: 应用
+    - id: ch14
+      number: 14
+      title: 整式的乘法与因式分解
+      description: 幂的运算、整式乘法公式、因式分解方法
+      importance: 代数运算核心，中考高频
+      knowledge_points:
+      - id: power_rules
+        name: 幂的运算法则
+        description: aᵐ·aⁿ=aᵐⁿⁿ、(aᵐ)ⁿ=aᵐⁿⁿ、(ab)ⁿ=aⁿbⁿ
+        prerequisites:
+        - math/g7s1/ch01/exponents
+        importance: 核心
+      - id: polynomial_multiplication
+        name: 整式的乘法
+        description: 单项式乘单项式、单项式乘多项式、多项式乘多项式
+        prerequisites:
+        - math/g8s1/ch14/power_rules
+        importance: 核心
+      - id: difference_of_squares
+        name: 平方差公式
+        description: (a+b)(a-b)=a²-b²，公式的几何意义与运用
+        prerequisites:
+        - math/g8s1/ch14/polynomial_multiplication
+        importance: 核心
+      - id: perfect_square_formula
+        name: 完全平方公式
+        description: (a±b)²=a²±2ab+b²，公式的几何意义与运用
+        prerequisites:
+        - math/g8s1/ch14/polynomial_multiplication
+        importance: 核心
+      - id: factoring_gcf
+        name: 提公因式法因式分解
+        description: 找出各项公因式提出，注意符号变化
+        prerequisites:
+        - math/g8s1/ch14/polynomial_multiplication
+        importance: 核心
+      - id: factoring_formula
+        name: 公式法因式分解
+        description: 平方差公式 a²-b²=(a+b)(a-b)、完全平方公式 a²±2ab+b²=(a±b)²
+        prerequisites:
+        - math/g8s1/ch14/difference_of_squares
+        importance: 核心
+      - id: factoring_cross
+        name: 十字相乘法因式分解
+        description: x²+(p+q)x+pq=(x+p)(x+q) 的分解方法
+        prerequisites:
+        - math/g8s1/ch14/factoring_formula
+        importance: 进阶
+    - id: ch15
+      number: 15
+      title: 分式
+      description: 分式的定义、性质、运算及分式方程
+      importance: 代数运算核心，中考必考
+      knowledge_points:
+      - id: rational_expression_concept
+        name: 分式的概念与有意义条件
+        description: A/B 形式的式子，分母 B≠0，分式有意义的条件
+        prerequisites:
+        - math/g8s1/ch14/polynomial_multiplication
+        importance: 基础
+      - id: rational_expression_properties
+        name: 分式的基本性质
+        description: 分子分母同乘（除）同一个不为 0 的整式，分式值不变；约分和最简分式
+        prerequisites:
+        - math/g8s1/ch15/rational_expression_concept
+        importance: 核心
+      - id: rational_expression_operations
+        name: 分式的加减乘除运算
+        description: 同分母/异分母加减、乘法约分、除法变乘法、混合运算
+        prerequisites:
+        - math/g8s1/ch15/rational_expression_properties
+        importance: 核心
+      - id: integer_exponents
+        name: 整数指数幂
+        description: 负整数指数幂 a⁻ⁿ=1/aⁿ，科学记数法表示小数（同底数幂的推广）
+        prerequisites:
+        - math/g8s1/ch14/power_rules
+        importance: 核心
+      - id: fractional_equation
+        name: 分式方程及其解法
+        description: 去分母转化为整式方程、验根（最简公分母≠0）
+        prerequisites:
+        - math/g8s1/ch15/rational_expression_operations
+        importance: 核心
+      - id: fractional_equation_applications
+        name: 分式方程的应用
+        description: 工程问题、行程问题中的分式方程应用
+        prerequisites:
+        - math/g8s1/ch15/fractional_equation
+        importance: 应用
+  - id: s2
+    name: 八年级下册
+    chapters:
+    - id: ch16
+      number: 16
+      title: 二次根式
+      description: 二次根式的概念、性质和运算
+      importance: 代数基础，中考常考
+      knowledge_points:
+      - id: quadratic_root_concept
+        name: 二次根式的概念与有意义的条件
+        description: √a (a≥0) 的定义，被开方数非负的条件
+        prerequisites:
+        - math/g7s2/ch06/square_root
+        importance: 基础
+      - id: quadratic_root_properties
+        name: 二次根式的性质
+        description: (√a)²=a (a≥0)，√a²=|a|，√ab=√a·√b，√(a/b)=√a/√b
+        prerequisites:
+        - math/g8s2/ch16/quadratic_root_concept
+        importance: 核心
+      - id: quadratic_root_simplify
+        name: 二次根式的化简
+        description: 化简到最简二次根式（分母不含根号、被开方数不含开得尽的因式）
+        prerequisites:
+        - math/g8s2/ch16/quadratic_root_properties
+        importance: 核心
+      - id: quadratic_root_operations
+        name: 二次根式的加减乘除
+        description: 同类二次根式合并、乘除法则、混合运算
+        prerequisites:
+        - math/g8s2/ch16/quadratic_root_simplify
+        importance: 核心
+      - id: rationalizing_denominator
+        name: 分母有理化
+        description: 将分母中的根号化去，利用平方差公式进行分母有理化
+        prerequisites:
+        - math/g8s2/ch16/quadratic_root_operations
+        importance: 核心
+    - id: ch17
+      number: 17
+      title: 勾股定理
+      description: 勾股定理及其逆定理、实际应用
+      importance: 几何核心定理，中考高频
+      knowledge_points:
+      - id: pythagorean_theorem
+        name: 勾股定理
+        description: 直角三角形两直角边的平方和等于斜边平方 a²+b²=c²
+        prerequisites:
+        - math/g8s1/ch11/triangle_angle_sum
+        importance: 核心
+      - id: pythagorean_converse
+        name: 勾股定理的逆定理
+        description: 三角形三边满足 a²+b²=c² 则为直角三角形
+        prerequisites:
+        - math/g8s2/ch17/pythagorean_theorem
+        importance: 核心
+      - id: pythagorean_triples
+        name: 勾股数
+        description: 常见勾股数（3-4-5、5-12-13、8-15-17 等）及其倍数
+        prerequisites:
+        - math/g8s2/ch17/pythagorean_theorem
+        importance: 基础
+      - id: pythagorean_applications
+        name: 勾股定理的应用
+        description: 求线段长度、最短距离（展开图）、测量问题
+        prerequisites:
+        - math/g8s2/ch17/pythagorean_converse
+        importance: 应用
+    - id: ch18
+      number: 18
+      title: 平行四边形
+      description: 平行四边形的性质与判定、特殊平行四边形（矩形菱形正方形）
+      importance: 几何核心，中考重点
+      knowledge_points:
+      - id: parallelogram_properties
+        name: 平行四边形的性质
+        description: 对边平行且相等、对角相等、对角线互相平分
+        prerequisites:
+        - math/g7s2/ch05/parallel_lines_properties
+        importance: 核心
+      - id: parallelogram_judgment
+        name: 平行四边形的判定
+        description: 对边平行/相等、对角相等、对角线互相平分、一组对边平行且相等
+        prerequisites:
+        - math/g8s2/ch18/parallelogram_properties
+        importance: 核心
+      - id: rectangle
+        name: 矩形
+        description: 定义、性质（对角线相等、四个直角）、判定
+        prerequisites:
+        - math/g8s2/ch18/parallelogram_judgment
+        importance: 核心
+      - id: rhombus
+        name: 菱形
+        description: 定义、性质（对角线互相垂直平分、每条对角线平分一组对角）、判定
+        prerequisites:
+        - math/g8s2/ch18/parallelogram_judgment
+        importance: 核心
+      - id: square
+        name: 正方形
+        description: 定义、性质（矩形+菱形的综合性质）、判定
+        prerequisites:
+        - math/g8s2/ch18/rectangle
+        - math/g8s2/ch18/rhombus
+        importance: 核心
+      - id: triangle_midline
+        name: 三角形的中位线
+        description: 中位线平行于第三边且等于第三边的一半
+        prerequisites:
+        - math/g8s2/ch18/parallelogram_judgment
+        importance: 核心
+    - id: ch19
+      number: 19
+      title: 一次函数
+      description: 函数概念、一次函数图像与性质、待定系数法
+      importance: 函数学习核心，中考重点
+      knowledge_points:
+      - id: function_concept
+        name: 变量与函数的概念
+        description: 常量与变量、函数定义、函数的三种表示法（解析式/列表/图像）
+        prerequisites:
+        - math/g7s2/ch07/coordinate_system
+        importance: 基础
+      - id: linear_function_concept
+        name: 一次函数的定义与图像
+        description: y=kx+b (k≠0)，图像是一条直线，k 和 b 的几何意义
+        prerequisites:
+        - math/g8s2/ch19/function_concept
+        importance: 核心
+      - id: linear_function_properties
+        name: 一次函数的性质
+        description: k>0 y 随 x 增大而增大，k<0 y 随 x 增大而减小
+        prerequisites:
+        - math/g8s2/ch19/linear_function_concept
+        importance: 核心
+      - id: linear_function_drawing
+        name: 一次函数的图像画法
+        description: 两点法画直线，截距的概念
+        prerequisites:
+        - math/g8s2/ch19/linear_function_concept
+        importance: 核心
+      - id: undetermined_coefficients
+        name: 待定系数法求解析式
+        description: 已知两点或一点加斜率，列方程组求 k 和 b
+        prerequisites:
+        - math/g8s2/ch19/linear_function_properties
+        importance: 核心
+      - id: linear_function_vs_equation
+        name: 一次函数与方程/不等式的关系
+        description: y=0 对应一元一次方程，图像法解不等式
+        prerequisites:
+        - math/g8s2/ch19/linear_function_properties
+        importance: 核心
+      - id: linear_function_applications
+        name: 一次函数的实际应用
+        description: 分段函数、方案选择、最值问题
+        prerequisites:
+        - math/g8s2/ch19/undetermined_coefficients
+        importance: 应用
+    - id: ch20
+      number: 20
+      title: 数据的分析
+      description: 平均数、中位数、众数、方差
+      importance: 统计基础，中考常考
+      knowledge_points:
+      - id: central_tendency
+        name: 平均数、中位数与众数
+        description: 算术平均数、加权平均数、中位数排序取中间、众数出现最多
+        prerequisites:
+        - math/g7s2/ch10/bar_pie_charts
+        importance: 核心
+      - id: variance_std_dev
+        name: 方差与标准差
+        description: 方差衡量数据波动大小，S²=Σ(xᵢ-x̄)²/n，标准差为方差的算术平方根
+        prerequisites:
+        - math/g8s2/ch20/central_tendency
+        importance: 核心
+      - id: data_analysis_applications
+        name: 数据分析的实际应用
+        description: 选择合适的统计量描述数据集中趋势和离散程度
+        prerequisites:
+        - math/g8s2/ch20/variance_std_dev
+        importance: 应用
+- id: 9
+  name: 九年级
+  semesters:
+  - id: s1
+    name: 九年级上册
+    chapters:
+    - id: ch21
+      number: 21
+      title: 一元二次方程
+      description: 一元二次方程的定义、解法及应用
+      importance: 中考高频考点，占 8-12 分
+      knowledge_points:
+      - id: quadratic_equation_concept
+        name: 一元二次方程的定义
+        description: 理解 ax²+bx+c=0 (a≠0) 的标准形式，能识别二次项、一次项、常数项
+        prerequisites:
+        - math/g7s1/ch03/equation_concept
+        importance: 基础
+      - id: quadratic_equation_standard_form
+        name: 一元二次方程的一般形式
+        description: 能将方程化为 ax²+bx+c=0 的形式，正确确定 a、b、c 的值
+        prerequisites:
+        - math/g9s1/ch21/quadratic_equation_concept
+        importance: 基础
+      - id: direct_square_root_method
+        name: 直接开平方法
+        description: 利用平方根定义解形如 (x+n)²=p 的方程，理解 p≥0 时有解
+        prerequisites:
+        - math/g9s1/ch21/quadratic_equation_standard_form
+        importance: 基础
+      - id: factoring_method
+        name: 因式分解法解一元二次方程
+        description: 十字相乘法、提公因式法将方程化为 (x-p)(x-q)=0 求解
+        prerequisites:
+        - math/g9s1/ch21/quadratic_equation_standard_form
+        - math/g8s1/ch14/factoring_cross
+        importance: 核心
+      - id: completing_square_method
+        name: 配方法
+        description: 通过配方将方程化为 (x+n)²=p 的形式再开平方求解
+        prerequisites:
+        - math/g9s1/ch21/quadratic_equation_standard_form
+        - math/g9s1/ch21/direct_square_root_method
+        importance: 核心
+      - id: quadratic_formula
+        name: 公式法求根公式
+        description: x=[-b±√(b²-4ac)]/2a，掌握推导过程和直接应用
+        prerequisites:
+        - math/g9s1/ch21/completing_square_method
+        importance: 核心
+      - id: discriminant
+        name: 根的判别式 Δ=b²-4ac
+        description: Δ>0 两个不等实根，Δ=0 两个相等实根，Δ<0 无实根
+        prerequisites:
+        - math/g9s1/ch21/quadratic_formula
+        importance: 核心
+      - id: vieta_formulas
+        name: 韦达定理（根与系数的关系）
+        description: x₁+x₂=-b/a，x₁·x₂=c/a，及其在求值问题中的应用
+        prerequisites:
+        - math/g9s1/ch21/quadratic_formula
+        importance: 核心
+      - id: quadratic_equation_applications
+        name: 一元二次方程的应用题
+        description: 增长率问题、面积问题、利润问题、传播问题等列方程求解
+        prerequisites:
+        - math/g9s1/ch21/quadratic_formula
+        importance: 应用
+    - id: ch22
+      number: 22
+      title: 二次函数
+      description: 二次函数的图像与性质、解析式、实际应用
+      importance: 中考压轴题核心，占 12-18 分
+      knowledge_points:
+      - id: quadratic_function_concept
+        name: 二次函数的定义
+        description: 理解 y=ax²+bx+c (a≠0) 的定义，区分二次函数与其他函数
+        prerequisites:
+        - math/g8s2/ch19/linear_function_concept
+        importance: 基础
+      - id: quadratic_function_y_ax2
+        name: y=ax² 的图像与性质
+        description: 开口方向（a>0 向上，a<0 向下）、顶点、对称轴、增减性
+        prerequisites:
+        - math/g9s1/ch22/quadratic_function_concept
+        importance: 核心
+      - id: quadratic_function_y_ax_h2_k
+        name: y=a(x-h)²+k 的图像与性质
+        description: 顶点式、平移规律（左加右减、上加下减）
+        prerequisites:
+        - math/g9s1/ch22/quadratic_function_y_ax2
+        importance: 核心
+      - id: quadratic_function_general_form_properties
+        name: 一般式 y=ax²+bx+c 的图像与性质
+        description: 顶点坐标 (-b/2a, 4ac-b²/4a)、对称轴 x=-b/2a、最值
+        prerequisites:
+        - math/g9s1/ch22/quadratic_function_y_ax_h2_k
+        importance: 核心
+      - id: quadratic_function_three_forms
+        name: 二次函数的三种解析式
+        description: 一般式、顶点式、交点式（两根式），能根据不同条件选择合适形式
+        prerequisites:
+        - math/g9s1/ch22/quadratic_function_general_form_properties
+        importance: 核心
+      - id: quadratic_function_coefficient_roles
+        name: 系数 a、b、c 对图像的影响
+        description: a 决定开口和大小、c 为 y 轴截距、a 与 b 共同决定对称轴位置
+        prerequisites:
+        - math/g9s1/ch22/quadratic_function_general_form_properties
+        importance: 核心
+      - id: quadratic_function_vs_equation
+        name: 二次函数与一元二次方程的关系
+        description: 函数图像与 x 轴交点的横坐标即对应方程的解
+        prerequisites:
+        - math/g9s1/ch22/quadratic_function_general_form_properties
+        - math/g9s1/ch21/discriminant
+        importance: 核心
+      - id: quadratic_function_inequality
+        name: 二次函数与不等式
+        description: 利用函数图像解 ax²+bx+c>0 或 <0 的 x 取值范围
+        prerequisites:
+        - math/g9s1/ch22/quadratic_function_vs_equation
+        importance: 进阶
+      - id: quadratic_function_applications
+        name: 二次函数的实际应用
+        description: 最大利润问题、面积最值问题、抛物线型实际问题（拱桥、喷泉等）
+        prerequisites:
+        - math/g9s1/ch22/quadratic_function_three_forms
+        importance: 应用
+    - id: ch23
+      number: 23
+      title: 旋转
+      description: 旋转的定义、性质、中心对称及图案设计
+      importance: 中等考点，占 5-8 分
+      knowledge_points:
+      - id: rotation_concept
+        name: 旋转的定义与三要素
+        description: 旋转中心、旋转方向、旋转角度
+        prerequisites: []
+        importance: 基础
+      - id: rotation_properties
+        name: 旋转的性质
+        description: 对应点到旋转中心距离相等、对应点与旋转中心连线夹角相等、图形全等
+        prerequisites:
+        - math/g9s1/ch23/rotation_concept
+        importance: 核心
+      - id: central_symmetry
+        name: 中心对称
+        description: 中心对称的定义、性质、识别中心对称图形
+        prerequisites:
+        - math/g9s1/ch23/rotation_properties
+        importance: 核心
+      - id: central_symmetry_coordinates
+        name: 关于原点对称的点的坐标
+        description: 点 (x,y) 关于原点对称的点为 (-x,-y)
+        prerequisites:
+        - math/g9s1/ch23/central_symmetry
+        importance: 核心
+      - id: rotation_composition
+        name: 旋转与中心对称的综合应用
+        description: 在坐标系中完成旋转变换作图，旋转与平移/轴对称的组合
+        prerequisites:
+        - math/g9s1/ch23/central_symmetry_coordinates
+        importance: 进阶
+    - id: ch24
+      number: 24
+      title: 圆
+      description: 圆的有关性质、点与圆/直线与圆的位置关系、正多边形与圆
+      importance: 中考重难点，占 10-15 分
+      knowledge_points:
+      - id: circle_concept
+        name: 圆的定义及相关概念
+        description: 圆心、半径、弦、直径、弧（优弧/劣弧）、圆心角、圆周角
+        prerequisites: []
+        importance: 基础
+      - id: perpendicular_diameter_theorem
+        name: 垂径定理
+        description: 垂直于弦的直径平分弦及其所对的弧，及其逆定理
+        prerequisites:
+        - math/g9s1/ch24/circle_concept
+        importance: 核心
+      - id: arc_chord_central_angle
+        name: 弧、弦、圆心角的关系
+        description: 在同圆或等圆中，等圆心角对等弧、等弦
+        prerequisites:
+        - math/g9s1/ch24/circle_concept
+        importance: 核心
+      - id: inscribed_angle_theorem
+        name: 圆周角定理及其推论
+        description: 同弧所对圆周角等于圆心角的一半，直径所对圆周角为 90°
+        prerequisites:
+        - math/g9s1/ch24/circle_concept
+        importance: 核心
+      - id: circle_inscribed_quadrilateral
+        name: 圆内接四边形
+        description: 对角互补、外角等于内对角
+        prerequisites:
+        - math/g9s1/ch24/inscribed_angle_theorem
+        importance: 核心
+      - id: point_to_circle_distance
+        name: 点与圆的位置关系
+        description: 点在圆内 d<r、点在圆上 d=r、点在圆外 d>r
+        prerequisites:
+        - math/g9s1/ch24/circle_concept
+        importance: 基础
+      - id: circumcircle
+        name: 三角形的外接圆
+        description: 外心的定义与性质、锐角/直角/钝角三角形的外心位置
+        prerequisites:
+        - math/g9s1/ch24/point_to_circle_distance
+        importance: 核心
+      - id: line_to_circle_relations
+        name: 直线与圆的位置关系
+        description: 相离 d>r、相切 d=r、相交 d<r
+        prerequisites:
+        - math/g9s1/ch24/point_to_circle_distance
+        importance: 核心
+      - id: tangent_properties
+        name: 切线的性质与判定
+        description: 切线垂直于过切点的半径、判定方法：d=r 或垂直半径过端点
+        prerequisites:
+        - math/g9s1/ch24/line_to_circle_relations
+        importance: 核心
+      - id: tangent_length_theorem
+        name: 切线长定理
+        description: 从圆外一点引两条切线，切线长相等，连线平分夹角
+        prerequisites:
+        - math/g9s1/ch24/tangent_properties
+        importance: 核心
+      - id: incircle
+        name: 三角形的内切圆
+        description: 内心的定义与性质，内切圆半径与面积的关系
+        prerequisites:
+        - math/g9s1/ch24/tangent_properties
+        importance: 核心
+      - id: arc_length_sector_area
+        name: 弧长与扇形面积
+        description: l=nπr/180，S=nπr²/360，及组合图形面积计算
+        prerequisites:
+        - math/g9s1/ch24/circle_concept
+        importance: 核心
+      - id: regular_polygon_and_circle
+        name: 正多边形与圆
+        description: 正 n 边形的中心角、边心距、外接圆半径的计算
+        prerequisites:
+        - math/g9s1/ch24/circle_concept
+        importance: 进阶
+    - id: ch25
+      number: 25
+      title: 概率初步
+      description: 随机事件、概率的定义与计算
+      importance: 中等考点，占 5-8 分
+      knowledge_points:
+      - id: random_event
+        name: 随机事件的概念
+        description: 确定性事件（必然事件/不可能事件）与随机事件的区分
+        prerequisites: []
+        importance: 基础
+      - id: probability_concept
+        name: 概率的定义
+        description: 概率 P(A) 的取值范围 [0,1]，必然事件 P=1，不可能事件 P=0
+        prerequisites:
+        - math/g9s1/ch25/random_event
+        importance: 核心
+      - id: classical_probability
+        name: 古典概型
+        description: 等可能事件的概率 P(A)=m/n，列举法求概率
+        prerequisites:
+        - math/g9s1/ch25/probability_concept
+        importance: 核心
+      - id: tree_diagram
+        name: 用树状图求概率
+        description: 两步及以上试验的树状图法、列表法
+        prerequisites:
+        - math/g9s1/ch25/classical_probability
+        importance: 核心
+      - id: frequency_vs_probability
+        name: 用频率估计概率
+        description: 大量重复试验中频率稳定于概率，大数定律思想
+        prerequisites:
+        - math/g9s1/ch25/probability_concept
+        importance: 基础
+  - id: s2
+    name: 九年级下册
+    chapters:
+    - id: ch26
+      number: 26
+      title: 反比例函数
+      description: 反比例函数的定义、图像与性质、实际应用
+      importance: 中考中等考点，占 6-10 分
+      knowledge_points:
+      - id: inverse_proportion_concept
+        name: 反比例函数的定义
+        description: y=k/x (k≠0) 的定义，理解 k 为常数的意义
+        prerequisites:
+        - math/g8s2/ch19/linear_function_concept
+        importance: 基础
+      - id: inverse_proportion_image
+        name: 反比例函数的图像
+        description: 双曲线，k>0 在一三象限，k<0 在二四象限
+        prerequisites:
+        - math/g9s2/ch26/inverse_proportion_concept
+        importance: 核心
+      - id: inverse_proportion_properties
+        name: 反比例函数的性质
+        description: 增减性、对称性（关于原点中心对称）、渐近趋势
+        prerequisites:
+        - math/g9s2/ch26/inverse_proportion_image
+        importance: 核心
+      - id: inverse_proportion_k_geometric
+        name: k 的几何意义
+        description: 双曲线上任一点向坐标轴作垂线，|k|=矩形面积
+        prerequisites:
+        - math/g9s2/ch26/inverse_proportion_image
+        importance: 核心
+      - id: inverse_proportion_applications
+        name: 反比例函数的实际应用
+        description: 行程问题中的反比例关系、物理中的反比例（压强、电阻等）
+        prerequisites:
+        - math/g9s2/ch26/inverse_proportion_properties
+        importance: 应用
+    - id: ch27
+      number: 27
+      title: 相似
+      description: 相似三角形的判定与性质、位似变换
+      importance: 中考重难点，占 10-15 分
+      knowledge_points:
+      - id: similar_figures
+        name: 相似图形的概念
+        description: 形状相同大小不同的图形，相似比的定义
+        prerequisites:
+        - math/g8s1/ch12/congruence_concept
+        importance: 基础
+      - id: proportion_segments
+        name: 成比例线段
+        description: 四条线段 a:b=c:d，比例中项的概念
+        prerequisites:
+        - math/g9s2/ch27/similar_figures
+        importance: 核心
+      - id: similar_triangle_aa
+        name: 两角对应相等的两个三角形相似 (AA)
+        description: 最常用的相似判定方法
+        prerequisites:
+        - math/g9s2/ch27/similar_figures
+        importance: 核心
+      - id: similar_triangle_sas
+        name: 两边成比例且夹角相等的两个三角形相似 (SAS)
+        description: 两边比例相等且夹角相等
+        prerequisites:
+        - math/g9s2/ch27/similar_figures
+        importance: 核心
+      - id: similar_triangle_sss
+        name: 三边成比例的两个三角形相似 (SSS)
+        description: 三条边的比例都相等
+        prerequisites:
+        - math/g9s2/ch27/similar_figures
+        importance: 核心
+      - id: similar_triangle_properties
+        name: 相似三角形的性质
+        description: 对应边成比例、对应角相等、周长比=相似比、面积比=相似比的平方
+        prerequisites:
+        - math/g9s2/ch27/similar_triangle_aa
+        importance: 核心
+      - id: similar_triangle_applications
+        name: 相似三角形的应用
+        description: 测量高度（影子法、标杆法）、宽度、河宽等实际问题
+        prerequisites:
+        - math/g9s2/ch27/similar_triangle_properties
+        importance: 应用
+      - id: median_of_triangle_proportion
+        name: 三角形的中位线与重心
+        description: 中位线平行于第三边且等于一半，重心分中线 2:1
+        prerequisites:
+        - math/g9s2/ch27/similar_triangle_aa
+        importance: 核心
+      - id: right_triangle_similarity
+        name: 直角三角形中的相似（射影定理）
+        description: 斜边上的高分成的两个三角形与原三角形相似，射影定理
+        prerequisites:
+        - math/g9s2/ch27/similar_triangle_aa
+        importance: 进阶
+      - id: homothety
+        name: 位似图形
+        description: 位似中心、位似比、位似变换作图
+        prerequisites:
+        - math/g9s2/ch27/similar_figures
+        importance: 基础
+    - id: ch28
+      number: 28
+      title: 锐角三角函数
+      description: 正弦、余弦、正切的定义，解直角三角形及其应用
+      importance: 中考高频考点，占 8-12 分
+      knowledge_points:
+      - id: sine_concept
+        name: 正弦 (sin) 的定义
+        description: 在直角三角形中，sinA=对边/斜边
+        prerequisites:
+        - math/g8s2/ch17/pythagorean_theorem
+        importance: 核心
+      - id: cosine_concept
+        name: 余弦 (cos) 的定义
+        description: 在直角三角形中，cosA=邻边/斜边
+        prerequisites:
+        - math/g9s2/ch28/sine_concept
+        importance: 核心
+      - id: tangent_concept
+        name: 正切 (tan) 的定义
+        description: 在直角三角形中，tanA=对边/邻边
+        prerequisites:
+        - math/g9s2/ch28/sine_concept
+        importance: 核心
+      - id: special_angle_trig_values
+        name: 特殊角的三角函数值
+        description: 30°、45°、60° 的 sin/cos/tan 值，巧记方法
+        prerequisites:
+        - math/g9s2/ch28/sine_concept
+        - math/g9s2/ch28/cosine_concept
+        - math/g9s2/ch28/tangent_concept
+        importance: 核心
+      - id: trigonometric_relationships
+        name: 同角三角函数关系
+        description: sin²A+cos²A=1，tanA=sinA/cosA，互余角的三角函数关系
+        prerequisites:
+        - math/g9s2/ch28/special_angle_trig_values
+        importance: 核心
+      - id: solving_right_triangle
+        name: 解直角三角形
+        description: 已知两边或一边一角求其他边和角
+        prerequisites:
+        - math/g9s2/ch28/special_angle_trig_values
+        importance: 核心
+      - id: elevation_depression_angle
+        name: 仰角与俯角问题
+        description: 利用解直角三角形解决实际测量问题
+        prerequisites:
+        - math/g9s2/ch28/solving_right_triangle
+        importance: 应用
+      - id: slope_gradient
+        name: 坡度与方向角
+        description: 坡度 i=tanα，方向角的表示与计算
+        prerequisites:
+        - math/g9s2/ch28/solving_right_triangle
+        importance: 应用
+    - id: ch29
+      number: 29
+      title: 投影与视图
+      description: 平行投影、中心投影、三视图
+      importance: 低频考点，占 3-5 分
+      knowledge_points:
+      - id: projection_concept
+        name: 投影的概念与分类
+        description: 平行投影（太阳光）、中心投影（点光源）的区别
+        prerequisites: []
+        importance: 基础
+      - id: orthographic_views
+        name: 三视图
+        description: 正面、左面、上面的正投影图，长对正、高平齐、宽相等
+        prerequisites:
+        - math/g9s2/ch29/projection_concept
+        importance: 核心
+      - id: view_to_geometry
+        name: 由三视图还原几何体
+        description: 根据三视图想象立体图形，计算表面积和体积
+        prerequisites:
+        - math/g9s2/ch29/orthographic_views
+        importance: 核心
+exam_topics:
+- id: comprehensive_operations
+  title: 数与式综合运算
+  kp_list:
+  - math/g7s1/ch01/exponents
+  - math/g7s1/ch01/rational_mixed_operations
+  - math/g8s1/ch14/power_rules
+  - math/g8s1/ch14/difference_of_squares
+  - math/g8s1/ch14/perfect_square_formula
+  - math/g8s1/ch14/factoring_gcf
+  - math/g8s1/ch14/factoring_formula
+  - math/g8s1/ch15/rational_expression_operations
+  - math/g8s2/ch16/quadratic_root_operations
+  - math/g9s1/ch21/quadratic_formula
+  description: 中考第 1-3 题常规考点，涉及代数式的综合运算
+  分值: 15-20
+- id: function_comprehensive
+  title: 函数综合题
+  kp_list:
+  - math/g8s2/ch19/linear_function_properties
+  - math/g8s2/ch19/linear_function_applications
+  - math/g9s1/ch22/quadratic_function_general_form_properties
+  - math/g9s1/ch22/quadratic_function_vs_equation
+  - math/g9s2/ch26/inverse_proportion_properties
+  - math/g9s2/ch26/inverse_proportion_k_geometric
+  description: 函数图像性质综合，中考选择填空压轴及解答题
+  分值: 20-30
+- id: geometry_proof
+  title: 几何证明与计算
+  kp_list:
+  - math/g8s1/ch12/congruence_asa_aas
+  - math/g8s2/ch18/parallelogram_properties
+  - math/g8s2/ch18/rectangle
+  - math/g8s2/ch18/rhombus
+  - math/g8s2/ch18/square
+  - math/g9s1/ch24/inscribed_angle_theorem
+  - math/g9s1/ch24/tangent_properties
+  - math/g9s2/ch27/similar_triangle_aa
+  - math/g9s2/ch27/similar_triangle_properties
+  description: 三角形全等/相似、平行四边形、圆的综合几何证明题
+  分值: 20-30
+- id: practical_measurement
+  title: 实际测量与三角函数
+  kp_list:
+  - math/g9s2/ch28/solving_right_triangle
+  - math/g9s2/ch28/elevation_depression_angle
+  - math/g9s2/ch27/similar_triangle_applications
+  description: 利用三角函数或相似三角形解决实际测量问题
+  分值: 8-12
+- id: quadratic_comprehensive
+  title: 二次函数综合压轴
+  kp_list:
+  - math/g9s1/ch22/quadratic_function_three_forms
+  - math/g9s1/ch22/quadratic_function_inequality
+  - math/g9s1/ch22/quadratic_function_applications
+  description: 二次函数存在性问题、最值问题、动点问题，中考压轴题
+  分值: 12-16
+- id: linear_equation_applications
+  title: 方程与不等式应用
+  kp_list:
+  - math/g7s1/ch03/linear_equation_app_travel
+  - math/g7s1/ch03/linear_equation_app_profit
+  - math/g7s2/ch08/linear_system_applications
+  - math/g7s2/ch09/inequality_applications
+  description: 列方程（组）解决实际问题，中考中等题常考
+  分值: 10-15
+levels:
+- id: foundation
+  name: 基础层
+  description: 概念理解、定义记忆、基础运算，中考 70% 基础题覆盖范围
+  typical_mastery_target: 0.9
+- id: core
+  name: 核心层
+  description: 核心定理应用、中等难度综合题，中考 20% 中档题覆盖范围
+  typical_mastery_target: 0.8
+- id: advanced
+  name: 拔高层
+  description: 跨章节综合、压轴题解题能力，中考 10% 难题覆盖范围
+  typical_mastery_target: 0.7
+review_strategy:
+  ch01_priority: high
+  ch02_priority: normal
+  ch03_priority: high
+  ch04_priority: normal
+  ch05_priority: high
+  ch06_priority: normal
+  ch07_priority: normal
+  ch08_priority: high
+  ch09_priority: high
+  ch10_priority: low
+  ch11_priority: high
+  ch12_priority: high
+  ch13_priority: high
+  ch14_priority: high
+  ch15_priority: high
+  ch16_priority: normal
+  ch17_priority: high
+  ch18_priority: high
+  ch19_priority: high
+  ch20_priority: low
+  ch21_priority: high
+  ch22_priority: high
+  ch23_priority: normal
+  ch24_priority: high
+  ch25_priority: normal
+  ch26_priority: normal
+  ch27_priority: high
+  ch28_priority: high
+  ch29_priority: low

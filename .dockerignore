@@ -36,6 +36,9 @@ __pycache__/
 .Python
 build/
 develop-eggs/
+vendor/
+!vendor/hermes-agent/
+!vendor/deeptutor/
 dist/
 downloads/
 eggs/
@@ -75,6 +78,8 @@ dmypy.json
 node_modules/
 **/node_modules/
 web/node_modules/
+# Allow for Docker build (npm registry unreliable in China)
+!web/node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*

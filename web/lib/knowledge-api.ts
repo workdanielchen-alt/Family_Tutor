@@ -246,6 +246,10 @@ export async function createKnowledgeBase(payload: {
     );
   }
   invalidateKnowledgeCaches();
+
+  // 同步到平台 ChromaDB
+  syncFilesToPlatformChroma(payload.name, payload.files);
+
   return (await res.json()) as KnowledgeTaskResponse;
 }
 
@@ -266,7 +270,32 @@ export async function uploadKnowledgeBaseFiles(
     throw new Error(await readErrorDetail(res, "Failed to upload files"));
   }
   invalidateKnowledgeCaches();
+
+  // 同步到平台 ChromaDB（后台触发，不阻塞上传流程）
+  syncFilesToPlatformChroma(name, files);
+
   return (await res.json()) as KnowledgeTaskResponse;
+}
+
+/** 将文件同步到平台 ChromaDB（web UI → DT LlamaIndex 之后补充入库） */
+const PLATFORM_API_BASE =
+  typeof window !== "undefined"
+    ? `http://${window.location.hostname}:8100`
+    : "http://localhost:8100";
+
+function syncFilesToPlatformChroma(kbName: string, files: File[]): void {
+  for (const file of files) {
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("kb_name", kbName);
+    // 不 await，后台 fire-and-forget
+    fetch(`${PLATFORM_API_BASE}/api/kb/ingest-file`, {
+      method: "POST",
+      body: fd,
+    }).catch(() => {
+      /* 静默失败，不影响主流程 */
+    });
+  }
 }
 
 export async function setDefaultKnowledgeBase(name: string): Promise<void> {
@@ -297,6 +326,15 @@ export async function reindexKnowledgeBase(
     );
   }
   invalidateKnowledgeCaches();
+
+  // 后台同步到平台 ChromaDB
+  fetch(
+    `${PLATFORM_API_BASE}/api/kb/sync-from-dt?kb_name=${encodeURIComponent(name)}`,
+    { method: "POST" },
+  ).catch(() => {
+    /* 静默失败 */
+  });
+
   return (await res.json()) as KnowledgeTaskResponse;
 }
 

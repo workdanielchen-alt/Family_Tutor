@@ -39,6 +39,9 @@ from markitdown import MarkItDown
 from pydantic import BaseModel
 import uvicorn
 
+from domains.curriculum import (
+    format_curriculum_summary,
+)
 from domains.tutoring.mastery import (
     _load,
     generate_daily_report,
@@ -237,15 +240,26 @@ class _DTTutorSession:
             return {"ok": True, "content": final_content.strip(), "trace_id": trace_id}
 
         if ws_error != "timeout":
-            try:
-                raw = await asyncio.wait_for(ws.recv(), timeout=2)
-                data = json.loads(raw)
-                if data.get("type") == "proactive":
-                    c = data.get("content", "")
-                    if c:
-                        return {"ok": True, "content": c.strip(), "trace_id": trace_id}
-            except (asyncio.TimeoutError, json.JSONDecodeError):
-                pass
+            # ── Proactive content catch-up ──
+            # When the DT AgentLoop LLM uses the built-in `message` tool, its
+            # response is delivered through the bus→notify_queue→WS proactive
+            # path rather than as direct "content".  This proactive message
+            # may arrive up to several seconds *after* the "done" signal.
+            # Poll for up to 15 s to avoid losing the teaching response.
+            _proactive_deadline = time.time() + 15
+            while time.time() < _proactive_deadline:
+                try:
+                    _remaining = _proactive_deadline - time.time()
+                    raw = await asyncio.wait_for(ws.recv(), timeout=max(1.0, _remaining))
+                    data = json.loads(raw)
+                    if data.get("type") == "proactive":
+                        c = data.get("content", "")
+                        if c:
+                            return {"ok": True, "content": c.strip(), "trace_id": trace_id}
+                except asyncio.TimeoutError:
+                    break
+                except (json.JSONDecodeError, websockets.ConnectionClosed):
+                    break
         return {"ok": False, "error": ws_error or "empty"}
 
     async def _close_ws(self):
@@ -1707,8 +1721,7 @@ async def _ingest_to_kb(
             for _ in docs
         ]
 
-        await asyncio.to_thread(
-            provider.add_documents,
+        await provider.add_documents(
             kb_name=kb_name,
             documents=docs,
             metadatas=metadatas,
@@ -2334,6 +2347,17 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Platform API", version="7.0.0", lifespan=lifespan)
 
+# CORS: allow browser requests from the DeepTutor frontend (dev: 3782, prod: 8001/3790)
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # ── Phase B: MCP Server merge ──
 # FastMCP ASGI app needs lifespan events to initialize its session
 # manager (task group). Since Starlette Mount lifespan forwarding may
@@ -2662,6 +2686,218 @@ def api_kb_search(query: str = "", kb_name: str = "tutoring", top_k: int = 5):
         return {"ok": False, "error": "chromadb not available"}
     except Exception as e:
         return {"ok": False, "error": str(e), "source": "chromadb"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Web UI ↔ ChromaDB 关联入库
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@app.post("/api/kb/ingest-file")
+async def api_kb_ingest_file(
+    file: UploadFile = File(...),
+    kb_name: str = Form("tutoring"),
+    learner_id: str = Form("web"),
+    request: Request = None,
+):
+    """Web UI 上传文件后同步到平台 ChromaDB。
+
+    由 web UI 的 knowledge-api.ts 在 DT LlamaIndex 上传成功后调用。
+    提取文本并只写平台 ChromaDB (DT 那边已经写过了，不重复写)。
+    """
+    trace_id = _extract_trace_id(request) if request else _generate_trace_id()
+    raw = await file.read()
+    error = _validate_file(file.filename or "unknown", len(raw))
+    if error:
+        return {"ok": False, "error": error, "trace_id": trace_id}
+
+    import tempfile
+
+    suffix = os.path.splitext(file.filename or ".bin")[1] or ".bin"
+    tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    try:
+        tmp.write(raw)
+        tmp_path = tmp.name
+    finally:
+        tmp.close()
+
+    try:
+        result = await _handle_inbound_file(
+            tmp_path,
+            metadata={
+                "source": "web_ui",
+                "kb_name": kb_name,
+                "learner_id": learner_id,
+                "trace_id": trace_id,
+            },
+        )
+        extracted = result.get("content", "").strip()
+        if not extracted:
+            return {"ok": False, "error": "No extractable content", "trace_id": trace_id}
+
+        # ── 只写平台 ChromaDB（DT 已在 web UI 上传流程中写入过） ──
+        provider = await _get_provider()
+        import hashlib
+
+        _content_hash = hashlib.sha256(extracted.encode("utf-8")).hexdigest()[:16]
+        docs = _split_content_for_ingest(extracted, file.filename or "unknown")
+        ids = [f"{_content_hash}_{i}" for i in range(len(docs))]
+        metadatas = [
+            {
+                "filename": file.filename or "",
+                "learner_id": learner_id,
+                "source": "web_ui",
+                "trace_id": trace_id,
+            }
+            for _ in docs
+        ]
+        await provider.add_documents(
+            kb_name=kb_name,
+            documents=docs,
+            metadatas=metadatas,
+            ids=ids,
+        )
+        logger.info(
+            "[%s] Web UI KB ingest: %d chunks -> %s",
+            trace_id,
+            len(docs),
+            kb_name,
+        )
+        return {
+            "ok": True,
+            "trace_id": trace_id,
+            "chunks": len(docs),
+            "content_len": len(extracted),
+            "route": result.get("route", ""),
+        }
+    except Exception as e:
+        logger.warning("[%s] KB ingest-file error: %s", trace_id, e)
+        return {"ok": False, "error": str(e), "trace_id": trace_id}
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+@app.post("/api/kb/sync-from-dt")
+async def api_kb_sync_from_dt(
+    kb_name: str = "tutoring",
+    request: Request = None,
+):
+    """从 DT 知识库同步全部文件到平台 ChromaDB（重建索引后调用）。
+
+    Web UI 重建索引后调用：读取 DT 的文件列表，下载每个文件，
+    提取文本后入库平台 ChromaDB。
+    """
+    trace_id = _extract_trace_id(request) if request else _generate_trace_id()
+
+    # 1) 列出 DT 知识库中的文件
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.get(
+            f"{DEEPTUTOR_URL}/api/v1/knowledge/{kb_name}/files",
+        )
+        if resp.status_code != 200:
+            return {
+                "ok": False,
+                "error": f"DT list files failed (HTTP {resp.status_code})",
+                "trace_id": trace_id,
+            }
+        data = resp.json()
+        files = data if isinstance(data, list) else data.get("files", [])
+
+    if not files:
+        return {"ok": True, "files_processed": 0, "total_chunks": 0, "trace_id": trace_id}
+
+    provider = await _get_provider()
+    total_chunks = 0
+    processed = 0
+
+    import hashlib
+    import tempfile
+
+    for f in files:
+        filename = f if isinstance(f, str) else f.get("name", "")
+        if not filename:
+            continue
+
+        # 2) 从 DT 下载原始文件
+        safe_name = filename.replace("/", "%2F")
+        file_url = f"{DEEPTUTOR_URL}/api/v1/knowledge/{kb_name}/files/{safe_name}"
+        try:
+            async with httpx.AsyncClient(timeout=120) as dl:
+                file_resp = await dl.get(file_url)
+                if file_resp.status_code != 200:
+                    logger.warning(
+                        "[%s] DT download failed: %s (HTTP %d)",
+                        trace_id, filename, file_resp.status_code,
+                    )
+                    continue
+                raw = file_resp.content
+        except Exception as exc:
+            logger.warning("[%s] DT download error: %s: %s", trace_id, filename, exc)
+            continue
+
+        # 3) 提取文本
+        suffix = os.path.splitext(filename)[1] or ".bin"
+        tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+        try:
+            tmp.write(raw)
+            tmp_path = tmp.name
+        finally:
+            tmp.close()
+
+        try:
+            result = await _handle_inbound_file(
+                tmp_path,
+                metadata={
+                    "source": "web_ui_reindex",
+                    "kb_name": kb_name,
+                    "trace_id": trace_id,
+                },
+            )
+            extracted = result.get("content", "").strip()
+            if not extracted:
+                continue
+
+            # 4) 入库平台 ChromaDB
+            _content_hash = hashlib.sha256(extracted.encode("utf-8")).hexdigest()[:16]
+            docs = _split_content_for_ingest(extracted, filename)
+            ids = [f"{_content_hash}_{i}" for i in range(len(docs))]
+            metadatas = [
+                {
+                    "filename": filename,
+                    "source": "web_ui_reindex",
+                    "trace_id": trace_id,
+                }
+                for _ in docs
+            ]
+            await provider.add_documents(
+                kb_name=kb_name,
+                documents=docs,
+                metadatas=metadatas,
+                ids=ids,
+            )
+            total_chunks += len(docs)
+            processed += 1
+            logger.info(
+                "[%s] KB reindex sync: %s -> %d chunks",
+                trace_id, filename, len(docs),
+            )
+        except Exception as exc:
+            logger.warning("[%s] KB reindex error: %s: %s", trace_id, filename, exc)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    return {
+        "ok": True,
+        "files_processed": processed,
+        "total_chunks": total_chunks,
+        "trace_id": trace_id,
+    }
 
 
 @app.post("/api/ingest/proxy/{kb_name}")
@@ -3320,7 +3556,7 @@ async def _build_teaching_persona(
     skip HTTP PATCH if the persona hasn't changed from the previous build.
     """
     _persona = _TEACHER_EXPLAIN_SOUL if mode == "explain" else _TEACHER_SOUL
-    _exam = context.strip()[:3000]
+    _exam = context.strip()[:8000]
     if _exam:
         _persona += (
             "\n\n### 当前教学内容（优先级最高）\n"
@@ -3328,12 +3564,23 @@ async def _build_teaching_persona(
             f"请完全专注于以下内容：\n\n{_exam}\n"
         )
 
+    # Inject curriculum knowledge point system as teaching reference.
+    # Provides the AI with the complete course structure so it can map
+    # questions to the right curriculum chapter and knowledge point.
+    try:
+        _curriculum_summary = format_curriculum_summary()
+        if _curriculum_summary:
+            _persona += "\n\n" + _curriculum_summary + "\n"
+    except Exception:
+        logger.debug("Curriculum injection failed, continuing")
+
     # Inject relevant knowledge from KB to supplement teaching.
     # Query ChromaDB for content related to the exam topic, excluding the
     # exam itself (skip results with high semantic similarity to context).
     try:
+        logger.debug("KB section ENTERED for %s", learner_id)
         provider = get_provider_instance()
-        _kb_results = provider.query("tutoring", [_exam], n_results=5)
+        _kb_results = await provider.query("tutoring", [_exam], n_results=5)
         _kb_found = []
         if _exam:
             for _doc_item in _kb_results:
@@ -3355,8 +3602,8 @@ async def _build_teaching_persona(
             )
             for _dc in _kb_found:
                 _persona += f"- {_dc}\n"
-    except Exception:
-        logger.debug("KB query failed for %s, continuing", learner_id)
+    except Exception as _kb_err:
+        logger.warning("KB query failed for %s: %s", learner_id, _kb_err)
 
     # Inject due reviews (Ebbinghaus spaced repetition)
     try:
@@ -4093,7 +4340,7 @@ async def _tutor_chat_core(
         # same paper rather than generating from its own knowledge.
         _exam_ctx = context.strip() or _last_tutor_context.get(learner_id, "")
         if _exam_ctx:
-            payload += f"\n\n# 当前试卷（下一题必须从此试卷中选取）\n{_exam_ctx[:2000]}"
+            payload += f"\n\n# 当前试卷（下一题必须从此试卷中选取）\n{_exam_ctx[:6000]}"
 
     # 4. Direct LLM call for NPU path (replaces DT AgentLoop profile switching + WS).
     #    When the local LLM lock is available, call rkllama's OpenAI-compatible API
@@ -5125,7 +5372,7 @@ async def _generate_exam_paper(
                     num = q.get("num", len(all_questions) + 1)
                     text = q.get("question", "")
                     exam_lines.append(f"{num}. {text}")
-                    opts = q.get("options", {})
+                    opts = q.get("options") or {}
                     for k, v in opts.items():
                         exam_lines.append(f"   {k}. {v}")
                     exam_lines.append("")

@@ -1,22 +1,10 @@
 import type { Metadata } from "next";
-import { Plus_Jakarta_Sans, Lora } from "next/font/google";
+import "./fonts.css";
 import "./globals.css";
 import ThemeScript from "@/components/ThemeScript";
 import ToastViewport from "@/components/common/ToastViewport";
 import { AppShellProvider } from "@/context/AppShellContext";
 import { I18nClientBridge } from "@/i18n/I18nClientBridge";
-
-const fontSans = Plus_Jakarta_Sans({
-  subsets: ["latin"],
-  display: "swap",
-  variable: "--font-sans",
-});
-
-const fontSerif = Lora({
-  subsets: ["latin"],
-  display: "swap",
-  variable: "--font-serif",
-});
 
 export const metadata: Metadata = {
   title: "DeepTutor",
@@ -40,7 +28,6 @@ export default function RootLayout({
       lang="en"
       suppressHydrationWarning
       data-scroll-behavior="smooth"
-      className={`${fontSans.variable} ${fontSerif.variable}`}
     >
       <head>
         <ThemeScript />

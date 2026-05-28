@@ -29,11 +29,21 @@ class UnifiedLocalProvider:
         self._chroma_dir = os.getenv("CHROMA_PERSIST_DIR", "/data/chromadb")
         self._client = httpx.AsyncClient(timeout=120)
         self._ocr_model = os.getenv("OLLAMA_OCR_MODEL", "openbmb/minicpm-v4.6:q4_K_M")
+        self._embed_fn = None
         logger.info(
             "UnifiedLocalProvider: ollama=%s chroma=%s",
             self._ollama_url,
             self._chroma_dir,
         )
+
+    def _get_embed_fn(self):
+        if self._embed_fn is None:
+            from tutor_platform.tools.embeddings import RkllamaEmbeddingFunction
+            self._embed_fn = RkllamaEmbeddingFunction()
+            # Warm up — verify it works
+            test = self._embed_fn(["warmup"])
+            logger.info("Ollama embedder ready (dim=%d)", len(test[0]))
+        return self._embed_fn
 
     async def add_documents(
         self,
@@ -56,17 +66,11 @@ class UnifiedLocalProvider:
             )
             collection = client.get_or_create_collection(name=kb_name)
 
-            embeddings: list[list[float]] = []
-            for doc in documents:
-                emb_resp = await self._client.post(
-                    f"{self._ollama_url}/api/embeddings",
-                    json={"model": "nomic-embed-text", "prompt": doc[:512]},
-                )
-                if emb_resp.status_code == 200:
-                    emb_data = emb_resp.json()
-                    embeddings.append(emb_data.get("embedding", []))
-                else:
-                    embeddings.append([])
+            embed_fn = self._get_embed_fn()
+            loop = asyncio.get_running_loop()
+            embeddings = await loop.run_in_executor(
+                None, lambda: embed_fn(documents)
+            )
 
             collection.add(
                 embeddings=embeddings,
@@ -100,16 +104,15 @@ class UnifiedLocalProvider:
             collection = client.get_or_create_collection(name=kb_name)
 
             doc_id = f"{filename or 'text'}_{trace_id or id(content)}"
-            # Get embedding from Ollama
-            emb_resp = await self._client.post(
-                f"{self._ollama_url}/api/embeddings",
-                json={"model": "nomic-embed-text", "prompt": content[:512]},
+            embed_fn = self._get_embed_fn()
+            loop = asyncio.get_running_loop()
+            embeddings = await loop.run_in_executor(
+                None, lambda: embed_fn([content])
             )
-            if emb_resp.status_code == 200:
-                emb_data = emb_resp.json()
-                embedding = emb_data.get("embedding", [])
+
+            if embeddings is not None and len(embeddings) > 0 and embeddings[0] is not None:
                 collection.add(
-                    embeddings=[embedding],
+                    embeddings=embeddings,
                     documents=[content],
                     ids=[doc_id],
                     metadatas=[{"filename": filename, "source": source}],
@@ -137,25 +140,23 @@ class UnifiedLocalProvider:
             )
             collection = client.get_or_create_collection(name=collection_name)
 
-            emb_resp = await self._client.post(
-                f"{self._ollama_url}/api/embeddings",
-                json={"model": "nomic-embed-text", "prompt": query_texts[0][:512]},
+            embed_fn = self._get_embed_fn()
+            loop = asyncio.get_running_loop()
+            query_embs = await loop.run_in_executor(
+                None, lambda: embed_fn(query_texts)
             )
-            if emb_resp.status_code != 200:
-                return []
-            emb_data = emb_resp.json()
-            embedding = emb_data.get("embedding", [])
-            if not embedding:
+            if query_embs is None or len(query_embs) == 0 or query_embs[0] is None:
                 return []
 
             results = collection.query(
-                query_embeddings=[embedding],
+                query_embeddings=query_embs,
                 n_results=n_results,
             )
             docs = []
             distances_list = results.get("distances", [[]])[0] or []
+            metadatas_list = results.get("metadatas", [[]])[0] or []
             for i, doc in enumerate(results.get("documents", [[]])[0]):
-                meta = (results.get("metadatas", [[]])[0] or {}) if results.get("metadatas") else {}
+                meta = metadatas_list[i] if i < len(metadatas_list) else {}
                 dist = float(distances_list[i]) if i < len(distances_list) else 1.0
                 docs.append({"content": doc, "metadata": meta, "distance": dist})
             return docs
