@@ -8,10 +8,10 @@
 +        label="RKLLM Local",
 +        mode="local",
 +        default_api_base="",
-+        keywords=("rkllama", "rkllm", "bge-small-zh"),
++        keywords=("rkllama", "rkllm", "bge-m3"),
 +        is_local=True,
-+        default_model="bge-small-zh",
-+        default_dim=384,
++        default_model="bge-m3",
++        default_dim=1024,
 +    ),
      "siliconflow": EmbeddingProviderSpec(
          label="SiliconFlow",

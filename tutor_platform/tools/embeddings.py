@@ -13,7 +13,7 @@ logger = logging.getLogger("tutor_platform.tools.embeddings")
 
 RKLLM_SERVER_URL = os.environ.get("RKLLM_SERVER_URL", "http://rkllama:8080")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434")
-_EMBED_DIM = 768
+_EMBED_DIM = 1024
 
 
 def _hash_embed(text: str, dim: int = _EMBED_DIM) -> list[float]:
@@ -38,7 +38,7 @@ class RkllamaEmbeddingFunction:
     """
 
     def __init__(self, model: str = "", batch_size: int = 8):
-        self.model = model or os.environ.get("EMBEDDING_MODEL", "bge-small-zh-v1.5")
+        self.model = model or os.environ.get("EMBEDDING_MODEL", "bge-m3")
         self.batch_size = batch_size
         self._http_client = None
 
@@ -48,7 +48,7 @@ class RkllamaEmbeddingFunction:
             self._http_client = httpx.AsyncClient(timeout=30)
         return self._http_client
 
-    def __call__(self, texts: list[str]) -> list[list[float]]:
+    def __call__(self, input: list[str]) -> list[list[float]]:
         """ChromaDB 兼容接口：同步返回 embedding 向量列表。"""
 
         # ── Tier 1: RKLLM (NPU) ──
@@ -57,15 +57,15 @@ class RkllamaEmbeddingFunction:
             client = httpx.Client(timeout=30)
             resp = client.post(
                 f"{RKLLM_SERVER_URL}/api/embed",
-                json={"texts": texts, "model": self.model},
+                json={"texts": input, "model": self.model},
             )
             if resp.status_code == 200:
                 data = resp.json()
                 embeds = data.get("embeddings")
-                if embeds and len(embeds) == len(texts):
+                if embeds and len(embeds) == len(input):
                     return embeds
                 logger.warning("RKLLM embed returned %d vectors (expected %d), fallback",
-                               len(embeds or []), len(texts))
+                               len(embeds or []), len(input))
             else:
                 logger.warning("RKLLM embed returned %s, trying fallback", resp.status_code)
         except Exception as e:
@@ -74,23 +74,23 @@ class RkllamaEmbeddingFunction:
         # ── Tier 2: ollama (CPU) ──
         try:
             import httpx
-            client = httpx.Client(timeout=30)
+            client = httpx.Client(timeout=120)
             resp = client.post(
                 f"{OLLAMA_URL}/api/embed",
-                json={"model": self.model, "input": texts},
+                json={"model": self.model, "input": input},
             )
             if resp.status_code == 200:
                 data = resp.json()
                 embeds = data.get("embeddings")
-                if embeds and len(embeds) == len(texts):
-                    logger.info("Ollama embed fallback OK for %d texts", len(texts))
+                if embeds and len(embeds) == len(input):
+                    logger.info("Ollama embed fallback OK for %d texts", len(input))
                     return embeds
         except Exception:
             logger.debug("Ollama embed fallback unavailable")
 
         # ── Tier 3: Deterministic hash (last resort) ──
         logger.warning("No embedding service available, using deterministic hash fallback")
-        return [_hash_embed(t) for t in texts]
+        return [_hash_embed(t) for t in input]
 
     def close(self):
         if self._http_client is not None:
