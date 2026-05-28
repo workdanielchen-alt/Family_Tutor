@@ -39,6 +39,16 @@ develop-eggs/
 vendor/
 !vendor/hermes-agent/
 !vendor/deeptutor/
+# Exclude vendor submodule junk to keep build context small
+vendor/deeptutor/.git/
+vendor/deeptutor/.github/
+vendor/deeptutor/deeptutor_web/
+vendor/deeptutor/deeptutor_*/node_modules/
+vendor/deeptutor/docs/
+vendor/deeptutor/tests/
+vendor/deeptutor/assets/
+vendor/deeptutor/examples/
+vendor/deeptutor/scripts/
 dist/
 downloads/
 eggs/
