@@ -1,0 +1,12 @@
+# MiniCPM-V 4.6 OCR-optimized model
+# Derived from q4_K_M with greedy decoding defaults.
+#
+# Usage:
+#   docker exec ollama ollama create openbmb/minicpm-v4.6-ocr -f /config/Modelfile
+#   docker-compose up -d  # picks up OLLAMA_OCR_MODEL=openbmb/minicpm-v4.6-ocr
+
+FROM openbmb/minicpm-v4.6:q4_K_M
+
+# Greedy decoding — deterministic, no random errors
+PARAMETER temperature 0
+PARAMETER top_k 1

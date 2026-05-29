@@ -177,9 +177,15 @@ class UnifiedLocalProvider:
             img_bytes = base64.b64decode(image_data)
             img_b64 = base64.b64encode(img_bytes).decode("ascii")
             prompt = (
-                "Transcribe all visible text from this image exactly as written, "
-                "preserving the original language, paragraphs, and line breaks. "
-                "Return only the transcribed text."
+                "OCR text extraction for a math tutoring system.\n\n"
+                "Rules:\n"
+                "1. Only extract text visible in the image — do NOT solve or add content not present\n"
+                "2. Chinese text must NOT be wrapped in $ delimiters\n"
+                "3. Math formulas, equations, numbers SHOULD be wrapped in $ (inline LaTeX) — "
+                "this is formatting, not solving\n"
+                "4. Use align* for equation systems; don't add unnecessary parentheses\n"
+                "5. Use \\frac{}{} for fractions, \\times for multiplication\n"
+                "6. Never add explanations or text not present in the image"
             )
             payload = {
                 "model": self._ocr_model,
@@ -195,6 +201,7 @@ class UnifiedLocalProvider:
                         ],
                     }
                 ],
+                "temperature": 0,
                 "stream": False,
             }
             resp = await self._client.post(

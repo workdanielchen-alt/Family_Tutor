@@ -56,6 +56,17 @@ services:
     volumes:
       # 挂载已有的 MiniCPM-V 4.6 模型文件 (D:\ollama_models)
       - //d/ollama_models:/models
+      # Modelfile for OCR-optimized derived model
+      - ./config/ollama:/config:ro
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        ollama serve &
+        until ollama list >/dev/null 2>&1; do sleep 1; done
+        # Create OCR-optimized derived model if not exists
+        ollama create openbmb/minicpm-v4.6-ocr -f /config/Modelfile 2>/dev/null || true
+        wait
     deploy:
       resources:
         limits:
@@ -210,7 +221,7 @@ services:
       - HERMES_AGENT_URL=http://hermes_agent:8004
       - OLLAMA_URL=http://ollama:11434
       - OCR_PROVIDER=ollama
-      - OLLAMA_OCR_MODEL=openbmb/minicpm-v4.6:q4_K_M
+      - OLLAMA_OCR_MODEL=openbmb/minicpm-v4.6-ocr
       - RKLLM_SERVER_URL=http://rkllama:8080
       - MASTERY_DIR=/data/mastery
       - CHROMA_PERSIST_DIR=/data/chromadb

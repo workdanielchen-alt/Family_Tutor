@@ -1341,14 +1341,17 @@ def _opencv_preprocess_image(image_bytes: bytes) -> bytes:
 
 
 async def _ocr_image_bytes_ollama(image_bytes: bytes, trace_id: str) -> str:
-    """OCR via local Ollama (MiniCPM-V 4.6)."""
+    """OCR via local Ollama (MiniCPM-V 4.6) — /api/chat with Chinese prompt."""
     img_b64 = base64.b64encode(image_bytes).decode("utf-8")
     ollama_url = os.getenv("OLLAMA_URL", "http://ollama:11434")
-    model = os.getenv("OLLAMA_OCR_MODEL", "openbmb/minicpm-v4.6")
+    model = os.getenv("OLLAMA_OCR_MODEL", "openbmb/minicpm-v4.6:q4_K_M")
     keep_alive = os.getenv("OLLAMA_KEEP_ALIVE", "15m")
     async with _ocr_semaphore:
         try:
             async with httpx.AsyncClient(timeout=120) as client:
+                # Use /api/chat with Chinese system prompt for better Chinese OCR.
+                # System role + structured rules + greedy decoding gives the most
+                # reliable text-only output from MiniCPM-V 4.6.
                 resp = await client.post(
                     f"{ollama_url}/api/chat",
                     json={
@@ -1356,38 +1359,48 @@ async def _ocr_image_bytes_ollama(image_bytes: bytes, trace_id: str) -> str:
                         "messages": [
                             {
                                 "role": "system",
-                                "content": "你是一个OCR文字识别引擎。只输出图片中实际存在的文字内容，不要添加任何描述、解释或额外文字。按阅读顺序逐字输出。如果有公式或数字，保持原样。",
+                                "content": (
+                                    "你是一个专业OCR文字识别引擎。\n\n"
+                                    "规则：\n"
+                                    "1. 只输出图片中实际存在的文字——不要添加任何描述、解释或额外内容\n"
+                                    "2. 中文文字直接输出纯文本（不要加$分隔符）\n"
+                                    "3. 数学公式用$LaTeX$行内或$$display$$块级\n"
+                                    "4. 保留原始换行和段落结构\n"
+                                    "5. 如果没有文字，返回空字符串"
+                                ),
                             },
                             {
                                 "role": "user",
-                                "content": "识别这张图片中的文字，只输出文字本身，不要任何其他内容：",
+                                "content": "识别这张图片中的所有文字，只输出文字本身：",
                                 "images": [img_b64],
                             },
                         ],
                         "stream": False,
                         "keep_alive": keep_alive,
-                        "options": {"temperature": 0},
+                        "options": {
+                            "temperature": 0,
+                            "top_k": 1,
+                        },
                     },
                 )
                 if resp.status_code == 200:
                     data = resp.json()
                     content = (data.get("message", {}).get("content", "") or "").strip()
-                    # Post-process: strip explanation prefixes common in MiniCPM responses
-                    for prefix in [
-                        "图片中的文字", "图片上的文字", "图片内容为", "图片内容是",
-                        "识别结果", "OCR结果", "OCR识别结果",
-                        "The OCR result", "The text in the image",
-                        "OCR recognition result",
-                    ]:
-                        if content.startswith(prefix):
-                            # Try to extract the quoted part or remaining text
-                            import re
-                            quoted = re.search(r'["""](.+)["""]', content)
-                            if quoted:
-                                content = quoted.group(1)
-                            else:
-                                content = content[len(prefix):].lstrip("：:，, ")
-                            break
+                    # Post-process: strip explanation prefixes common in MiniCPM output
+                    import re
+                    m = re.search(r'[一-鿿]|\$\$?|\\\\\[', content)
+                    if m:
+                        content = content[m.start():]
+                    else:
+                        content = re.sub(
+                            r'^[\s\n]*(?:图片[中的上].*?[：:]|'
+                            r'识别结果[：:]|OCR[识别结果]*[：:]|'
+                            r'the (?:ocr|text|image).*?[：:])',
+                            '',
+                            content,
+                            flags=re.IGNORECASE,
+                        )
+                    content = re.sub(r'^[\s\n：:，,;.、]+', '', content).strip()
                     return content
                 logger.warning("[%s] Ollama OCR returned HTTP %s", trace_id, resp.status_code)
         except Exception as exc:
