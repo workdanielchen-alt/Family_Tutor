@@ -15,12 +15,17 @@ source "${INSTALL_DIR}/.venv/bin/activate"
 # container restart (which would risk >5min downtime and session loss).
 _child_restart_loop() {
   while true; do
+    # Clean up stale lock/PID files from previous container runs.
+    # Docker volumes persist these across restarts, and without cleanup the
+    # child gateway would refuse to start (detects a phantom running instance).
+    rm -f /opt/data/child/gateway.lock /opt/data/child/gateway.pid
+
     WEIXIN_TOKEN="$CHILD_WEIXIN_TOKEN" \
     WEIXIN_ACCOUNT_ID="$CHILD_WEIXIN_ACCOUNT_ID" \
     API_SERVER_ENABLED=false \
     API_SERVER_KEY="" \
     HERMES_HOME=/opt/data/child \
-    hermes gateway run --accept-hooks
+    hermes gateway run --accept-hooks --no-supervise
     EXIT_CODE=$?
     echo "[child] gateway exited (code $EXIT_CODE), restarting in 3s..."
     sleep 3
