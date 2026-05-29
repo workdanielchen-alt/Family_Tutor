@@ -1511,6 +1511,12 @@ class WeixinAdapter(BasePlatformAdapter):
         _in_session = (self._teaching_sessions.get(effective_chat_id) or
                        self._teaching_sessions.get(sender_id))
         _has_doc = any(p.endswith((".doc", ".docx", ".pdf")) for p in media_paths)
+        # New doc always starts fresh teaching (resets old session)
+        if _has_doc and _in_session is not None:
+            self._teaching_sessions.pop(effective_chat_id, None)
+            self._teaching_sessions.pop(sender_id, None)
+            self._save_teaching_sessions()
+            _in_session = None
         _should_teach = _in_session is not None or (_has_doc and _in_session is None)
 
         if _should_teach:
