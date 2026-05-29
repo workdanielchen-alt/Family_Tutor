@@ -1519,17 +1519,28 @@ class WeixinAdapter(BasePlatformAdapter):
             self._save_teaching_sessions()
             _in_session = None
 
-        # Mode switching: chat signals exit teaching, doc files enter teaching
-        if _in_session is not None and text.strip():
+        # Mode switching: chat exits, teach re-enters, doc always starts fresh
+        _reenter_teach = False
+        if text.strip():
             _chat_signals = {"聊天", "退出", "聊聊", "stop", "exit", "结束", "不做了", "算了", "help", "问个问题"}
-            if text.strip() in _chat_signals or any(text.strip().startswith(kw) for kw in ("聊天", "退出", "聊聊", "问个")):
+            _teach_signals = {"继续做题", "继续学习", "继续教学", "回来做题", "接着讲", "接着学"}
+            # Exit teaching → agent
+            if _in_session is not None and (
+                text.strip() in _chat_signals or any(text.strip().startswith(kw) for kw in ("聊天", "退出", "聊聊", "问个"))
+            ):
                 self._teaching_sessions.pop(effective_chat_id, None)
                 self._teaching_sessions.pop(sender_id, None)
                 self._save_teaching_sessions()
                 _in_session = None
                 logger.info("[%s] Chat signal, exited teaching session for %s", self.name, effective_chat_id)
+            # Re-enter teaching → tutor_chat (platform preserves old context)
+            if _in_session is None and not _has_doc and (
+                text.strip() in _teach_signals or any(text.strip().startswith(kw) for kw in ("继续", "接着"))
+            ):
+                _reenter_teach = True
+                logger.info("[%s] Re-enter teaching signal for %s", self.name, effective_chat_id)
 
-        _should_teach = (_in_session is not None) or (_has_doc and _in_session is None)
+        _should_teach = (_in_session is not None) or (_has_doc and _in_session is None) or _reenter_teach
 
         if _should_teach:
             if _in_session is not None and _now - _in_session > 7200:
