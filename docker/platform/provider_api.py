@@ -207,6 +207,7 @@ class _DTTutorSession:
         self.ws: "websockets.WebSocketClientProtocol | None" = None
         self.last_used: float = time.time()
         self._ws_lock = asyncio.Lock()
+        self._keepalive_task: asyncio.Task | None = None
 
     async def send_and_recv(self, payload: str, trace_id: str) -> dict:
         import websockets
@@ -241,7 +242,8 @@ class _DTTutorSession:
             while self.ws is not None and _ws_is_alive(self.ws):
                 await asyncio.sleep(30)
                 try:
-                    await asyncio.wait_for(self.ws.send("ping"), timeout=5)
+                    payload = json.dumps({"type": "keepalive", "chat_id": self.learner_id})
+                    await asyncio.wait_for(self.ws.send(payload), timeout=5)
                 except (websockets.ConnectionClosed, OSError, asyncio.TimeoutError):
                     break
         except asyncio.CancelledError:
