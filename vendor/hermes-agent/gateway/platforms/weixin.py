@@ -1502,25 +1502,33 @@ class WeixinAdapter(BasePlatformAdapter):
             logger.debug("[%s] LLM lock acquire failed (non-fatal)", self.name)
         # ==== END HERMES PATCH ====
 
-        # ==== HERMES PATCH: Route teaching session messages to DeepTutor ====
-        # If sender has an active teaching session (< 2h), bypass LLM agent and
-        # send directly to the platform's tutor_chat API for guided teaching.
+        # ==== HERMES PATCH: Route to DeepTutor teaching flow ====
+        # Three cases:
+        #   1. Has active teaching session (< 2h) → route to tutor_chat
+        #   2. First-time document file (.doc/.docx/.pdf) → auto-initiate teaching
+        #   3. Otherwise → agent
         _now = time.time()
-        _last_active = self._teaching_sessions.get(effective_chat_id) or self._teaching_sessions.get(sender_id)
-        if _last_active is not None:
-            if _now - _last_active > 7200:
-                # Stale session — clean up and fall through to agent
+        _in_session = (self._teaching_sessions.get(effective_chat_id) or
+                       self._teaching_sessions.get(sender_id))
+        _has_doc = any(p.endswith((".doc", ".docx", ".pdf")) for p in media_paths)
+        _should_teach = _in_session is not None or (_has_doc and _in_session is None)
+
+        if _should_teach:
+            if _in_session is not None and _now - _in_session > 7200:
+                # Stale session — clean up
                 self._teaching_sessions.pop(effective_chat_id, None)
                 self._teaching_sessions.pop(sender_id, None)
                 self._save_teaching_sessions()
             else:
                 platform_url = os.getenv("PLATFORM_API_URL", "http://platform:8100")
+                # Use text if present, otherwise describe the file
+                _msg = text.strip() if text.strip() else f"请分析这份{'、'.join(media_paths)}"
                 try:
                     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as _tsession:
                         async with _tsession.post(
                             f"{platform_url}/api/tutor/chat",
                             json={
-                                "message": text,
+                                "message": _msg,
                                 "learner_id": effective_chat_id,
                                 "context": "",
                                 "mode": "guide",
