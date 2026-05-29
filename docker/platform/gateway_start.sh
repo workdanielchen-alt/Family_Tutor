@@ -35,5 +35,8 @@ _child_restart_loop &
 CHILD_PID=$!
 echo "Child gateway supervisor started (PID=$CHILD_PID)"
 
-# Start parent gateway in foreground
+# Start parent gateway in foreground.
+# NOTE: s6 gateway-default/run is marked "down" (intentionally disabled), so
+# the parent gateway is started here via exec.  The child supervisor was
+# backgrounded above and survives the exec unharmed.
 exec hermes gateway run --accept-hooks
