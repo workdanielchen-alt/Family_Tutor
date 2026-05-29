@@ -1050,6 +1050,16 @@ async def _handle_inbound_file(
             content = await _ocr_image_file(file_path, trace_id)
             if content:
                 logger.info("[%s] OCR success: %d chars from %s", trace_id, len(content), file_path)
+                # If the page contains diagrams (图1, 如图, etc.), get a vision
+                # description and fuse it into the teaching context.
+                if _DIAGRAM_PATTERNS.search(content):
+                    vision_desc = await _describe_diagram(file_path, trace_id)
+                    if vision_desc:
+                        content = f"{content}\n\n[图片中的图形描述]\n{vision_desc}"
+                        logger.info(
+                            "[%s] Vision description appended (%d chars)",
+                            trace_id, len(vision_desc),
+                        )
                 return _cache_res(
                     {
                         "ok": True,
@@ -1534,6 +1544,95 @@ async def _ocr_image_file(file_path: str, trace_id: str) -> str:
     except Exception as exc:
         logger.warning("[%s] Image OCR pipeline failed: %s", trace_id, exc)
         return ""
+
+
+# ── Math/physics diagram detection & description ──
+
+
+_DIAGRAM_PATTERNS = re.compile(
+    r'[图图表][0-9一二三四五六七八九十]|如图|Fig\.|diagram|graph|figure|'
+    r'所示|示意图|电路图|受力分析|光路|函数[图像]|坐标系|坐标图',
+    re.IGNORECASE,
+)
+
+# Vision description cache: {file_hash: (timestamp, description)}
+_VISION_DESC_CACHE: dict[str, tuple[float, str]] = {}
+_VISION_CACHE_TTL = 3600      # 1 hour
+_VISION_CACHE_MAX = 100
+
+
+async def _describe_diagram(file_path: str, trace_id: str) -> str:
+    """Use MiniCPM-V vision to describe math/physics diagrams in the image.
+
+    Runs as a separate call after OCR so the diagram description can be fused
+    into the teaching context alongside the extracted text.
+    """
+    fhash = _hash_file(file_path)
+    ckey = f"vision:{fhash}"
+    if ckey in _VISION_DESC_CACHE:
+        ts, desc = _VISION_DESC_CACHE[ckey]
+        if time.time() - ts < _VISION_CACHE_TTL:
+            return desc
+
+    try:
+        with open(file_path, "rb") as f:
+            raw_bytes = f.read()
+        img_b64 = base64.b64encode(raw_bytes).decode("utf-8")
+
+        ollama_url = os.getenv("OLLAMA_URL", "http://ollama:11434")
+        model = os.getenv("OLLAMA_OCR_MODEL", "openbmb/minicpm-v4.6:q4_K_M")
+
+        # Use a separate semaphore for vision — shares Ollama resources
+        async with _ocr_semaphore:
+            async with httpx.AsyncClient(timeout=90) as client:
+                resp = await client.post(
+                    f"{ollama_url}/api/chat",
+                    json={
+                        "model": model,
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": (
+                                    "你是一个数学/物理图形分析助手。"
+                                    "仔细观察图片中的图形、图表、示意图等视觉元素。\n\n"
+                                    "规则：\n"
+                                    "1. 只描述视觉元素本身——禁止回答题目中的问题\n"
+                                    "2. 列出所有几何图形（三角形、圆、烧瓶等）及物理示意图\n"
+                                    "3. 标注所有字母（A/B/C等）、数字、角度符号（∠等）\n"
+                                    "4. 说明线段、角度、长度等几何关系\n"
+                                    "5. 如果有多个子图，分别描述每个子图\n"
+                                    "6. 描述图形的整体布局\n\n"
+                                    "禁止：\n"
+                                    "- 绝对不要回答题目的任何问题\n"
+                                    "- 绝对不要给出解题思路或答案\n"
+                                    "- 绝对不要推理实验现象或结论\n"
+                                    "- 只描述你看到了什么，不要解释它意味着什么"
+                                ),
+                            },
+                            {
+                                "role": "user",
+                                "content": "描述这张图片中的图形和视觉元素：",
+                                "images": [img_b64],
+                            },
+                        ],
+                        "stream": False,
+                        "options": {"temperature": 0},
+                    },
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    desc = (data.get("message", {}).get("content", "") or "").strip()
+                    if desc:
+                        _VISION_DESC_CACHE[ckey] = (time.time(), desc)
+                        if len(_VISION_DESC_CACHE) > _VISION_CACHE_MAX:
+                            _VISION_DESC_CACHE.pop(next(iter(_VISION_DESC_CACHE)))
+                        return desc
+                logger.warning(
+                    "[%s] Vision API returned HTTP %s", trace_id, resp.status_code
+                )
+    except Exception as exc:
+        logger.warning("[%s] Vision description failed: %s", trace_id, exc)
+    return ""
 
 
 # ── Document text extraction ──
