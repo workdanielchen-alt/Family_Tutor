@@ -45,7 +45,7 @@ services:
   # Ollama — 本地 LLM (MiniCPM-V 4.6 与其他模型)
   # ============================================
   ollama:
-    image: ollama/ollama:0.30.0-rc23
+    image: ollama/ollama:0.20.5
     container_name: ollama
     restart: unless-stopped
     # 宿主机 11434 已被 Windows Ollama 占用，映射到 11435
@@ -53,7 +53,6 @@ services:
       - "11435:11434"
     environment:
       - OLLAMA_MODELS=/models
-      - OLLAMA_FLASH_ATTENTION=1
       - OLLAMA_KV_CACHE_TYPE=q8_0
     volumes:
       # 挂载已有的 MiniCPM-V 4.6 模型文件 (D:\ollama_models)
