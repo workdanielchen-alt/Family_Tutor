@@ -1523,6 +1523,14 @@ class WeixinAdapter(BasePlatformAdapter):
                 platform_url = os.getenv("PLATFORM_API_URL", "http://platform:8100")
                 # Use text if present, otherwise describe the file
                 _msg = text.strip() if text.strip() else f"请分析这份{'、'.join(media_paths)}"
+
+                # Quick acknowledgment so user knows it's processing
+                if _has_doc:
+                    try:
+                        await self.send(content="📝 收到试卷，正在分析中，请稍候...", chat_id=effective_chat_id)
+                    except Exception:
+                        pass
+
                 try:
                     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as _tsession:
                         async with _tsession.post(
