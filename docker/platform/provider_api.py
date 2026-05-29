@@ -39,9 +39,7 @@ from markitdown import MarkItDown
 from pydantic import BaseModel
 import uvicorn
 
-from domains.curriculum import (
-    format_curriculum_summary,
-)
+from domains.curriculum import load as load_curriculum
 from domains.tutoring.mastery import (
     _load,
     generate_daily_report,
@@ -99,6 +97,11 @@ def _ws_is_alive(ws) -> bool:
 
 
 HERMES_AGENT_URL = os.getenv("HERMES_AGENT_URL", "http://hermes_agent:8004")
+# Separate callback ports for dual-gateway (parent=8005, child=8006)
+HERMES_CALLBACK_URLS = [
+    os.getenv("HERMES_CALLBACK_URL", "http://hermes_agent:8005/api/tutor/callback"),
+    os.getenv("HERMES_CHILD_CALLBACK_URL", "http://hermes_agent:8006/api/tutor/callback"),
+]
 DEEPTUTOR_URL = os.getenv("DEEPTUTOR_API_URL", "http://deeptutor:8001")
 UPLOADS_DIR = os.getenv("UPLOADS_DIR", "/data/uploads")
 SOURCES_DIR = os.getenv("SOURCES_DIR", "/data/sources")
@@ -164,7 +167,29 @@ _last_question_text: dict[str, str] = {}
 
 # DT LLM profile cache: tracks currently active (profile_id, model_id) so
 # _tutor_chat_core can skip redundant catalog switches + bot restarts.
-_last_llm_profile: tuple[str, str] | None = None
+# Persisted to disk so it survives platform container restarts.
+_LLM_PROFILE_FILE = os.path.join(
+    os.getenv("MASTERY_DIR", "/data/mastery"),
+    "_llm_profile.json",
+)
+
+def _load_llm_profile() -> tuple[str, str] | None:
+    try:
+        with open(_LLM_PROFILE_FILE) as f:
+            data = json.load(f)
+        return (data["profile_id"], data["model_id"])
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        return None
+
+def _save_llm_profile(profile_id: str, model_id: str) -> None:
+    try:
+        os.makedirs(os.path.dirname(_LLM_PROFILE_FILE), exist_ok=True)
+        with open(_LLM_PROFILE_FILE, "w") as f:
+            json.dump({"profile_id": profile_id, "model_id": model_id}, f)
+    except Exception:
+        pass
+
+_last_llm_profile: tuple[str, str] | None = _load_llm_profile()
 
 # Per-learner DT WebSocket session pool: reuse WS connections across
 # follow-up calls to avoid ~2-5s bot cold start on every turn.
@@ -1929,8 +1954,31 @@ async def _notify_hermes_agent(
         logger.debug("[notify_ha] notification write failed: %s", e)
 
 
+async def _notify_tutor_callback(learner_id: str, content: str, trace_id: str):
+    """Send teaching response to hermes-agent via HTTP callback.
+
+    Replaces the old notification file bridge. POSTs to both parent and child
+    gateway callback ports — the gateway that has the learner's WeChat contact
+    delivers the message, the other silently ignores.
+    """
+    payload = {
+        "type": "tutor_reply",
+        "learner_id": learner_id,
+        "content": content,
+        "trace_id": trace_id or "",
+    }
+    for url in HERMES_CALLBACK_URLS:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.post(url, json=payload)
+                if resp.status_code != 200:
+                    logger.debug("[%s] tutor callback %s returned %d", trace_id, url, resp.status_code)
+        except (httpx.TimeoutException, httpx.RequestError):
+            logger.debug("[%s] tutor callback to %s failed (non-fatal)", trace_id, url)
+
+
 async def _async_tutor_teach(content: str, learner_id: str, trace_id: str):
-    """Background task: run tutor_chat and push result via notification file.
+    """Background task: run tutor_chat and push result via HTTP callback.
 
     Called fire-and-forget from ``api_process_file`` so the OCR response is
     not blocked by LLM-based teaching generation.
@@ -1945,7 +1993,7 @@ async def _async_tutor_teach(content: str, learner_id: str, trace_id: str):
         )
         if tutor_result.get("ok") and tutor_result.get("content"):
             _clean_content = html.unescape(tutor_result["content"])
-            _write_tutor_notification(learner_id, _clean_content, trace_id)
+            await _notify_tutor_callback(learner_id, _clean_content, trace_id)
             logger.info("[%s] Async tutor_chat success for %s", trace_id, learner_id)
         else:
             logger.warning(
@@ -1955,29 +2003,6 @@ async def _async_tutor_teach(content: str, learner_id: str, trace_id: str):
             )
     except Exception as e:
         logger.warning("[%s] Async tutor_chat failed: %s", trace_id, e)
-
-
-def _write_tutor_notification(learner_id: str, content: str, trace_id: str):
-    """Write a ``tutor_reply`` notification for the hermes-agent to pick up."""
-    notif = {
-        "type": "tutor_reply",
-        "learner_id": learner_id,
-        "content": content,
-        "trace_id": trace_id or "",
-    }
-    notif_dir = Path("/data/hermes/notifications")
-    notif_dir.mkdir(parents=True, exist_ok=True)
-    notif_dir.chmod(0o777)
-    name = f"tutor_{trace_id or int(time.time())}.json"
-    tmp = notif_dir / (name + ".tmp")
-    dst = notif_dir / name
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(notif, f, ensure_ascii=False)
-        os.replace(tmp, dst)
-        logger.info("[notify_tutor] tutor_reply written for %s (%d chars)", learner_id, len(content))
-    except Exception as e:
-        logger.warning("[notify_tutor] failed: %s", e)
 
 
 class QuizSyncRequest(BaseModel):
@@ -2127,9 +2152,10 @@ async def _periodic_task_loop():
 
             # ── Exam push: once per day after 20:00, for learners with ≥3 weak points ──
             if now_bj.hour >= 20:
-                _pushed = _read_marker("exam_push_last.txt")
-                _today = now_bj.strftime("%Y-%m-%d")
-                if _pushed != _today:
+                _pushed = _read_marker("exam_push_24h.txt")
+                _now_ts = time.time()
+                _due = not _pushed or (_now_ts - float(_pushed)) >= 86400
+                if _due:
                     from tutor_platform.report_scheduler import (
                         _write_notification,
                         enumerate_learners,
@@ -2138,10 +2164,23 @@ async def _periodic_task_loop():
                     _pushed_count = 0
                     for _lid in enumerate_learners():
                         try:
+                            # Fallback to disk-persisted context (survives restarts)
+                            if not _last_tutor_context.get(_lid, "").strip():
+                                _disk_ctx, _ = await asyncio.to_thread(_load_context_from_disk, _lid)
+                                if _disk_ctx:
+                                    _last_tutor_context[_lid] = _disk_ctx
+                            if len(_last_tutor_context.get(_lid, "").strip()) > 200:
+                                continue
                             _w = await asyncio.to_thread(weak_points, _lid)
                             if len(_w) < 3:
                                 continue
-                            _exam_ok = await _generate_exam_paper(_lid, "cron-exam")
+                            # Detect most common subject among weak points
+                            _subj_counts = {}
+                            for _wp in _w:
+                                _s = _wp["kp_id"].split("/")[0]
+                                _subj_counts[_s] = _subj_counts.get(_s, 0) + 1
+                            _top_subj = max(_subj_counts, key=_subj_counts.get) if _subj_counts else ""
+                            _exam_ok = await _generate_exam_paper(_lid, "cron-exam", kp_filter=_top_subj)
                             if _exam_ok.get("ok"):
                                 _text = (
                                     f"📝 {_exam_ok.get('title', '强化训练')}\n"
@@ -2155,7 +2194,7 @@ async def _periodic_task_loop():
                             await asyncio.sleep(2)  # rate-limit between learners
                         except Exception:
                             logger.debug("[periodic] exam_push skipped for %s", _lid)
-                    _write_marker("exam_push_last.txt", _today)
+                    _write_marker("exam_push_24h.txt", str(_now_ts))
                     logger.info(
                         "[periodic] exam_push: pushed=%d learners",
                         _pushed_count,
@@ -3545,6 +3584,91 @@ async def api_tutor_context(request: Request):
     return {"ok": True, "teaching_context": teaching_context, "trace_id": trace_id}
 
 
+_SUBJECT_KEYWORDS = {
+    "chemistry": ["化学", "初三化学", "初中化学", "高考化学"],
+    "physics": ["物理", "初中物理", "高中物理", "高考物理"],
+    "math": ["数学", "初中数学", "高中数学", "高考数学", "中考数学"],
+}
+
+
+def _detect_exam_subject(context: str) -> str:
+    """Detect exam subject from OCR text by keyword matching, fallback to env."""
+    for subject, keywords in _SUBJECT_KEYWORDS.items():
+        for kw in keywords:
+            if kw in context:
+                return subject
+    return os.getenv("DOMAINS_SUBJECT", "math")
+
+
+_curriculum_indexed: set[str] = set()  # track which subjects are indexed
+
+
+async def _ensure_curriculum_indexed(provider) -> None:
+    """Index curriculum chapters into ChromaDB (one-time per subject).
+
+    Each chapter becomes a document with its title, knowledge points, and
+    kp_ids embedded.  The "curriculum" collection is queried during teaching
+    to find which chapter best matches the current exam.
+    """
+    # Skip if already indexed in this process lifetime.
+    if _curriculum_indexed:
+        return
+
+    # Check if ChromaDB already has curriculum docs (survives restarts).
+    try:
+        import chromadb
+        from chromadb.config import Settings
+        _c = chromadb.PersistentClient(
+            path="/data/chromadb",
+            settings=Settings(anonymized_telemetry=False),
+        )
+        if _c.get_or_create_collection(name="curriculum").count() > 0:
+            _curriculum_indexed.update(["math", "chemistry", "physics"])
+            logger.info("Curriculum already indexed in ChromaDB, skipping")
+            return
+    except Exception:
+        pass
+
+    for subject in ("math", "chemistry", "physics"):
+        try:
+            data = load_curriculum(subject)
+            if not data:
+                continue
+            docs: list[str] = []
+            metadatas: list[dict] = []
+            ids: list[str] = []
+            for grade in data.get("grades", []):
+                g_name = grade.get("name", "")
+                g_id = str(grade.get("id", ""))
+                for sem in grade.get("semesters", []):
+                    s_name = sem.get("name", "")
+                    s_id = sem.get("id", "")
+                    for ch in sem.get("chapters", []):
+                        ch_title = ch.get("title", "")
+                        ch_num = ch.get("number", "")
+                        kps = ch.get("knowledge_points", [])
+                        kp_lines = [f"- {kp.get('name', '')}" for kp in kps]
+                        doc = (
+                            f"{data.get('title', subject)} / {g_name} / {s_name}\n"
+                            f"第{ch_num}章 {ch_title}\n"
+                            f"知识点：\n" + "\n".join(kp_lines)
+                        )
+                        docs.append(doc)
+                        metadatas.append({
+                            "subject": subject,
+                            "grade": g_name,
+                            "semester": s_name,
+                            "chapter": ch_title,
+                        })
+                        ch_id = f"{subject}/g{g_id}{s_id}/{ch.get('id', ch_num)}"
+                        ids.append(ch_id)
+            if docs:
+                await provider.add_documents("curriculum", docs, metadatas, ids)
+                logger.info("Curriculum indexed: %s (%d chapters)", subject, len(docs))
+        except Exception as exc:
+            logger.warning("Curriculum indexing failed for %s: %s", subject, exc)
+
+
 async def _build_teaching_persona(
     learner_id: str,
     context: str,
@@ -3557,6 +3681,7 @@ async def _build_teaching_persona(
     """
     _persona = _TEACHER_EXPLAIN_SOUL if mode == "explain" else _TEACHER_SOUL
     _exam = context.strip()[:8000]
+    _subject = _detect_exam_subject(context) if _exam else os.getenv("DOMAINS_SUBJECT", "math")
     if _exam:
         _persona += (
             "\n\n### 当前教学内容（优先级最高）\n"
@@ -3564,22 +3689,27 @@ async def _build_teaching_persona(
             f"请完全专注于以下内容：\n\n{_exam}\n"
         )
 
-    # Inject curriculum knowledge point system as teaching reference.
-    # Provides the AI with the complete course structure so it can map
-    # questions to the right curriculum chapter and knowledge point.
+    # Inject the relevant curriculum chapter (not the whole syllabus).
+    # ChromaDB stores each chapter as a document with metadata {subject, grade}.
+    # Query with exam text to find the best-matching chapter for the current exam.
     try:
-        _curriculum_summary = format_curriculum_summary()
-        if _curriculum_summary:
-            _persona += "\n\n" + _curriculum_summary + "\n"
+        provider = await _get_provider()
+        await _ensure_curriculum_indexed(provider)
+        _chapter_results = await provider.query("curriculum", [_exam], n_results=1)
+        if _chapter_results:
+            _ch = _chapter_results[0]
+            _ch_content = (_ch.get("content") or "").strip()
+            if _ch_content:
+                _persona += "\n\n### 相关课程章节\n" + _ch_content + "\n"
     except Exception:
-        logger.debug("Curriculum injection failed, continuing")
+        logger.debug("Curriculum chapter lookup failed, continuing")
 
     # Inject relevant knowledge from KB to supplement teaching.
     # Query ChromaDB for content related to the exam topic, excluding the
     # exam itself (skip results with high semantic similarity to context).
     try:
         logger.debug("KB section ENTERED for %s", learner_id)
-        provider = get_provider_instance()
+        provider = await _get_provider()
         _kb_results = await provider.query("tutoring", [_exam], n_results=5)
         _kb_found = []
         if _exam:
@@ -3605,9 +3735,10 @@ async def _build_teaching_persona(
     except Exception as _kb_err:
         logger.warning("KB query failed for %s: %s", learner_id, _kb_err)
 
-    # Inject due reviews (Ebbinghaus spaced repetition)
+    # Inject due reviews (Ebbinghaus spaced repetition), filtered by subject.
     try:
         _due = await asyncio.to_thread(get_due_reviews, learner_id)
+        _due = [r for r in _due if r["kp_id"].startswith(_subject + "/")]
         if _due:
             _lines = [
                 "\n### 到期复习知识点（优先复习）\n以下知识点今天到期需要复习，请优先安排复习："
@@ -3622,8 +3753,11 @@ async def _build_teaching_persona(
 
     # Inject learner weak points into SOUL.md for adaptive teaching.
     # DT reads this and adjusts its teaching strategy accordingly.
+    # Only include weak points matching the current exam subject to avoid
+    # cross-subject confusion (e.g. math weak points in a chemistry exam).
     try:
         _weak = await asyncio.to_thread(weak_points, learner_id)
+        _weak = [w for w in _weak if w["kp_id"].startswith(_subject + "/")]
         if _weak:
             _lines = [
                 "\n### 该学生薄弱知识点（教学重点）\n以下知识点该学生掌握不足，请重点加强引导："
@@ -3638,7 +3772,8 @@ async def _build_teaching_persona(
             # NOTE: correct_answer is omitted when the wrong answer question
             # appears in the current exam context, preventing DT from seeing
             # the answer key during new-question guidance.
-            _wrongs = await asyncio.to_thread(get_wrong_answers, learner_id, limit=3)
+            _wrongs = await asyncio.to_thread(get_wrong_answers, learner_id, limit=5)
+            _wrongs = [w for w in _wrongs if w.get("kp_id", "").startswith(_subject + "/")]
             if _wrongs:
                 _persona += "\n### 近期错题记录\n以下题目学生最近答错，教学时注意关联：\n"
                 for w in _wrongs:
@@ -3861,23 +3996,41 @@ async def _trigger_practice_if_needed(learner_id: str, kp_id: str, trace_id: str
         return []
 
 
-async def _auto_generate_exam(learner_id: str, trace_id: str):
+# Auto-exam 24h cooldown marker: uses /data/mastery (persistent volume).
+_AUTO_EXAM_DIR = os.getenv("MASTERY_DIR", "/data/mastery")
+
+
+def _auto_exam_due(learner_id: str) -> bool:
+    """Check if 24h cooldown has elapsed since last auto-exam generation."""
+    path = os.path.join(_AUTO_EXAM_DIR, f"_autoexam_{learner_id}.txt")
+    try:
+        with open(path) as f:
+            last = float(f.read().strip())
+        return time.time() - last >= 86400
+    except (FileNotFoundError, ValueError, OSError):
+        return True
+
+
+def _mark_auto_exam_generated(learner_id: str) -> None:
+    """Record current time as last auto-exam generation."""
+    path = os.path.join(_AUTO_EXAM_DIR, f"_autoexam_{learner_id}.txt")
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(str(time.time()))
+    except OSError:
+        pass
+
+
+async def _auto_generate_exam(learner_id: str, trace_id: str, kp_filter: str = ""):
     """Background task: auto-generate exam paper and inject into teaching context.
 
-    Throttled to once per 24h per learner via file-based marker.
+    Throttled to once per 24h per learner — caller must check _auto_exam_due first.
     """
-    _exam_marker_name = f"autoexam_{learner_id}.txt"
-    _last = _read_marker(_exam_marker_name)
-    if _last:
-        try:
-            if time.time() - float(_last) < 86400:
-                return
-        except ValueError:
-            pass
-    _write_marker(_exam_marker_name, str(time.time()))
+    _mark_auto_exam_generated(learner_id)
     logger.info("[%s] Auto-generating exam for %s (weak points >= 3)", trace_id, learner_id)
 
-    result = await _generate_exam_paper(learner_id, trace_id)
+    result = await _generate_exam_paper(learner_id, trace_id, kp_filter=kp_filter)
     if not result.get("ok"):
         logger.info("[%s] Auto-exam skipped for %s: %s", trace_id, learner_id, result.get("error"))
         return
@@ -4263,14 +4416,13 @@ async def _tutor_chat_core(
                 _last_question_num[learner_id] = _disk_qnum
                 _soul_context = _disk_ctx
                 logger.info("[%s] Context restored from disk for %s", trace_id, learner_id)
-    # Inject auto-generated exam context if available
-    pending_exam = _pending_exam_context.pop(learner_id, "")
-    if pending_exam:
-        if _soul_context:
-            _soul_context += "\n\n" + pending_exam
-        else:
+    # Inject auto-generated exam context if available.
+    # Skip if learner is already working on a user-sent exam (has context).
+    if not _soul_context:
+        pending_exam = _pending_exam_context.pop(learner_id, "")
+        if pending_exam:
             _soul_context = pending_exam
-        logger.info("[%s] Pending exam context injected for %s", trace_id, learner_id)
+            logger.info("[%s] Pending exam context injected for %s", trace_id, learner_id)
 
     if _soul_context != _last_soul_content.get(learner_id):
         await _update_soul_with_context(learner_id, _soul_context, mode)
@@ -4326,11 +4478,13 @@ async def _tutor_chat_core(
         payload = f"[PHASE:{_phase}]{_constraint}\n{context}"
     else:
         _phase = "EVALUATE_ANSWER"
+        _qnum = _last_question_num.get(learner_id, 0)
+        _next_q = _qnum + 1
         _constraint = (
             "\n\n【硬性规则】\n"
-            "🔴 评判当前题目后，只能出一道下一题。\n"
+            f"🔴 当前是第{_qnum}题，评判此题后必须立即出第{_next_q}题！\n"
             "🔴 绝对禁止在一条回复中出现两道或以上的题目。\n"
-            "🔴 不要提前展示第N+2题。\n"
+            "🔴 不要提前展示更后面的题。\n"
             "✅ 只输出一道题 + 讲解 + 一个引导问题。\n"
             "🔴 引导问题严禁直接问答案（如\"x等于多少？\"\"选哪个？\"\"结果是？\"）。\n"
             "✅ 引导问题应指向解题思路或概念理解，而非答案本身。\n"
@@ -4341,6 +4495,8 @@ async def _tutor_chat_core(
         _exam_ctx = context.strip() or _last_tutor_context.get(learner_id, "")
         if _exam_ctx:
             payload += f"\n\n# 当前试卷（下一题必须从此试卷中选取）\n{_exam_ctx[:6000]}"
+
+    _nudge_sent = False  # track if we already nudged for next question
 
     # 4. Direct LLM call for NPU path (replaces DT AgentLoop profile switching + WS).
     #    When the local LLM lock is available, call rkllama's OpenAI-compatible API
@@ -4390,14 +4546,7 @@ async def _tutor_chat_core(
             _profile_switched = await _switch_dt_profile("deepseek", "deepseek-v4-flash", trace_id)
             if _profile_switched:
                 _last_llm_profile = ("deepseek", "deepseek-v4-flash")
-
-        if _profile_switched:
-            await _DTTutorSession.close_all()
-            try:
-                async with httpx.AsyncClient(timeout=10) as _sc:
-                    await _sc.delete(f"{DEEPTUTOR_URL}/api/v1/tutorbot/teacher")
-            except Exception:
-                pass
+                _save_llm_profile("deepseek", "deepseek-v4-flash")
 
     # 5. Send via persistent WS session pool (reuses connection per learner).
     #    Skipped entirely when the direct NPU call succeeded.
@@ -4405,6 +4554,22 @@ async def _tutor_chat_core(
         try:
             _session = await _DTTutorSession.get(learner_id)
             result = await _session.send_and_recv(payload, trace_id)
+
+            # 5a. Ensure next question was output in EVALUATE_ANSWER guide mode.
+            #     If the LLM only evaluated without advancing, nudge it once.
+            if (mode == "guide" and _phase == "EVALUATE_ANSWER" and result.get("ok")
+                    and not _nudge_sent and _last_question_num.get(learner_id, 0) < _next_q):
+                _r_content = result.get("content", "")
+                _has_next = re.search(rf"第{_next_q}题", _r_content) is not None
+                if not _has_next:
+                    _nudge_payload = (
+                        f"【系统】你只评判了第{_qnum}题但没有出第{_next_q}题。"
+                        f"请立即从试卷中选出第{_next_q}题输出。"
+                        "只要题目+选项+引导问题，不要评判。"
+                    )
+                    logger.info("[%s] Missing next question, nudging (q%d→q%d)", trace_id, _qnum, _next_q)
+                    result = await _session.send_and_recv(_nudge_payload, trace_id)
+                    _nudge_sent = True
 
             # 5b. Fallback chain: empty cloud response → retry once.
             #     Close WS so the bot restarts with fresh config.
@@ -4428,6 +4593,7 @@ async def _tutor_chat_core(
                     )
                     if _profile_switched:
                         _last_llm_profile = ("deepseek", "deepseek-v4-flash")
+                        _save_llm_profile("deepseek", "deepseek-v4-flash")
                 # Close WS so the next get() triggers a fresh bot start
                 await _DTTutorSession.close_all()
                 try:
@@ -4440,6 +4606,19 @@ async def _tutor_chat_core(
                     await _update_soul_with_context(learner_id, _soul_ctx, mode, force=True)
                 _session = await _DTTutorSession.get(learner_id)
                 result = await _session.send_and_recv(payload, trace_id)
+                # Nudge on retry too if still missing next question
+                if (mode == "guide" and _phase == "EVALUATE_ANSWER" and result.get("ok")
+                        and not _nudge_sent and _last_question_num.get(learner_id, 0) < _next_q):
+                    _r_content = result.get("content", "")
+                    if re.search(rf"第{_next_q}题", _r_content) is None:
+                        _nudge_payload = (
+                            f"【系统】你只评判了第{_qnum}题但没有出第{_next_q}题。"
+                            f"请立即从试卷中选出第{_next_q}题输出。"
+                            "只要题目+选项+引导问题，不要评判。"
+                        )
+                        logger.info("[%s] Missing next question (retry), nudging", trace_id)
+                        result = await _session.send_and_recv(_nudge_payload, trace_id)
+                        _nudge_sent = True
         except Exception as e:
             logger.error("[%s] TutorBot WS failed: %s", trace_id, e)
             return {"ok": False, "error": f"教学引擎响应失败: {e}"}
@@ -4566,12 +4745,18 @@ async def _tutor_chat_core(
                 _is_correct,
             )
 
-            # Auto-trigger exam generation when weak points accumulate
-            # (goes through notification channel, not inline — doesn't interrupt teaching)
+            # Auto-trigger exam generation when weak points accumulate.
+            # Skipped if learner is actively working on a regular exam (user-sent).
+            # Only covers weak points matching the current exam subject.
             try:
-                weaks = await asyncio.to_thread(weak_points, learner_id)
-                if len(weaks) >= 3:
-                    asyncio.create_task(_auto_generate_exam(learner_id, trace_id))
+                _current_ctx = _last_tutor_context.get(learner_id, "").strip()
+                _has_active_exam = len(_current_ctx) > 200  # real exam vs empty/few chars
+                if not _has_active_exam and _auto_exam_due(learner_id):
+                    _exam_subj = _detect_exam_subject(_current_ctx) if _current_ctx else ""
+                    _all_weaks = await asyncio.to_thread(weak_points, learner_id)
+                    _subject_weaks = [w for w in _all_weaks if not _exam_subj or w["kp_id"].startswith(_exam_subj + "/")]
+                    if len(_subject_weaks) >= 3:
+                        asyncio.create_task(_auto_generate_exam(learner_id, trace_id, kp_filter=_exam_subj))
             except Exception:
                 pass
 
@@ -4582,7 +4767,7 @@ async def _tutor_chat_core(
             # 截断后 conversation history 没那道题，DT Bot 不会跳过）。
             #
             # EVALUATE_ANSWER 阶段: 第一个「第N题」是对当前题目的引用 heading，
-            # 不是新题。需要 3+ 标记才截断（2+ 道新题才截）。
+            # 不是新题。需要 3+ 标记才截断（只允许 1 道新题，禁止 2+ 道）。
             # FIRST_QUESTION 阶段: 所有标记都是新题，2+ 就截。
             _q_markers = [
                 m.start() for m in re.finditer(

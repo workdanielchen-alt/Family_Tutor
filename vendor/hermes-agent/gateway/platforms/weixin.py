@@ -1502,6 +1502,46 @@ class WeixinAdapter(BasePlatformAdapter):
             logger.debug("[%s] LLM lock acquire failed (non-fatal)", self.name)
         # ==== END HERMES PATCH ====
 
+        # ==== HERMES PATCH: Route teaching session messages to DeepTutor ====
+        # If sender has an active teaching session (< 2h), bypass LLM agent and
+        # send directly to the platform's tutor_chat API for guided teaching.
+        _now = time.time()
+        _last_active = self._teaching_sessions.get(effective_chat_id) or self._teaching_sessions.get(sender_id)
+        if _last_active is not None:
+            if _now - _last_active > 7200:
+                # Stale session — clean up and fall through to agent
+                self._teaching_sessions.pop(effective_chat_id, None)
+                self._teaching_sessions.pop(sender_id, None)
+                self._save_teaching_sessions()
+            else:
+                platform_url = os.getenv("PLATFORM_API_URL", "http://platform:8100")
+                try:
+                    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as _tsession:
+                        async with _tsession.post(
+                            f"{platform_url}/api/tutor/chat",
+                            json={
+                                "message": text,
+                                "learner_id": effective_chat_id,
+                                "context": "",
+                                "mode": "guide",
+                            },
+                        ) as _tresp:
+                            if _tresp.status == 200:
+                                _tdata = await _tresp.json()
+                                _reply = _tdata.get("content", "") if _tdata.get("ok") else ""
+                                if _reply:
+                                    await self.send(content=_reply, chat_id=effective_chat_id)
+                                    self._teaching_sessions[effective_chat_id] = time.time()
+                                    self._save_teaching_sessions()
+                                    logger.info(
+                                        "[%s] Tutor reply sent to %s (%d chars)",
+                                        self.name, effective_chat_id, len(_reply),
+                                    )
+                                    return
+                except Exception as _exc:
+                    logger.warning("[%s] Tutor chat failed, falling back to agent: %s", self.name, _exc)
+        # ==== END HERMES PATCH ====
+
         await self.handle_message(event)
 
     def _is_dm_allowed(self, sender_id: str) -> bool:
@@ -2186,10 +2226,10 @@ class WeixinAdapter(BasePlatformAdapter):
             _lid = data.get("learner_id", "")
             _ct = data.get("content", "")
             if _lid and _ct:
-                await self.send(content=_ct, chat_id=_lid)
                 self._teaching_sessions[_lid] = time.time()
                 self._save_teaching_sessions()
-                logger.info("[%s] Tutor callback: sent to %s (%d chars)", self.name, _lid, len(_ct))
+                # Fire-and-forget iLink send (can take 5-10s, don't block HTTP response)
+                asyncio.create_task(self._deliver_tutor_reply(_lid, _ct))
             return web.Response(status=200, text="ok")
         except json.JSONDecodeError:
             return web.Response(status=400, text="invalid json")
@@ -2197,7 +2237,15 @@ class WeixinAdapter(BasePlatformAdapter):
             logger.warning("[%s] Tutor callback error: %s", self.name, exc)
             return web.Response(status=500, text=str(exc))
 
-    async def _load_teaching_sessions(self) -> None:
+    async def _deliver_tutor_reply(self, learner_id: str, content: str) -> None:
+        """Deliver a tutor reply via WeChat (background, after HTTP response)."""
+        try:
+            await self.send(content=content, chat_id=learner_id)
+            logger.info("[%s] Tutor reply delivered to %s (%d chars)", self.name, learner_id, len(content))
+        except Exception as exc:
+            logger.warning("[%s] Tutor reply delivery failed for %s: %s", self.name, learner_id, exc)
+
+    def _load_teaching_sessions(self) -> None:
         """Load persisted teaching sessions from disk."""
         try:
             if self._teaching_sessions_path.exists():

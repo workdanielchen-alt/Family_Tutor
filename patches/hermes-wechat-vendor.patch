@@ -1,638 +1,81 @@
 diff --git a/vendor/hermes-agent/gateway/platforms/weixin.py b/vendor/hermes-agent/gateway/platforms/weixin.py
-index ed89b5e32..1aa3160db 100644
+index 1aa3160db..2c78ed052 100644
 --- a/vendor/hermes-agent/gateway/platforms/weixin.py
 +++ b/vendor/hermes-agent/gateway/platforms/weixin.py
-@@ -37,6 +37,7 @@ WEIXIN_COPY_LINE_WIDTH = 120
- 
- try:
-     import aiohttp
-+    from aiohttp import web
- 
-     AIOHTTP_AVAILABLE = True
- except ImportError:  # pragma: no cover - dependency gate
-@@ -1192,18 +1193,23 @@ class WeixinAdapter(BasePlatformAdapter):
-         self._poll_session: Optional[aiohttp.ClientSession] = None
-         self._send_session: Optional[aiohttp.ClientSession] = None
-         self._poll_task: Optional[asyncio.Task] = None
--        self._report_notif_task: Optional[asyncio.Task] = None
-         self._dedup = MessageDeduplicator(ttl_seconds=MESSAGE_DEDUP_TTL_SECONDS)
- 
--	# ==== HERMES PATCH 2026-05-22: teaching session tracking for DT follow-up ====
-+        # ==== HERMES PATCH 2026-05-22: teaching session tracking for DT follow-up ====
-         self._teaching_sessions: dict[str, float] = {}  # sender_id → last_active_ts
--        self._last_tutor_reply: dict[str, str] = {}  # sender_id → tutor_content, for direct WeChat delivery
-         self._auto_processing_senders: set[str] = set()  # currently auto-processing senders
--        # Persist teaching sessions across container restarts
-         self._teaching_sessions_path = Path(hermes_home) / "weixin" / "teaching_sessions.json"
-         self._load_teaching_sessions()
+@@ -1502,6 +1502,46 @@ class WeixinAdapter(BasePlatformAdapter):
+             logger.debug("[%s] LLM lock acquire failed (non-fatal)", self.name)
          # ==== END HERMES PATCH ====
  
-+        # ==== HERMES PATCH 2026-05-28: HTTP callback server for DT teaching ====
-+        self._callback_runner: Optional["web.AppRunner"] = None
-+        self._callback_site: Optional["web.TCPSite"] = None
-+        self._callback_task: Optional[asyncio.Task] = None
-+        self._report_notif_task: Optional[asyncio.Task] = None
-+        self._last_tutor_reply: dict[str, str] = {}  # sender_id → tutor_content (kept for backward compat)
-+        # ==== END HERMES PATCH ====
-+
-         self._account_id = str(extra.get("account_id") or os.getenv("WEIXIN_ACCOUNT_ID", "")).strip()
-         self._token = str(config.token or extra.get("token") or os.getenv("WEIXIN_TOKEN", "")).strip()
-         self._base_url = str(extra.get("base_url") or os.getenv("WEIXIN_BASE_URL", ILINK_BASE_URL)).strip().rstrip("/")
-@@ -1284,7 +1290,12 @@ class WeixinAdapter(BasePlatformAdapter):
-         self._send_session = aiohttp.ClientSession(trust_env=True, connector=_make_ssl_connector(), timeout=_no_aiohttp_timeout)
-         self._token_store.restore(self._account_id)
-         self._poll_task = asyncio.create_task(self._poll_loop(), name="weixin-poll")
--        self._report_notif_task = asyncio.create_task(self._consume_report_notifications(), name="weixin-report")
-+        # ==== HERMES PATCH 2026-05-28: callback server + report notifications ====
-+        self._callback_task = asyncio.create_task(self._start_callback_server(), name="weixin-callback")
-+        self._report_notif_task = asyncio.create_task(
-+            self._consume_report_notifications(), name="weixin-report"
-+        )
-+        # ==== END HERMES PATCH ====
-         self._mark_connected()
-         _LIVE_ADAPTERS[self._token] = self
-         logger.info("[%s] Connected account=%s base=%s", self.name, _safe_id(self._account_id), self._base_url)
-@@ -1311,13 +1322,29 @@ class WeixinAdapter(BasePlatformAdapter):
-             except asyncio.CancelledError:
-                 pass
-         self._poll_task = None
-+        # ==== HERMES PATCH 2026-05-28: callback server cleanup ====
-+        if self._callback_runner:
-+            try:
-+                await self._callback_runner.cleanup()
-+            except Exception:
-+                pass
-+            self._callback_runner = None
-+            self._callback_site = None
-+        if self._callback_task and not self._callback_task.done():
-+            self._callback_task.cancel()
-+            try:
-+                await self._callback_task
-+            except (asyncio.CancelledError, Exception):
-+                pass
-+        self._callback_task = None
-         if self._report_notif_task and not self._report_notif_task.done():
-             self._report_notif_task.cancel()
-             try:
-                 await self._report_notif_task
--            except asyncio.CancelledError:
-+            except (asyncio.CancelledError, Exception):
-                 pass
-         self._report_notif_task = None
-+        # ==== END HERMES PATCH ====
-         if self._poll_session and not self._poll_session.closed:
-             await self._poll_session.close()
-         self._poll_session = None
-@@ -1458,362 +1485,32 @@ class WeixinAdapter(BasePlatformAdapter):
-             media_types=media_types,
-             timestamp=datetime.now(),
-         )
--        logger.warning("[%s] inbound from=%s type=%s media=%d text=%s",
--                       self.name, _safe_id(sender_id), source.chat_type, len(media_paths),
--                       (text or "")[:30])
--
--        # ==== HERMES PATCH 2026-05-22: auto-process media + direct DT teaching delivery ====
--        if media_paths and sender_id not in self._auto_processing_senders:
--            logger.warning("[%s] DIAG: media_paths=%d auto_proc=%s → trigger auto_process_media",
--                           self.name, len(media_paths), sender_id not in self._auto_processing_senders)
--            self._auto_processing_senders.add(sender_id)
--            # 发确认消息，让用户知道正在处理
--            try:
--                await self.send(content="📝 收到题目，正在识别处理，请稍候...", chat_id=effective_chat_id)
--            except Exception:
--                pass
--            try:
--                event = await self._auto_process_media(event, sender_id)
--            except Exception as exc:
--                logger.warning("[%s] Auto-process media error: %s", self.name, exc)
--            finally:
--                self._auto_processing_senders.discard(sender_id)
--
--            # DT teaching response: send directly to WeChat, bypass agent
--            _tutor_reply = self._last_tutor_reply.pop(sender_id, "")
--            if _tutor_reply:
--                self._teaching_sessions[sender_id] = time.time()
--                self._save_teaching_sessions()
--                try:
--                    await self.send(content=_tutor_reply, chat_id=effective_chat_id)
--                except Exception as exc:
--                    logger.warning("[%s] Direct DT send failed: %s", self.name, exc)
--                logger.info("[%s] DT teaching sent directly to WeChat for %s (len=%d)",
--                            self.name, _safe_id(sender_id), len(_tutor_reply))
--                return  # Skip handle_message — already delivered
--            else:
--                logger.warning("[%s] DIAG: auto-proc finished, _tutor_reply empty (async path), "
--                               "skipping agent for %s",
--                               self.name, _safe_id(sender_id))
--                return  # Skip agent — async tutor notification will arrive via bridge
--
--        _dt_attempted = False
--        if not media_paths and (getattr(event, "text", "") or "").strip():
--            _teach_ok = self._is_teaching_session(sender_id)
--            logger.warning("[%s] DIAG: text msg from=%s text=%s teaching_session=%s",
--                           self.name, _safe_id(sender_id), (getattr(event, "text", "") or "")[:30], _teach_ok)
--            if _teach_ok:
--                logger.warning("[%s] Teaching follow-up for %s: %s", self.name,
--                            _safe_id(sender_id), (getattr(event, "text", "") or "")[:50])
--                _dt_attempted = True
--            followup_reply = await self._auto_teaching_followup(event, sender_id)
--            if followup_reply:
--                self._teaching_sessions[sender_id] = time.time()
--                self._save_teaching_sessions()
--                logger.warning("[%s] DIAG: followup_reply len=%d, sending to WeChat...",
--                               self.name, len(followup_reply))
--                await self.send(content=followup_reply, chat_id=effective_chat_id)
--                logger.warning("[%s] DIAG: send() succeeded, returning",
--                               self.name)
--                return  # Skip handle_message — already delivered
--            else:
--                logger.warning("[%s] DIAG: followup_reply empty, falling through to agent for %s",
--                               self.name, _safe_id(sender_id))
--        # ==== END HERMES PATCH ====
--
--        # ==== HERMES PATCH 2026-05-22: LLM intent detection ====
--        # Before falling through to agent, detect intent via lightweight LLM call.
--        # Learning intent → route directly to DT Bot (bypass agent LLM).
--        # Chat intent → let agent handle it normally.
--        # Skip if DT was already attempted via teaching session block above.
--        if not _dt_attempted and not media_paths and (getattr(event, "text", "") or "").strip():
--            _api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
--            if _api_key:
--                intent = await self._detect_intent(getattr(event, "text", ""), _api_key)
--                if intent == "学习":
--                    logger.info("[%s] Intent=学习, routing to DT Bot: %s",
--                                self.name, _safe_id(sender_id))
--                    teach_reply = await self._auto_teaching_followup(event, sender_id)
--                    if teach_reply:
--                        self._teaching_sessions[sender_id] = time.time()
--                        self._save_teaching_sessions()
--                        await self.send(content=teach_reply, chat_id=effective_chat_id)
--                        logger.info("[%s] DT teach sent (intent) to WeChat for %s (len=%d)",
--                                    self.name, _safe_id(sender_id), len(teach_reply))
--                        return
--                    else:
--                        logger.info("[%s] DT teach failed, falling through to agent", self.name)
--                else:
--                    logger.debug("[%s] Intent=%s, routing to agent", self.name, intent)
--        # ==== END HERMES PATCH ====
--
--        await self.handle_message(event)
--
--    def _is_dm_allowed(self, sender_id: str) -> bool:
--        if self._dm_policy == "disabled":
--            return False
--        if self._dm_policy == "allowlist":
--            return sender_id in self._allow_from
--        return True
--
--    async def _auto_process_media(self, event: "MessageEvent", sender_id: str = "") -> "MessageEvent":
--        """自动处理媒体文件: 上传到平台进行 OCR + 引导式教学.
--
--        在消息进入 LLM agent 之前调用, 确保教育内容自动触发教学,
--        不依赖 LLM 自主调用 process_file 工具.
--        """
--        _is_child = os.environ.get("HERMES_HOME", "").endswith("/child")
--        logger.warning("[%s] DIAG: auto-proc entered gateway=%s media_urls=%d",
--                       self.name, "child" if _is_child else "parent", len(event.media_urls or []))
--        if not event.media_urls:
--            logger.warning("[%s] DIAG: auto-proc bailed — no media_urls", self.name)
--            return event
--
--        # 接受图片和常见文档类型 (试卷可能是图片或 Word/PDF)
--        _SKIP_PREFIXES = ("audio/", "video/")  # 跳过音视频
--        file_paths = []
--        logger.warning("[%s] DIAG: auto-proc media_urls=%d media_types=%s",
--                       self.name, len(event.media_urls), event.media_types)
--        for i, path in enumerate(event.media_urls):
--            mtype = event.media_types[i] if i < len(event.media_types) else ""
--            logger.warning("[%s] DIAG: auto-proc path[%d]=%s mtype=%r", self.name, i, path, mtype)
--            # 跳过音视频，处理图片和文档
--            if mtype.startswith(_SKIP_PREFIXES):
--                continue
--            if os.path.isfile(path):
--                file_paths.append(path)
--
--        if not file_paths:
--            logger.warning("[%s] DIAG: auto-proc bailed — no processable files (media_urls=%d)", self.name, len(event.media_urls))
--            return event
--
--        # 只处理第一个文件 (试卷通常是一张图或一个文档)
--        file_path = file_paths[0]
--
--        # 根据扩展名确定 content_type
--        _ext = os.path.splitext(file_path)[1].lower()
--        _content_type_map = {
--            ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
--            ".png": "image/png", ".webp": "image/webp",
--            ".bmp": "image/bmp", ".pdf": "application/pdf",
--            ".doc": "application/msword",
--            ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
--        }
--        content_type = _content_type_map.get(_ext, "application/octet-stream")
--
--        platform_url = os.getenv("PLATFORM_API_URL", "http://platform:8100")
-+        logger.info("[%s] inbound from=%s type=%s media=%d", self.name, _safe_id(sender_id), source.chat_type, len(media_paths))
- 
--        # ==== Acquire LLM lock before OCR (architecture: 60s timeout, TTL 120s) ====
-+        # ==== HERMES PATCH: Acquire LLM lock before OCR (best-effort, no wait) ====
-         _lock_held = False
-         try:
--            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=70)) as _lock_session:
-+            platform_url = os.getenv("PLATFORM_API_URL", "http://platform:8100")
-+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as _lock_session:
-                 async with _lock_session.post(
-                     f"{platform_url}/api/llm/acquire",
--                    params={"timeout": "60"},
-+                    params={"timeout": "0"},
-                 ) as _lock_resp:
-                     if _lock_resp.status == 200:
-                         _lock_held = True
--                        logger.warning("[%s] LLM lock acquired for OCR", self.name)
--                    else:
--                        logger.warning("[%s] LLM lock busy, proceeding without lock", self.name)
--        except Exception as _lock_exc:
--            logger.warning("[%s] LLM lock acquire failed: %s, proceeding", self.name, _lock_exc)
--
--        try:
--            _upload_timeout = int(os.getenv("PLATFORM_UPLOAD_TIMEOUT", "120"))
--            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=_upload_timeout)) as session:
--                with open(file_path, "rb") as f:
--                    data = aiohttp.FormData()
--                    data.add_field("file", f, filename=os.path.basename(file_path),
--                                   content_type=content_type)
--                    data.add_field("auto_teach", "true")
--                    data.add_field("source", "weixin")
--                    data.add_field("learner_id", sender_id)
--                    async with session.post(f"{platform_url}/api/process/file", data=data) as resp:
--                        if resp.status != 200:
--                            logger.warning("[%s] DIAG: auto-proc bailed — platform status=%s", self.name, resp.status)
--                            return event
--                        result = await resp.json()
--        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
--            logger.warning("[%s] DIAG: auto-proc bailed — connection error: %s", self.name, e)
--            return event
--        finally:
--            if _lock_held:
--                try:
--                    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as _rel_session:
--                        await _rel_session.post(f"{platform_url}/api/llm/release")
--                except Exception:
--                    pass
--
--        if not result.get("ok"):
--            logger.warning("[%s] DIAG: auto-proc bailed — platform !ok: %s",
--                          self.name, result.get("error", "no error")[:200])
--            return event
--
--        ocr_text = result.get("content", "").strip()
--        _route = result.get("route", "")
--        # OCR 成功 → 立即创建教学会话，不等通知桥。用户回复文字直接走 DT 而非 LLM agent
--        if _route != "ocr_fallback" and ocr_text:
--            self._teaching_sessions[sender_id] = time.time()
--            self._save_teaching_sessions()
--            logger.warning("[%s] DIAG: Teaching session created for %s (async tutor pending)",
--                           self.name, _safe_id(sender_id))
--
--        tutor_content = result.get("tutor_content", "").strip()
--        logger.warning("[%s] DIAG: auto-proc result ocr=%d tutor=%d",
--                       self.name, len(ocr_text), len(tutor_content))
--        extra_parts = []
--
--        if ocr_text:
--            if tutor_content:
--                # OCR 内容注入事件供 agent 参考
--                extra_parts.append(ocr_text[:500])
--            else:
--                # DT Bot 异步处理中，不暴露考题原文给 agent，不做额外提示
--                logger.warning("[%s] DIAG: auto-proc DT Bot silent (async), suppress exam content from agent msg",
--                               self.name)
--
--        if tutor_content:
--            extra_parts.append(tutor_content)
--            self._last_tutor_reply[sender_id] = tutor_content  # per-sender
--            logger.warning("[%s] DIAG: auto-proc setting _last_tutor_reply[%s] len=%d",
--                           self.name, sender_id, len(tutor_content))
--        elif sender_id:
--            self._last_tutor_reply.pop(sender_id, "")
--
--        if not extra_parts:
--            logger.warning("[%s] DIAG: auto-proc bailed — no extra_parts after OCR+tutor", self.name)
--            return event
--
--        import dataclasses
--        injection = "\n\n".join(extra_parts)
--        new_text = f"{injection}\n\n---\n{event.text}" if event.text else injection
--        event = dataclasses.replace(event, text=new_text)
--        logger.warning("[%s] DIAG: auto-proc injected OCR+teaching (%d chars)", self.name, len(new_text))
--        return event
--
--    # ==== HERMES PATCH 2026-05-22: DT teaching helper methods ====
--    _TEACHING_SESSION_TTL: float = 1800.0  # 30 min inactivity -> auto-exit
--
--    def _load_teaching_sessions(self) -> None:
--        path = self._teaching_sessions_path
--        if not path.exists():
--            return
--        try:
--            data = json.loads(path.read_text(encoding="utf-8"))
--        except Exception as exc:
--            logger.warning("[%s] Failed to load teaching sessions: %s", self.name, exc)
--            return
--        now = time.time()
--        restored = 0
--        expired = 0
--        for sid, ts in data.items():
--            if now - ts > self._TEACHING_SESSION_TTL:
--                expired += 1
--                continue
--            self._teaching_sessions[sid] = ts
--            restored += 1
--        if restored or expired:
--            logger.warning("[%s] Teaching sessions restored=%d expired=%d",
--                          self.name, restored, expired)
-+        except Exception:
-+            logger.debug("[%s] LLM lock acquire failed (non-fatal)", self.name)
-+        # ==== END HERMES PATCH ====
- 
--    def _save_teaching_sessions(self) -> None:
--        path = self._teaching_sessions_path
--        try:
--            path.parent.mkdir(parents=True, exist_ok=True)
--            path.write_text(
--                json.dumps(self._teaching_sessions, ensure_ascii=False, indent=None),
--                encoding="utf-8",
--            )
--        except Exception as exc:
--            logger.warning("[%s] Failed to save teaching sessions: %s", self.name, exc)
-+        await self.handle_message(event)
- 
--    def _is_teaching_session(self, sender_id: str) -> bool:
--        """Check if sender has an active teaching session (not expired)."""
--        ts = self._teaching_sessions.get(sender_id)
--        if ts is None:
--            return False
--        if time.time() - ts > self._TEACHING_SESSION_TTL:
--            del self._teaching_sessions[sender_id]
--            self._save_teaching_sessions()
-+    def _is_dm_allowed(self, sender_id: str) -> bool:
-+        if self._dm_policy == "disabled":
-             return False
--        self._teaching_sessions[sender_id] = time.time()  # refresh
--        self._save_teaching_sessions()
-+        if self._dm_policy == "allowlist":
-+            return sender_id in self._allow_from
-         return True
- 
--    async def _auto_teaching_followup(self, event, sender_id: str) -> str:
--        """Route a follow-up text message to DT via /api/tutor/chat.
--
--        Returns DT's teaching response content, or empty string on failure.
--        Also sends auto-generated practice questions to WeChat if available.
--        """
--        text = getattr(event, "text", "")
--        if not text.strip():
--            return ""
--        platform_url = os.getenv("PLATFORM_API_URL", "http://platform:8100")
--        try:
--            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as session:
--                async with session.post(
--                    f"{platform_url}/api/tutor/chat",
--                    json={"message": text.strip(), "learner_id": sender_id, "mode": "guide"},
--                ) as resp:
--                    if resp.status != 200:
--                        return ""
--                    result = await resp.json()
--                    if result.get("ok"):
--                        return result.get("content", "")
--        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
--            logger.debug("[%s] Teaching follow-up failed: %s", self.name, e)
--        return ""
--    # ==== END HERMES PATCH ====
--
--    # ==== HERMES PATCH 2026-05-22: LLM intent detection ====
--    async def _detect_intent(self, text: str, api_key: str) -> str:
--        """Use DeepSeek API to classify user intent: 学习 or 聊天.
--
--        Returns '学习', '聊天', or '' on failure.
--        """
--        if not text.strip() or not api_key:
--            return ""
--        try:
--            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
--                async with session.post(
--                    "https://api.deepseek.com/v1/chat/completions",
--                    headers={
--                        "Authorization": f"Bearer {api_key}",
--                        "Content-Type": "application/json",
--                    },
--                    json={
--                        "model": "deepseek-chat",
--                        "messages": [
--                            {
--                                "role": "system",
--                                "content": (
--                                    "你是一个严格的意图分类器。判断用户消息属于哪种意图，只返回一个词：学习 或 聊天\n\n"
--                                    "学习意图：学生问学科知识、做题、解题、对答案、问公式/定理/概念、问作业、复习备考等一切与学习相关的内容。\n"
--                                    "聊天意图：打招呼、聊日常、分享生活、闲聊、问心情等非学习内容。"
--                                ),
--                            },
--                            {"role": "user", "content": text.strip()},
--                        ],
--                        "temperature": 0,
--                        "max_tokens": 5,
--                    },
--                ) as resp:
--                    if resp.status != 200:
--                        logger.debug("[%s] Intent detection API error: %s", self.name, resp.status)
--                        return ""
--                    result = await resp.json()
--                    content = (result.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
--                    if content in ("学习", "聊天"):
--                        return content
--                    logger.debug("[%s] Intent detection unexpected: %s", self.name, content)
--                    return ""
--        except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError, KeyError) as e:
--            logger.debug("[%s] Intent detection failed: %s", self.name, e)
--            return ""
--    # ==== END HERMES PATCH ====
--
-     async def _collect_media(self, item: Dict[str, Any], media_paths: List[str], media_types: List[str]) -> None:
-         item_type = item.get("type")
-         if item_type == ITEM_IMAGE:
-@@ -2029,69 +1726,6 @@ class WeixinAdapter(BasePlatformAdapter):
-         assert last_error is not None
-         raise last_error
- 
--    async def _consume_report_notifications(self) -> None:
--        """Background task: poll /data/hermes/notifications/ for report_push
--        notifications and send them to the appropriate WeChat user.
--
--        Routes by target field:
--          - target="parent" → sent by parent gateway (管理员)
--          - target="child"  → sent by child gateway (学生)
--        """
--        notif_dir = Path("/data/hermes/notifications")
--        # Determine which target this gateway handles
--        _is_child = os.environ.get("HERMES_HOME", "").endswith("/child")
--        _my_target = "child" if _is_child else "parent"
--        logger.info("[%s] Report notification consumer started (target=%s)", self.name, _my_target)
--        while self._running:
--            try:
--                if notif_dir.exists():
--                    for f in sorted(notif_dir.iterdir()):
--                        if not f.is_file() or f.suffix != ".json":
--                            continue
--                        try:
--                            with open(f, encoding="utf-8") as fh:
--                                notif = json.load(fh)
--
--                            # ── Async tutor reply (from background tutor_chat) ──
--                            if notif.get("type") == "tutor_reply":
--                                _lid = notif.get("learner_id", "")
--                                _ct = notif.get("content", "")
--                                if _lid and _ct:
--                                    await self.send(content=_ct, chat_id=_lid)
--                                    # 创建教学会话，确保用户后续回复走 DeepTutor 而非 LLM agent
--                                    self._teaching_sessions[_lid] = time.time()
--                                    self._save_teaching_sessions()
--                                    logger.info(
--                                        "[%s] Async tutor reply sent to %s (%d chars)",
--                                        self.name, _lid, len(_ct),
--                                    )
--                                consumed = f.with_suffix(".consumed")
--                                f.rename(consumed)
--                                continue
--
--                            if notif.get("type") != "report_push":
--                                continue
--                            # Route by target: skip if not for this gateway
--                            _notif_target = notif.get("target", "parent")  # default parent for backward compat
--                            if _notif_target != _my_target:
--                                continue
--                            learner_id = notif.get("learner_id", "")
--                            content = notif.get("content", "")
--                            if learner_id and content:
--                                await self.send(content=content, chat_id=learner_id)
--                                logger.info(
--                                    "[%s] Report pushed to %s: %s (target=%s)",
--                                    self.name, learner_id, notif.get("report_type", "?"), _notif_target
--                                )
--                            # Mark as consumed
--                            consumed = f.with_suffix(".consumed")
--                            f.rename(consumed)
--                        except (json.JSONDecodeError, KeyError, OSError):
--                            pass
--            except Exception:
--                logger.debug("[%s] Report notification check failed", self.name)
--            await asyncio.sleep(30)
--
-     async def send(
-         self,
-         chat_id: str,
-@@ -2106,8 +1740,10 @@ class WeixinAdapter(BasePlatformAdapter):
- 
-         # Extract MEDIA: tags and bare local file paths before text delivery.
-         media_files, cleaned_content = self.extract_media(content)
-+        media_files = self.filter_media_delivery_paths(media_files)
-         _, image_cleaned = self.extract_images(cleaned_content)
-         local_files, final_content = self.extract_local_files(image_cleaned)
-+        local_files = self.filter_local_delivery_paths(local_files)
- 
-         _AUDIO_EXTS = {".ogg", ".opus", ".mp3", ".wav", ".m4a", ".flac"}
-         _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
-@@ -2494,6 +2130,95 @@ class WeixinAdapter(BasePlatformAdapter):
-             return ""
-         return _wrap_copy_friendly_lines_for_weixin(_normalize_markdown_blocks(content))
- 
-+    # ==== HERMES PATCH 2026-05-28: report notification consumer ====
-+    async def _consume_report_notifications(self) -> None:
-+        """Poll for report-push notifications from the platform API."""
-+        _notif_dir = Path(self._hermes_home) / "weixin" / "notifications"
-+        _notif_dir.mkdir(parents=True, exist_ok=True)
-+        while self._running:
-+            try:
-+                for f in sorted(_notif_dir.glob("*.json"), key=lambda p: p.stat().st_mtime):
-+                    if f.suffix != ".json":
-+                        continue
-+                    if f.name.endswith(".consumed"):
-+                        continue
-+                    try:
-+                        with open(f, encoding="utf-8") as fh:
-+                            notif = json.load(fh)
-+                        if notif.get("type") != "report_push":
-+                            continue
-+                        if notif.get("target") and notif["target"] != self._account_id:
-+                            continue
-+                        _content = notif.get("content", "")
-+                        _chat_id = notif.get("chat_id", "")
-+                        if _chat_id and _content:
-+                            await self.send(content=_content, chat_id=_chat_id)
-+                        consumed = f.with_suffix(".consumed")
-+                        f.rename(consumed)
-+                    except Exception:
-+                        logger.debug("[%s] Report notification check failed", self.name)
-+            except Exception:
-+                logger.debug("[%s] Report notification check failed", self.name)
-+            await asyncio.sleep(3)
-+    # ==== END HERMES PATCH ====
-+
-+    # ==== HERMES PATCH 2026-05-28: HTTP callback server for DT teaching ====
-+    async def _start_callback_server(self) -> None:
-+        """Start a minimal aiohttp server for receiving teaching callbacks from platform."""
-+        _is_child = os.environ.get("HERMES_HOME", "").endswith("/child")
-+        _port = int(os.getenv("WEIXIN_CALLBACK_PORT", "8006" if _is_child else "8005"))
-+        _host = os.getenv("WEIXIN_CALLBACK_HOST", "0.0.0.0")
-+        try:
-+            app = web.Application()
-+            app.router.add_post("/api/tutor/callback", self._handle_tutor_callback)
-+            self._callback_runner = web.AppRunner(app)
-+            await self._callback_runner.setup()
-+            self._callback_site = web.TCPSite(self._callback_runner, _host, _port)
-+            await self._callback_site.start()
-+            logger.info("[%s] Tutor callback server started on %s:%d", self.name, _host, _port)
-+        except Exception as exc:
-+            logger.warning("[%s] Tutor callback server failed to start: %s", self.name, exc)
-+
-+    async def _handle_tutor_callback(self, request: "web.Request") -> "web.Response":
-+        """Receive teaching response from platform and deliver via WeChat."""
-+        try:
-+            data = await request.json()
-+            _lid = data.get("learner_id", "")
-+            _ct = data.get("content", "")
-+            if _lid and _ct:
-+                await self.send(content=_ct, chat_id=_lid)
-+                self._teaching_sessions[_lid] = time.time()
++        # ==== HERMES PATCH: Route teaching session messages to DeepTutor ====
++        # If sender has an active teaching session (< 2h), bypass LLM agent and
++        # send directly to the platform's tutor_chat API for guided teaching.
++        _now = time.time()
++        _last_active = self._teaching_sessions.get(effective_chat_id) or self._teaching_sessions.get(sender_id)
++        if _last_active is not None:
++            if _now - _last_active > 7200:
++                # Stale session — clean up and fall through to agent
++                self._teaching_sessions.pop(effective_chat_id, None)
++                self._teaching_sessions.pop(sender_id, None)
 +                self._save_teaching_sessions()
-+                logger.info("[%s] Tutor callback: sent to %s (%d chars)", self.name, _lid, len(_ct))
-+            return web.Response(status=200, text="ok")
-+        except json.JSONDecodeError:
-+            return web.Response(status=400, text="invalid json")
-+        except Exception as exc:
-+            logger.warning("[%s] Tutor callback error: %s", self.name, exc)
-+            return web.Response(status=500, text=str(exc))
++            else:
++                platform_url = os.getenv("PLATFORM_API_URL", "http://platform:8100")
++                try:
++                    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as _tsession:
++                        async with _tsession.post(
++                            f"{platform_url}/api/tutor/chat",
++                            json={
++                                "message": text,
++                                "learner_id": effective_chat_id,
++                                "context": "",
++                                "mode": "guide",
++                            },
++                        ) as _tresp:
++                            if _tresp.status == 200:
++                                _tdata = await _tresp.json()
++                                _reply = _tdata.get("content", "") if _tdata.get("ok") else ""
++                                if _reply:
++                                    await self.send(content=_reply, chat_id=effective_chat_id)
++                                    self._teaching_sessions[effective_chat_id] = time.time()
++                                    self._save_teaching_sessions()
++                                    logger.info(
++                                        "[%s] Tutor reply sent to %s (%d chars)",
++                                        self.name, effective_chat_id, len(_reply),
++                                    )
++                                    return
++                except Exception as _exc:
++                    logger.warning("[%s] Tutor chat failed, falling back to agent: %s", self.name, _exc)
++        # ==== END HERMES PATCH ====
 +
-+    async def _load_teaching_sessions(self) -> None:
-+        """Load persisted teaching sessions from disk."""
-+        try:
-+            if self._teaching_sessions_path.exists():
-+                data = json.loads(self._teaching_sessions_path.read_text(encoding="utf-8"))
-+                now = time.time()
-+                for k, v in data.items():
-+                    if now - v < 7200:
-+                        self._teaching_sessions[k] = v
-+        except Exception:
-+            pass
-+
-+    def _save_teaching_sessions(self) -> None:
-+        """Persist teaching sessions to disk."""
-+        try:
-+            self._teaching_sessions_path.write_text(
-+                json.dumps(self._teaching_sessions, ensure_ascii=False), encoding="utf-8"
-+            )
-+        except Exception:
-+            pass
-+    # ==== END HERMES PATCH ====
-+
+         await self.handle_message(event)
  
- async def send_weixin_direct(
-     *,
+     def _is_dm_allowed(self, sender_id: str) -> bool:
+@@ -2186,10 +2226,10 @@ class WeixinAdapter(BasePlatformAdapter):
+             _lid = data.get("learner_id", "")
+             _ct = data.get("content", "")
+             if _lid and _ct:
+-                await self.send(content=_ct, chat_id=_lid)
+                 self._teaching_sessions[_lid] = time.time()
+                 self._save_teaching_sessions()
+-                logger.info("[%s] Tutor callback: sent to %s (%d chars)", self.name, _lid, len(_ct))
++                # Fire-and-forget iLink send (can take 5-10s, don't block HTTP response)
++                asyncio.create_task(self._deliver_tutor_reply(_lid, _ct))
+             return web.Response(status=200, text="ok")
+         except json.JSONDecodeError:
+             return web.Response(status=400, text="invalid json")
+@@ -2197,7 +2237,15 @@ class WeixinAdapter(BasePlatformAdapter):
+             logger.warning("[%s] Tutor callback error: %s", self.name, exc)
+             return web.Response(status=500, text=str(exc))
+ 
+-    async def _load_teaching_sessions(self) -> None:
++    async def _deliver_tutor_reply(self, learner_id: str, content: str) -> None:
++        """Deliver a tutor reply via WeChat (background, after HTTP response)."""
++        try:
++            await self.send(content=content, chat_id=learner_id)
++            logger.info("[%s] Tutor reply delivered to %s (%d chars)", self.name, learner_id, len(content))
++        except Exception as exc:
++            logger.warning("[%s] Tutor reply delivery failed for %s: %s", self.name, learner_id, exc)
++
++    def _load_teaching_sessions(self) -> None:
+         """Load persisted teaching sessions from disk."""
+         try:
+             if self._teaching_sessions_path.exists():
