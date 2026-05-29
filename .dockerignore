@@ -42,6 +42,7 @@ vendor/
 # Exclude vendor submodule junk to keep build context small
 vendor/deeptutor/.git/
 vendor/deeptutor/.github/
+vendor/deeptutor/data/
 vendor/deeptutor/deeptutor_web/
 vendor/deeptutor/deeptutor_*/node_modules/
 vendor/deeptutor/docs/
@@ -49,6 +50,9 @@ vendor/deeptutor/tests/
 vendor/deeptutor/assets/
 vendor/deeptutor/examples/
 vendor/deeptutor/scripts/
+vendor/deeptutor/site/
+vendor/hermes-agent/node_modules/
+vendor/hermes-agent/.venv/
 dist/
 downloads/
 eggs/
@@ -82,14 +86,17 @@ htmlcov/
 .dmypy.json
 dmypy.json
 
+# Other Python tools
+.tox/
+.ruff_cache
+.pyre/
+.pytype/
+
 # ============================================
 # Node.js
 # ============================================
 node_modules/
 **/node_modules/
-web/node_modules/
-# Allow for Docker build (npm registry unreliable in China)
-!web/node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
@@ -101,12 +108,15 @@ web/.next/
 web/.next2/
 out/
 web/out/
+web/.next-new/
+web/.next.old
 
 # ============================================
 # IDE and Editor
 # ============================================
 .idea/
 .vscode/
+.cursor/
 *.swp
 *.swo
 *~
@@ -121,11 +131,17 @@ docker-compose*.yml
 .dockerignore
 
 # ============================================
-# User Data (will be mounted as volumes)
+# Runtime Data (mounted as volumes, not built)
 # ============================================
-data/user/
-data/knowledge_bases/
+data/
+data_dev/
+test_data/
 run_code_workspace/
+multi-user/
+output/
+outputs/
+**/output/
+**/outputs/
 
 # ============================================
 # Development and Testing
@@ -136,6 +152,14 @@ scripts/extract_numbered_items.sh
 logs/
 *.bak
 *.tmp
+
+# Playwright test artifacts
+web/playwright-report/
+web/test-results/
+
+# Test / coverage output
+coverage.xml
+nosetests.xml
 
 # ============================================
 # Temporary and Cache Files
@@ -148,8 +172,36 @@ temp/
 *.tmp
 *.temp
 
+# AI assistant state
+.claude
+.deepseek/
+
 # ============================================
 # License and Communication
 # ============================================
 LICENSE
 Communication.md
+
+# ============================================
+# Binary / Large Asset Files
+# ============================================
+*.zip
+*.tar
+*.tar.gz
+*.rar
+*.7z
+*.mp3
+*.wav
+*.ogg
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Profiling
+*.prof
+*.pstats
+
+# Jupyter
+.ipynb_checkpoints/
