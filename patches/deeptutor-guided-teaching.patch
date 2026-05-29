@@ -1,0 +1,822 @@
+diff --git a/deeptutor/agents/_shared/tool_composition.py b/deeptutor/agents/_shared/tool_composition.py
+index b1e6a12..dff7af2 100644
+--- a/deeptutor/agents/_shared/tool_composition.py
++++ b/deeptutor/agents/_shared/tool_composition.py
+@@ -33,6 +33,8 @@ from deeptutor.tools.builtin import BUILTIN_TOOL_NAMES, USER_TOGGLEABLE_TOOL_NAM
+ AUTO_MOUNTED_TOOLS: frozenset[str] = frozenset(
+     {
+         "rag",
++        "kb_lookup_concept",
++        "kb_syllabus",
+         "read_source",
+         "read_memory",
+         "write_memory",
+@@ -108,6 +110,8 @@ def compose_enabled_tools(
+     ]
+     if mount_flags.has_kb:
+         composed.append("rag")
++        composed.append("kb_lookup_concept")
++        composed.append("kb_syllabus")
+     if mount_flags.has_sources:
+         composed.append("read_source")
+     if mount_flags.has_memory:
+diff --git a/deeptutor/agents/chat/agentic_pipeline.py b/deeptutor/agents/chat/agentic_pipeline.py
+index 93737c6..29a6e4b 100644
+--- a/deeptutor/agents/chat/agentic_pipeline.py
++++ b/deeptutor/agents/chat/agentic_pipeline.py
+@@ -1389,6 +1389,10 @@ class AgenticChatPipeline:
+                 kb_schema = properties.get("kb_name")
+                 if isinstance(kb_schema, dict):
+                     kb_schema["enum"] = kb_choices
++            if function.get("name") in ("kb_lookup_concept", "kb_syllabus") and isinstance(properties, dict):
++                kb_schema = properties.get("kb_name")
++                if isinstance(kb_schema, dict):
++                    kb_schema["enum"] = kb_choices
+             if function.get("name") == "read_source" and isinstance(properties, dict):
+                 sid_schema = properties.get("source_id")
+                 if isinstance(sid_schema, dict) and source_ids:
+@@ -1519,6 +1523,10 @@ class AgenticChatPipeline:
+         task_dir = None
+         if turn_id:
+             task_dir = get_path_service().get_task_workspace("chat", turn_id)
++        if tool_name in ("rag", "kb_lookup_concept", "kb_syllabus"):
++            kb_names = self._selected_kbs(context)
++            if kb_names:
++                kwargs.setdefault("kb_name", kb_names[0])
+         if tool_name == "rag":
+             kwargs.setdefault("mode", "hybrid")
+         elif tool_name == "code_execution":
+diff --git a/deeptutor/agents/question/pipeline.py b/deeptutor/agents/question/pipeline.py
+index 98cbec5..874ff86 100644
+--- a/deeptutor/agents/question/pipeline.py
++++ b/deeptutor/agents/question/pipeline.py
+@@ -630,7 +630,7 @@ class QuestionPipeline:
+         """
+         system_prompt = self._t(
+             "explore.system",
+-            kb_note=self._kb_system_note(),
++            kb_teaching_context=self._kb_system_note(),
+             tool_list=self._tool_list_text(context),
+             num_questions=num_questions,
+         )
+@@ -833,7 +833,7 @@ class QuestionPipeline:
+             "quiz_step.system",
+             question_number=question_number,
+             total_questions=total_questions,
+-            kb_note=self._kb_system_note(),
++            kb_teaching_context=self._kb_system_note(),
+             tool_list=self._tool_list_text(context),
+         )
+         system_prompt = append_language_directive(system_prompt, self.language)
+@@ -1522,6 +1522,10 @@ class QuestionPipeline:
+                 kb_schema = properties.get("kb_name")
+                 if isinstance(kb_schema, dict) and kb_choices:
+                     kb_schema["enum"] = kb_choices
++            if name in ("kb_lookup_concept", "kb_syllabus") and isinstance(properties, dict):
++                kb_schema = properties.get("kb_name")
++                if isinstance(kb_schema, dict) and kb_choices:
++                    kb_schema["enum"] = kb_choices
+             if name == "read_source" and isinstance(properties, dict):
+                 sid_schema = properties.get("source_id")
+                 if isinstance(sid_schema, dict) and source_ids:
+@@ -1540,10 +1544,11 @@ class QuestionPipeline:
+         task_dir = None
+         if turn_id:
+             task_dir = get_path_service().get_task_workspace(FEATURE, turn_id)
+-        if tool_name == "rag":
+-            kwargs.setdefault("mode", "hybrid")
++        if tool_name in ("rag", "kb_lookup_concept", "kb_syllabus"):
+             if self.kb_name:
+                 kwargs.setdefault("kb_name", self.kb_name)
++        if tool_name == "rag":
++            kwargs.setdefault("mode", "hybrid")
+         elif tool_name == "code_execution":
+             kwargs.setdefault("intent", context.user_message)
+             kwargs.setdefault("timeout", 30)
+@@ -1606,6 +1611,9 @@ class QuestionPipeline:
+     def _kb_system_note(self) -> str:
+         if not self.kb_name:
+             return ""
++        ctx = self._load_kb_teaching_context()
++        if ctx:
++            return ctx
+         if self.language == "zh":
+             return f"用户已挂载知识库：{self.kb_name}。调用 rag 时，kb_name 必须填这个名称。"
+         return (
+@@ -1613,6 +1621,44 @@ class QuestionPipeline:
+             f"must be {self.kb_name!r}."
+         )
+ 
++    def _load_kb_teaching_context(self) -> str:
++        if not self.kb_name:
++            return ""
++        try:
++            from deeptutor.multi_user.knowledge_access import resolve_for_rag
++            from deeptutor.services.kb_navigation import KnowledgeNavigationService
++
++            resource = resolve_for_rag(self.kb_name)
++            if resource is None:
++                return ""
++            nav = KnowledgeNavigationService(self.kb_name, str(resource.base_dir))
++            syllabus = nav.get_syllabus()
++            if not syllabus:
++                return ""
++            lines: list[str] = []
++            if self.language == "zh":
++                lines.append(f"## 知识库教学参考\n已挂载知识库：{self.kb_name}\n")
++                for doc in syllabus[:3]:
++                    lines.append(f"### {doc.title}")
++                    for sec in doc.sections[:5]:
++                        concepts = nav.get_concepts_for_section(doc.doc_id, sec.heading)
++                        cs = ", ".join(c.label for c in concepts[:5])
++                        lines.append(f"- {sec.heading}" + (f" → 概念：{cs}" if cs else ""))
++                lines.append("调用 kb_lookup_concept 查概念定义，kb_syllabus 浏览结构，rag 搜索段落。")
++            else:
++                lines.append(f"## Knowledge Base Teaching Context\nAttached: {self.kb_name}\n")
++                for doc in syllabus[:3]:
++                    lines.append(f"### {doc.title}")
++                    for sec in doc.sections[:5]:
++                        concepts = nav.get_concepts_for_section(doc.doc_id, sec.heading)
++                        cs = ", ".join(c.label for c in concepts[:5])
++                        lines.append(f"- {sec.heading}" + (f" → concepts: {cs}" if cs else ""))
++                lines.append("Use kb_lookup_concept for definitions, kb_syllabus for structure, rag for search.")
++            return "\n".join(lines)
++        except Exception as exc:
++            logger.debug("Failed to load KB teaching context: %s", exc)
++            return ""
++
+     # ------------------------------------------------------------------
+     # LLM call helpers
+     # ------------------------------------------------------------------
+diff --git a/deeptutor/agents/question/prompts/en/pipeline.yaml b/deeptutor/agents/question/prompts/en/pipeline.yaml
+index 81e48f4..16f7470 100644
+--- a/deeptutor/agents/question/prompts/en/pipeline.yaml
++++ b/deeptutor/agents/question/prompts/en/pipeline.yaml
+@@ -59,7 +59,7 @@ explore:
+ 
+     # How to make each iteration count
+ 
+-    Before you decide what this reply will be, review the conversation so far — your earlier ``THINK`` notes, the tool calls you already made, and the summarized tool results that came back. Then ask:
++    Before you decide what this reply will be, review the conversation so far — your earlier ``THINK`` notes, the tool calls you already made, and the summarized tool results that came back. If a knowledge base is attached, use ``kb_syllabus`` first to explore its structure. Then ask:
+ 
+     1. What do I now know that I didn't at the start of this turn?
+     2. What is still missing or uncertain for producing {num_questions} grounded questions at the requested type / difficulty?
+@@ -71,7 +71,7 @@ explore:
+ 
+     The runtime mounts whichever of the following are appropriate for this turn. Their presence below is not an instruction to invoke them; it is a list of what you *may* invoke when prior iterations show you still need information.
+ 
+-    {kb_note}
++    {kb_teaching_context}
+     Enabled tools:
+     {tool_list}
+ 
+@@ -240,7 +240,7 @@ quiz_step:
+     - Copy tool names, parameter names, and KB names verbatim from the "Enabled tools" / "Knowledge bases" blocks. Never invent.
+     - Arguments must be concrete and executable; empty queries are invalid.
+ 
+-    {kb_note}
++    {kb_teaching_context}
+     Enabled tools:
+     {tool_list}
+   user_template: |-
+diff --git a/deeptutor/agents/question/prompts/zh/pipeline.yaml b/deeptutor/agents/question/prompts/zh/pipeline.yaml
+index 29bb89a..215e0fd 100644
+--- a/deeptutor/agents/question/prompts/zh/pipeline.yaml
++++ b/deeptutor/agents/question/prompts/zh/pipeline.yaml
+@@ -42,7 +42,7 @@ explore:
+ 
+     # 让每次迭代都有价值
+ 
+-    在决定本次回复要做什么之前，先复盘到目前为止的对话——你之前的 ``THINK`` 笔记、已经发起的工具调用、以及返回的「已概括的工具结果」。然后问自己：
++    在决定本次回复要做什么之前，先复盘到目前为止的对话——你之前的 ``THINK`` 笔记、已经发起的工具调用、以及返回的「已概括的工具结果」。如有知识库，先用 ``kb_syllabus`` 浏览其结构了解覆盖范围。然后问自己：
+ 
+     1. 我现在比本轮开始时多知道了什么？
+     2. 为了产出 {num_questions} 道符合指定类型 / 难度且**有依据**的题目，我还缺什么、还有哪些不确定？
+@@ -54,7 +54,7 @@ explore:
+ 
+     运行时会根据本轮上下文挂载下述能力。它们出现在列表里**不是**让你必须调用的指示，而是**当之前的迭代显示你确实还缺信息时，你可以调用的备选**。
+ 
+-    {kb_note}
++    {kb_teaching_context}
+     启用的工具：
+     {tool_list}
+ 
+@@ -221,7 +221,7 @@ quiz_step:
+     - 工具名、参数名、知识库名必须**逐字**抄自下方「启用的工具」/「知识库」块。**不要**编造。
+     - 参数必须具体可执行；空查询无效。
+ 
+-    {kb_note}
++    {kb_teaching_context}
+     启用的工具：
+     {tool_list}
+   user_template: |-
+diff --git a/deeptutor/agents/solve/pipeline.py b/deeptutor/agents/solve/pipeline.py
+index 9653ffc..7ebfe6f 100644
+--- a/deeptutor/agents/solve/pipeline.py
++++ b/deeptutor/agents/solve/pipeline.py
+@@ -857,7 +857,7 @@ class SolvePipeline:
+             step_index_human=step_index + 1,
+             total_steps=total_steps,
+             tone_guidance=tone_guidance,
+-            kb_note=kb_note,
++            kb_teaching_context=kb_note,
+             tool_list=tool_list,
+         )
+         return append_language_directive(system, self.language)
+@@ -1238,14 +1238,17 @@ class SolvePipeline:
+     # ------------------------------------------------------------------
+     def _resolved_tools(self) -> list[str]:
+         """Filter the user's enabled_tools by what the registry actually has,
+-        and ensure ``rag`` is mounted when a KB is attached."""
++        and ensure KB-aware tools are mounted when a KB is attached."""
+         resolved: list[str] = []
+         for tool in self.registry.get_enabled(self.enabled_tools):
+             if tool.name in resolved:
+                 continue
+             resolved.append(tool.name)
+-        if self.kb_name and self._tool_in_registry("rag") and "rag" not in resolved:
+-            resolved.append("rag")
++        if self.kb_name:
++            kb_tools = ["rag", "kb_lookup_concept", "kb_syllabus"]
++            for name in kb_tools:
++                if self._tool_in_registry(name) and name not in resolved:
++                    resolved.append(name)
+         return resolved
+ 
+     def _build_llm_tool_schemas(self) -> list[dict[str, Any]]:
+@@ -1259,7 +1262,7 @@ class SolvePipeline:
+             if not isinstance(parameters, dict):
+                 continue
+             properties = parameters.get("properties") or {}
+-            if function.get("name") == "rag" and isinstance(properties, dict):
++            if function.get("name") in ("rag", "kb_lookup_concept", "kb_syllabus") and isinstance(properties, dict):
+                 if isinstance(properties.get("query"), dict):
+                     properties["query"].setdefault("minLength", 1)
+                 kb_schema = properties.get("kb_name")
+@@ -1279,10 +1282,11 @@ class SolvePipeline:
+         task_dir = None
+         if turn_id:
+             task_dir = get_path_service().get_task_workspace("deep_solve", turn_id)
+-        if tool_name == "rag":
+-            kwargs.setdefault("mode", "hybrid")
++        if tool_name in ("rag", "kb_lookup_concept", "kb_syllabus"):
+             if self.kb_name:
+                 kwargs.setdefault("kb_name", self.kb_name)
++        if tool_name == "rag":
++            kwargs.setdefault("mode", "hybrid")
+         elif tool_name == "code_execution":
+             kwargs.setdefault("intent", context.user_message)
+             kwargs.setdefault("timeout", 30)
+@@ -1476,6 +1480,11 @@ class SolvePipeline:
+     def _kb_system_note(self) -> str:
+         if not self.kb_name:
+             return ""
++        # Try structured teaching context from knowledge graph.
++        ctx = self._load_kb_teaching_context()
++        if ctx:
++            return ctx
++        # Fallback to simple tool hint.
+         if self.language == "zh":
+             return f"用户已挂载知识库：{self.kb_name}。调用 rag 时，kb_name 必须填这个名称。"
+         return (
+@@ -1483,6 +1492,68 @@ class SolvePipeline:
+             f"must be {self.kb_name!r}."
+         )
+ 
++    def _load_kb_teaching_context(self) -> str:
++        """Load structured KB context.
++
++        Reads ``knowledge_graph.json`` and formats a teaching context
++        string for injection as ``{kb_teaching_context}``. Returns empty
++        string if no knowledge graph exists (caller falls back to
++        the simple ``kb_note``).
++        """
++        if not self.kb_name:
++            return ""
++        try:
++            from deeptutor.multi_user.knowledge_access import resolve_for_rag
++            from deeptutor.services.kb_navigation import KnowledgeNavigationService
++
++            resource = resolve_for_rag(self.kb_name)
++            if resource is None:
++                return ""
++            kb_base_dir = str(resource.base_dir)
++            nav = KnowledgeNavigationService(self.kb_name, kb_base_dir)
++            syllabus = nav.get_syllabus()
++            if not syllabus:
++                return ""
++            lines: list[str] = []
++            if self.language == "zh":
++                lines.append(f"## 知识库教学参考")
++                lines.append(f"已挂载知识库：{self.kb_name}")
++                lines.append("")
++                for doc in syllabus[:3]:
++                    lines.append(f"### {doc.title}")
++                    for sec in doc.sections[:5]:
++                        concepts = nav.get_concepts_for_section(doc.doc_id, sec.heading)
++                        concept_str = ", ".join(c.label for c in concepts[:5])
++                        if concept_str:
++                            lines.append(f"- {sec.heading} → 概念：{concept_str}")
++                        else:
++                            lines.append(f"- {sec.heading}")
++                lines.append(
++                    "调用 kb_lookup_concept 可查概念定义，调用 kb_syllabus 可浏览完整结构，"
++                    "调用 rag 可搜索相关段落。"
++                )
++            else:
++                lines.append("## Knowledge Base Teaching Context")
++                lines.append(f"Attached: {self.kb_name}")
++                lines.append("")
++                for doc in syllabus[:3]:
++                    lines.append(f"### {doc.title}")
++                    for sec in doc.sections[:5]:
++                        concepts = nav.get_concepts_for_section(doc.doc_id, sec.heading)
++                        concept_str = ", ".join(c.label for c in concepts[:5])
++                        if concept_str:
++                            lines.append(f"- {sec.heading} → concepts: {concept_str}")
++                        else:
++                            lines.append(f"- {sec.heading}")
++                lines.append(
++                    "Use kb_lookup_concept for definitions, kb_syllabus to browse "
++                    "structure, rag for passage search."
++                )
++            return "\n".join(lines)
++        except Exception as exc:
++            logger.debug("Failed to load KB teaching context: %s", exc)
++            return ""
++
+     def _fallback_empty_tool_list(self) -> str:
+         return "- 无" if self.language == "zh" else "- none"
+ 
+diff --git a/deeptutor/agents/solve/prompts/en/pipeline.yaml b/deeptutor/agents/solve/prompts/en/pipeline.yaml
+index 234c3d2..9921937 100644
+--- a/deeptutor/agents/solve/prompts/en/pipeline.yaml
++++ b/deeptutor/agents/solve/prompts/en/pipeline.yaml
+@@ -47,13 +47,14 @@ pre_retrieve:
+ 
+   aggregate:
+     system: |-
+-      You are a knowledge organizer.
++      You are a curriculum knowledge organizer.
+ 
+-      Reply MUST begin with ``SUMMARY``. After the label, write a single structured knowledge summary based on the supplied passages.
++      Reply MUST begin with ``SUMMARY``. After the label, write a **teaching-structured** knowledge summary based on the supplied passages.
+ 
+       Rules:
+       - Remove duplicated information across passages.
+-      - Organize by topic (definitions, formulas / theorems, key facts, examples).
++      - Extract **core concepts**, their **definitions**, **theorems/formulas**, and **prerequisite relationships**.
++      - Organize by pedagogical order (prerequisites → core concepts → applications).
+       - Do NOT solve any problem or infer beyond what the passages state.
+       - Do NOT reference any question — just organize the raw knowledge.
+       - Keep the summary under 3000 characters.
+@@ -81,7 +82,7 @@ plan:
+        - Complex derivation / multi-hop problem → 3–6 steps.
+     3. Step ids follow the pattern S1, S2, S3, ...
+     4. If a "Replan reason" section is present, the previous plan failed. Address the reason directly. You may keep useful step goals from the previous attempt or introduce new ones — the previous step results stay available as context for the new plan.
+-    5. If retrieved knowledge is provided, use it to make a more informed plan.
++    5. The retrieved knowledge includes a structured concept map. Use it to guide step planning: explain prerequisite concepts first, then core concepts. Each step should map to one or more knowledge points.
+   user_template: |-
+     ## Question
+     {question}
+@@ -155,7 +156,7 @@ solve_step:
+     - Copy tool names, parameter names, and KB names verbatim from the "Enabled tools" / "Knowledge bases" blocks. Never invent.
+     - Arguments must be concrete and executable; empty queries are invalid.
+ 
+-    {kb_note}
++    {kb_teaching_context}
+     Enabled tools:
+     {tool_list}
+   user_template: |-
+diff --git a/deeptutor/agents/solve/prompts/zh/pipeline.yaml b/deeptutor/agents/solve/prompts/zh/pipeline.yaml
+index 50eb3d6..4d92fbc 100644
+--- a/deeptutor/agents/solve/prompts/zh/pipeline.yaml
++++ b/deeptutor/agents/solve/prompts/zh/pipeline.yaml
+@@ -35,13 +35,14 @@ pre_retrieve:
+ 
+   aggregate:
+     system: |-
+-      你是知识整理器。
++      你是教材知识整理器。
+ 
+-      回复**必须**以 ``SUMMARY`` 开头。标签之后，基于给定段落写一段结构化的知识总结。
++      回复**必须**以 ``SUMMARY`` 开头。标签之后，基于给定段落写一段**教学结构化的知识总结**。
+ 
+       规则：
+       - 跨段落去重
+-      - 按主题组织（定义、公式 / 定理、关键事实、例题）
++      - 提取其中的**核心概念**及其**定义**、**定理/公式**、**前置知识关系**
++      - 按教学顺序组织（前置概念 → 核心概念 → 推论/应用）
+       - **不要**回答任何问题，**不要**做超出段落内容的推断
+       - **不要**引用任何问题——只整理原始知识
+       - 总结控制在 3000 字以内
+@@ -69,7 +70,7 @@ plan:
+        - 复杂推导 / 多跳问题 → 3–6 步
+     3. 步骤 id 遵循 S1, S2, S3 … 的格式。
+     4. 如果出现「Replan reason」字段，说明上一轮计划出了问题。直接针对该理由修订计划。可以保留之前可用的步骤目标，也可以引入新的——上一轮已完成的步骤结果会作为新计划的上下文保留。
+-    5. 如果提供了检索到的知识，请基于此做出更有依据的计划。
++    5. 检索到的知识中包含结构化概念图谱。请用它来指导步骤规划：先解释前置概念，再进入核心概念。每个步骤应映射到一个或多个知识点。
+   user_template: |-
+     ## 问题
+     {question}
+@@ -143,7 +144,7 @@ solve_step:
+     - 工具名、参数名、知识库名必须**逐字**抄自下方「启用的工具」/「知识库」块。**不要**编造。
+     - 参数必须具体可执行；空查询无效。
+ 
+-    {kb_note}
++    {kb_teaching_context}
+     启用的工具：
+     {tool_list}
+   user_template: |-
+diff --git a/deeptutor/services/rag/pipelines/llamaindex/document_loader.py b/deeptutor/services/rag/pipelines/llamaindex/document_loader.py
+index 2d3323d..9e8ca1a 100644
+--- a/deeptutor/services/rag/pipelines/llamaindex/document_loader.py
++++ b/deeptutor/services/rag/pipelines/llamaindex/document_loader.py
+@@ -5,6 +5,7 @@ from __future__ import annotations
+ import base64
+ import logging
+ import mimetypes
++import re
+ from pathlib import Path
+ from typing import Any, Iterable
+ 
+@@ -192,16 +193,36 @@ class LlamaIndexDocumentLoader:
+             "mimetype": mimetype,
+         }
+ 
++    _HEADING_RE = re.compile(r"^(#{1,4})\s+(.+)$", re.MULTILINE)
++
++    @staticmethod
++    def _extract_heading_structure(text: str) -> list[dict[str, Any]]:
++        """Extract heading hierarchy from markdown-style text.
++
++        Returns a list of ``{"heading": ..., "level": ...}`` dicts in
++        document order.  These are attached to the Document metadata
++        and propagated to each chunk by the ``SentenceSplitter`` so
++        that downstream retrieval and teaching tools can scope searches
++        to specific sections.
++        """
++        headings: list[dict[str, Any]] = []
++        for match in LlamaIndexDocumentLoader._HEADING_RE.finditer(text):
++            level = len(match.group(1))
++            heading = match.group(2).strip()
++            headings.append({"heading": heading, "level": level})
++        return headings
++
+     def _append_if_nonempty(self, documents: list[Any], file_path: Path, text: str) -> None:
+         if text.strip():
++            structure = self._extract_heading_structure(text)
++            metadata: dict[str, Any] = {
++                "file_name": file_path.name,
++                "file_path": str(file_path),
++            }
++            if structure:
++                metadata["headings"] = structure
+             documents.append(
+-                Document(
+-                    text=text,
+-                    metadata={
+-                        "file_name": file_path.name,
+-                        "file_path": str(file_path),
+-                    },
+-                )
++                Document(text=text, metadata=metadata)
+             )
+             self.logger.info(f"Loaded: {file_path.name} ({len(text)} chars)")
+         else:
+diff --git a/deeptutor/services/rag/pipelines/llamaindex/pipeline.py b/deeptutor/services/rag/pipelines/llamaindex/pipeline.py
+index 216caef..a4d2cc5 100644
+--- a/deeptutor/services/rag/pipelines/llamaindex/pipeline.py
++++ b/deeptutor/services/rag/pipelines/llamaindex/pipeline.py
+@@ -70,6 +70,25 @@ class LlamaIndexPipeline:
+                 f"Could not clean up failed version dir for {storage_dir}: {cleanup_exc}"
+             )
+ 
++    async def _extract_knowledge_graph(self, kb_name: str, kb_dir: Path) -> None:
++        """Best-effort post-indexing knowledge extraction.
++
++        Runs the ``KnowledgeExtractor`` after a successful index build.
++        Failures are logged but never propagated — the vector index is
++        the source of truth; the knowledge graph is a teaching aid.
++        """
++        try:
++            from deeptutor.knowledge.extractor import KnowledgeExtractor
++
++            extractor = KnowledgeExtractor()
++            await extractor.extract(kb_name, kb_dir)
++        except Exception as exc:
++            self.logger.warning(
++                "Knowledge extraction failed for '%s' (non-fatal): %s",
++                kb_name,
++                exc,
++            )
++
+     async def initialize(self, kb_name: str, file_paths: List[str], **kwargs) -> bool:
+         progress_callback = kwargs.get("progress_callback")
+         self._configure_settings()
+@@ -108,6 +127,10 @@ class LlamaIndexPipeline:
+                 write_version_meta(kb_dir, signature, storage_dir=storage_dir)
+ 
+             self.logger.info(f"KB '{kb_name}' initialized successfully with LlamaIndex")
++
++            # Best-effort structured knowledge extraction.
++            await self._extract_knowledge_graph(kb_name, kb_dir)
++
+             return True
+ 
+         except Exception as exc:
+@@ -265,6 +288,10 @@ class LlamaIndexPipeline:
+                     write_version_meta(kb_dir, signature, storage_dir=plan.storage_dir)
+ 
+             self.logger.info(f"Successfully added documents to KB '{kb_name}'")
++
++            # Best-effort structured knowledge extraction.
++            await self._extract_knowledge_graph(kb_name, kb_dir)
++
+             return True
+ 
+         except Exception as exc:
+diff --git a/deeptutor/tools/builtin/__init__.py b/deeptutor/tools/builtin/__init__.py
+index d00006d..df5f7ad 100644
+--- a/deeptutor/tools/builtin/__init__.py
++++ b/deeptutor/tools/builtin/__init__.py
+@@ -104,6 +104,79 @@ class RAGTool(_PromptHintsMixin, BaseTool):
+         )
+ 
+ 
++class KbLookupConceptTool(_PromptHintsMixin, BaseTool):
++    def get_definition(self) -> ToolDefinition:
++        return ToolDefinition(
++            name="kb_lookup_concept",
++            description=(
++                "Look up the exact definition and related concepts of a specific "
++                "concept from the attached knowledge base's extracted knowledge graph."
++            ),
++            parameters=[
++                ToolParameter(
++                    name="concept_name",
++                    type="string",
++                    description="The concept name to look up (e.g. 勾股定理).",
++                ),
++                ToolParameter(
++                    name="kb_name",
++                    type="string",
++                    description="Knowledge base name (must be one of the attached KB names).",
++                ),
++            ],
++        )
++
++    async def execute(self, **kwargs: Any) -> ToolResult:
++        from deeptutor.tools.kb_lookup_concept_tool import kb_lookup_concept
++
++        result = await kb_lookup_concept(
++            concept_name=str(kwargs.get("concept_name", "")),
++            kb_name=str(kwargs.get("kb_name", "")),
++        )
++        return ToolResult(
++            content=result.get("definition", "")
++            if result.get("found")
++            else result.get("message", ""),
++            metadata=result,
++        )
++
++
++class KbSyllabusTool(_PromptHintsMixin, BaseTool):
++    def get_definition(self) -> ToolDefinition:
++        return ToolDefinition(
++            name="kb_syllabus",
++            description=(
++                "Browse the attached knowledge base's document structure "
++                "and table of contents."
++            ),
++            parameters=[
++                ToolParameter(
++                    name="kb_name",
++                    type="string",
++                    description="Knowledge base name (must be one of the attached KB names).",
++                ),
++                ToolParameter(
++                    name="section",
++                    type="string",
++                    description="Optional section heading to drill into.",
++                    required=False,
++                ),
++            ],
++        )
++
++    async def execute(self, **kwargs: Any) -> ToolResult:
++        from deeptutor.tools.kb_syllabus_tool import kb_syllabus
++
++        result = await kb_syllabus(
++            kb_name=str(kwargs.get("kb_name", "")),
++            section=str(kwargs.get("section") or ""),
++        )
++        return ToolResult(
++            content=str(result) if not result.get("error") else result["error"],
++            metadata=result,
++        )
++
++
+ class WebSearchTool(_PromptHintsMixin, BaseTool):
+     def get_definition(self) -> ToolDefinition:
+         return ToolDefinition(
+@@ -1109,6 +1182,8 @@ class AskUserTool(_PromptHintsMixin, BaseTool):
+ BUILTIN_TOOL_TYPES: tuple[type[BaseTool], ...] = (
+     BrainstormTool,
+     RAGTool,
++    KbLookupConceptTool,
++    KbSyllabusTool,
+     WebSearchTool,
+     CodeExecutionTool,
+     ReasonTool,
+=== new files ===
+
+diff --git a/deeptutor/api/routers/knowledge.py b/deeptutor/api/routers/knowledge.py
+index b44b971..825e3e2 100644
+--- a/deeptutor/api/routers/knowledge.py
++++ b/deeptutor/api/routers/knowledge.py
+@@ -1273,6 +1273,26 @@ async def create_knowledge_base(
+         raise HTTPException(status_code=500, detail=str(e))
+ 
+ 
++async def _extract_knowledge_graph_task(kb_name: str, kb_base_dir: str) -> None:
++    """Best-effort knowledge graph extraction for an already-indexed KB.
++
++    Runs the ``KnowledgeExtractor`` on an existing vector index that
++    was built before the extraction pipeline was deployed.  Failures
++    are logged but never propagated.
++    """
++    try:
++        from deeptutor.knowledge.extractor import KnowledgeExtractor
++
++        extractor = KnowledgeExtractor()
++        await extractor.extract(kb_name, Path(kb_base_dir) / kb_name)
++    except Exception as exc:
++        logger.warning(
++            "Knowledge extraction (background) failed for '%s': %s",
++            kb_name,
++            exc,
++        )
++
++
+ async def run_reindex_task(kb_name: str, base_dir: str, task_id: str, signature_hash: str) -> None:
+     """Re-index a KB's raw documents against the currently-active embedding config.
+ 
+@@ -1449,6 +1469,14 @@ async def reindex_knowledge_base(
+             and matching_valid
+             and not force_reindex
+         ):
++            # Ensure knowledge graph is extracted even when the vector
++            # index already exists (e.g. after a deploy that added the
++            # extractor post-indexing).
++            if not (kb_dir / "knowledge_graph.json").exists():
++                background_tasks.add_task(
++                    _extract_knowledge_graph_task, kb_name, str(kb_base_dir)
++                )
++
+             return {
+                 "message": (
+                     f"Knowledge base '{kb_name}' already has an index for the "
+diff --git a/deeptutor/agents/chat/agentic_pipeline.py b/deeptutor/agents/chat/agentic_pipeline.py
+index 93737c6..e3eb6eb 100644
+--- a/deeptutor/agents/chat/agentic_pipeline.py
++++ b/deeptutor/agents/chat/agentic_pipeline.py
+@@ -1239,7 +1239,7 @@ class AgenticChatPipeline:
+         system = self._t(
+             "system",
+             tool_list=tool_list or self._fallback_empty_tool_list(),
+-            kb_note=self._kb_system_note(context),
++            kb_teaching_context=self._kb_system_note(context),
+         )
+         return append_language_directive(system, self.language)
+ 
+@@ -1389,6 +1389,10 @@ class AgenticChatPipeline:
+                 kb_schema = properties.get("kb_name")
+                 if isinstance(kb_schema, dict):
+                     kb_schema["enum"] = kb_choices
++            if function.get("name") in ("kb_lookup_concept", "kb_syllabus") and isinstance(properties, dict):
++                kb_schema = properties.get("kb_name")
++                if isinstance(kb_schema, dict):
++                    kb_schema["enum"] = kb_choices
+             if function.get("name") == "read_source" and isinstance(properties, dict):
+                 sid_schema = properties.get("source_id")
+                 if isinstance(sid_schema, dict) and source_ids:
+@@ -1519,6 +1523,10 @@ class AgenticChatPipeline:
+         task_dir = None
+         if turn_id:
+             task_dir = get_path_service().get_task_workspace("chat", turn_id)
++        if tool_name in ("rag", "kb_lookup_concept", "kb_syllabus"):
++            kb_names = self._selected_kbs(context)
++            if kb_names:
++                kwargs.setdefault("kb_name", kb_names[0])
+         if tool_name == "rag":
+             kwargs.setdefault("mode", "hybrid")
+         elif tool_name == "code_execution":
+@@ -1632,6 +1640,11 @@ class AgenticChatPipeline:
+         kbs = self._selected_kbs(context)
+         if not kbs:
+             return ""
++        # Try structured teaching context from knowledge graph.
++        ctx = self._load_kb_teaching_context(kbs[0])
++        if ctx:
++            return ctx
++        # Fallback to simple tool hint.
+         joined = ", ".join(kbs)
+         if self.language == "zh":
+             return f"用户已挂载知识库：{joined}。调用 rag 时，kb_name 必须从其中选一个。"
+@@ -1640,6 +1653,51 @@ class AgenticChatPipeline:
+             "be one of these names."
+         )
+ 
++    def _load_kb_teaching_context(self, kb_name: str) -> str:
++        """Load structured KB context (same contract as DeepSolve/DeepQuestion)."""
++        if not kb_name:
++            return ""
++        try:
++            from deeptutor.multi_user.knowledge_access import resolve_for_rag
++            from deeptutor.services.kb_navigation import KnowledgeNavigationService
++
++            resource = resolve_for_rag(kb_name)
++            if resource is None:
++                return ""
++            nav = KnowledgeNavigationService(kb_name, str(resource.base_dir))
++            syllabus = nav.get_syllabus()
++            if not syllabus:
++                return ""
++            lines: list[str] = []
++            if self.language == "zh":
++                lines.append(f"## 知识库教学参考\n已挂载知识库：{kb_name}\n")
++                for doc in syllabus[:3]:
++                    lines.append(f"### {doc.title}")
++                    for sec in doc.sections[:5]:
++                        cs = ", ".join(
++                            c.label for c in nav.get_concepts_for_section(
++                                doc.doc_id, sec.heading
++                            )[:5]
++                        )
++                        lines.append(f"- {sec.heading}" + (f" → 概念：{cs}" if cs else ""))
++                lines.append("调用 kb_lookup_concept 查概念定义，kb_syllabus 浏览结构，rag 搜索段落。")
++            else:
++                lines.append(f"## Knowledge Base Teaching Context\nAttached: {kb_name}\n")
++                for doc in syllabus[:3]:
++                    lines.append(f"### {doc.title}")
++                    for sec in doc.sections[:5]:
++                        cs = ", ".join(
++                            c.label for c in nav.get_concepts_for_section(
++                                doc.doc_id, sec.heading
++                            )[:5]
++                        )
++                        lines.append(f"- {sec.heading}" + (f" → concepts: {cs}" if cs else ""))
++                lines.append("Use kb_lookup_concept for definitions, kb_syllabus for structure, rag for search.")
++            return "\n".join(lines)
++        except Exception as exc:
++            logger.debug("Failed to load KB teaching context: %s", exc)
++            return ""
++
+     def _fallback_empty_tool_list(self) -> str:
+         return "- 无" if self.language == "zh" else "- none"
+ 
+diff --git a/deeptutor/agents/chat/prompts/en/agentic_chat.yaml b/deeptutor/agents/chat/prompts/en/agentic_chat.yaml
+index 2de4d62..3762471 100644
+--- a/deeptutor/agents/chat/prompts/en/agentic_chat.yaml
++++ b/deeptutor/agents/chat/prompts/en/agentic_chat.yaml
+@@ -22,7 +22,7 @@ labels:
+ # appears when the corresponding tool is actually enabled.
+ #
+ # Placeholders filled by the pipeline at call time:
+-#   {kb_note}    — knowledge-base attachment notice (may be empty)
++#   {kb_teaching_context} — knowledge-base teaching context (may be empty)
+ #   {tool_list}  — enabled-tool catalog with short_description / when_to_use /
+ #                  input_format (may be empty)
+ #
+@@ -86,7 +86,7 @@ system: |-
+   - Text rewriting, translation, formatting, Markdown polish.
+   - Definitional / conceptual questions where you are 100% confident and no precision or recency is required.
+ 
+-  {kb_note}
++  {kb_teaching_context}
+   Enabled tools:
+   {tool_list}
+ 
+diff --git a/deeptutor/agents/chat/prompts/zh/agentic_chat.yaml b/deeptutor/agents/chat/prompts/zh/agentic_chat.yaml
+index b070167..66bc8c2 100644
+--- a/deeptutor/agents/chat/prompts/zh/agentic_chat.yaml
++++ b/deeptutor/agents/chat/prompts/zh/agentic_chat.yaml
+@@ -19,7 +19,7 @@ labels:
+ # 怎么用"的信息都通过 {tool_list} 动态注入——只在用户启用了对应工具时才出现。
+ #
+ # pipeline 在调用时替换的占位符：
+-#   {kb_note}    — 知识库挂载提示（可能为空）
++#   {kb_teaching_context} — 知识库教学上下文（可能为空）
+ #   {tool_list}  — 启用工具列表（含 short_description / when_to_use / input_format，可能为空）
+ #
+ # memory_context、skills_context、source_manifest 由 pipeline 作为独立的
+@@ -66,7 +66,7 @@ system: |-
+   - 文本改写、翻译、格式调整、Markdown 美化。
+   - 问的就是定义、概念且你 100% 确信答案、不存在精度或时效要求。
+ 
+-  {kb_note}
++  {kb_teaching_context}
+   启用工具：
+   {tool_list}
+ 

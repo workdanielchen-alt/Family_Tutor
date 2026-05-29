@@ -1,0 +1,31 @@
+diff --git a/deeptutor/services/rag/index_versioning.py b/deeptutor/services/rag/index_versioning.py
+index b6d2460..cbd9d72 100644
+--- a/deeptutor/services/rag/index_versioning.py
++++ b/deeptutor/services/rag/index_versioning.py
+@@ -313,14 +313,20 @@ def resolve_storage_dir_for_write(kb_dir: Path, signature: Optional[EmbeddingSig
+ 
+ 
+ def resolve_storage_dir_for_rebuild(kb_dir: Path, signature: Optional[EmbeddingSignature]) -> Path:
+-    """Return a fresh flat storage dir for a full index rebuild.
++    """Return a flat storage dir for a full index rebuild.
+ 
+-    Incremental writes reuse a matching flat version, but a full rebuild should
+-    not overwrite the last matching version until the new index has been
+-    persisted successfully. Keeping the old version in place lets a failed
+-    rebuild remain diagnosable and avoids stale vector-store files.
++    If a version already exists for this embedding signature (even if not yet
++    ready), reuse it. This prevents duplicate version directories from
++    concurrent reindex requests for the same embedding config — a race that
++    previously produced two version-N dirs with identical signatures when the
++    front-end poll triggered a second reindex before the first task finished.
+     """
+-    _ = signature
++    if signature is not None:
++        entry = _find_flat_version_by_signature(kb_dir, signature.hash(), ready_only=False)
++        if entry:
++            target = Path(str(entry["version_path"]))
++            target.mkdir(parents=True, exist_ok=True)
++            return target
+     target = _next_flat_version_dir(kb_dir)
+     target.mkdir(parents=True, exist_ok=True)
+     return target
