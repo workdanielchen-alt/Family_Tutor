@@ -1,6 +1,9 @@
 # MiniCPM-V 4.6 OCR-optimized model
 # Derived from q4_K_M with tuned inference parameters.
 #
+# Architecture: qwen35 (dense), LLM 752M + vision 548M = 1.3B total
+# Context length: 262K native support
+#
 # Usage:
 #   docker exec ollama ollama create openbmb/minicpm-v4.6-ocr -f /config/Modelfile
 #   docker-compose up -d  # picks up OLLAMA_OCR_MODEL=openbmb/minicpm-v4.6-ocr
@@ -10,15 +13,15 @@ FROM openbmb/minicpm-v4.6:q4_K_M
 # Greedy decoding — deterministic, no random errors
 PARAMETER temperature 0
 
-# Context window: 4096 balances OCR quality with Docker 4GB limit
-PARAMETER num_ctx 4096
+# Context window: 16K is ample for exam pages; model natively supports 262K
+PARAMETER num_ctx 16384
 
-# Batch size: 512 default, adequate for CPU prompt processing
-PARAMETER num_batch 512
+# Batch size: 1024 accelerates prompt prefill for a 752M dense model
+PARAMETER num_batch 1024
 
-# Thread count: limit to P-cores (i5-1240P: 4P+8E). LLM inference is
-# memory-bandwidth-bound on CPU; more threads hurts via cache thrashing.
-PARAMETER num_thread 4
+# Thread count: 6 uses P-cores + some E-cores. 752M model is less
+# memory-bandwidth-bound than larger models, so extra threads help.
+PARAMETER num_thread 6
 
 # Fixed seed for reproducible output
 PARAMETER seed 42
