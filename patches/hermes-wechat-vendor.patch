@@ -1,19 +1,130 @@
 diff --git a/vendor/hermes-agent/gateway/platforms/weixin.py b/vendor/hermes-agent/gateway/platforms/weixin.py
-index 772e2b911..97f6fb6a5 100644
+index 97f6fb6a5..0ab94ccc5 100644
 --- a/vendor/hermes-agent/gateway/platforms/weixin.py
 +++ b/vendor/hermes-agent/gateway/platforms/weixin.py
-@@ -1523,6 +1523,14 @@ class WeixinAdapter(BasePlatformAdapter):
-                 platform_url = os.getenv("PLATFORM_API_URL", "http://platform:8100")
+@@ -1524,38 +1524,16 @@ class WeixinAdapter(BasePlatformAdapter):
                  # Use text if present, otherwise describe the file
                  _msg = text.strip() if text.strip() else f"请分析这份{'、'.join(media_paths)}"
+ 
+-                # Quick acknowledgment so user knows it's processing
++                # Quick acknowledgment + fire-and-forget teaching in background
+                 if _has_doc:
+                     try:
+-                        await self.send(content="📝 收到试卷，正在分析中，请稍候...", chat_id=effective_chat_id)
++                        await self.send(content=" 正在分析试卷，请稍候...", chat_id=effective_chat_id)
+                     except Exception:
+                         pass
+-
+-                try:
+-                    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as _tsession:
+-                        async with _tsession.post(
+-                            f"{platform_url}/api/tutor/chat",
+-                            json={
+-                                "message": _msg,
+-                                "learner_id": effective_chat_id,
+-                                "context": "",
+-                                "mode": "guide",
+-                            },
+-                        ) as _tresp:
+-                            if _tresp.status == 200:
+-                                _tdata = await _tresp.json()
+-                                _reply = _tdata.get("content", "") if _tdata.get("ok") else ""
+-                                if _reply:
+-                                    await self.send(content=_reply, chat_id=effective_chat_id)
+-                                    self._teaching_sessions[effective_chat_id] = time.time()
+-                                    self._save_teaching_sessions()
+-                                    logger.info(
+-                                        "[%s] Tutor reply sent to %s (%d chars)",
+-                                        self.name, effective_chat_id, len(_reply),
+-                                    )
+-                                    return
+-                except Exception as _exc:
+-                    logger.warning("[%s] Tutor chat failed, falling back to agent: %s", self.name, _exc)
++                asyncio.create_task(self._run_teaching_flow(
++                    effective_chat_id, _msg, platform_url, _has_doc,
++                ))
++                return
+         # ==== END HERMES PATCH ====
+ 
+         await self.handle_message(event)
+@@ -2253,6 +2231,80 @@ class WeixinAdapter(BasePlatformAdapter):
+             logger.warning("[%s] Tutor callback error: %s", self.name, exc)
+             return web.Response(status=500, text=str(exc))
+ 
++    async def _run_teaching_flow(
++        self,
++        effective_chat_id: str,
++        message: str,
++        platform_url: str,
++        is_new_doc: bool,
++    ) -> None:
++        """Fire-and-forget teaching flow with periodic status updates."""
++        _STATUS_INTERVAL = 6
++        _start = time.time()
++        _last_status = _start
 +
-+                # Quick acknowledgment so user knows it's processing
-+                if _has_doc:
-+                    try:
-+                        await self.send(content="📝 收到试卷，正在分析中，请稍候...", chat_id=effective_chat_id)
-+                    except Exception:
-+                        pass
++        try:
++            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as session:
++                # Send status updates while waiting
++                async def _maybe_send_status():
++                    nonlocal _last_status
++                    elapsed = time.time() - _start
++                    if elapsed - (_last_status - _start) >= _STATUS_INTERVAL:
++                        _last_status = time.time()
++                        statuses = [
++                            "  正在识别题目类型...",
++                            "  正在生成详细讲解...",
++                            "  即将完成...",
++                        ]
++                        idx = min(int(elapsed / _STATUS_INTERVAL) - 1, len(statuses) - 1)
++                        if idx >= 0:
++                            try:
++                                await self.send(content=statuses[idx], chat_id=effective_chat_id)
++                            except Exception:
++                                pass
 +
-                 try:
-                     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as _tsession:
-                         async with _tsession.post(
++                # Start the tutor_chat request
++                resp = await session.post(
++                    f"{platform_url}/api/tutor/chat",
++                    json={
++                        "message": message,
++                        "learner_id": effective_chat_id,
++                        "context": "",
++                        "mode": "guide",
++                    },
++                )
++                await _maybe_send_status()
++
++                if resp.status == 200:
++                    data = await resp.json()
++                    reply = data.get("content", "") if data.get("ok") else ""
++                    if reply:
++                        await self.send(content=reply, chat_id=effective_chat_id)
++                        self._teaching_sessions[effective_chat_id] = time.time()
++                        self._save_teaching_sessions()
++                        logger.info(
++                            "[%s] Tutor reply sent to %s (%d chars, %.1fs)",
++                            self.name, effective_chat_id, len(reply), time.time() - _start,
++                        )
++                        return
++
++                # Fallback: if tutor_chat returned no content, try agent
++                logger.warning("[%s] Tutor chat returned empty, falling back", self.name)
++        except Exception as exc:
++            logger.warning("[%s] Tutor chat failed, falling back to agent: %s", self.name, exc)
++
++        # Fallback to regular agent processing
++        await self.handle_message(self._build_dummy_event(effective_chat_id, message))
++
++    def _build_dummy_event(self, chat_id: str, text: str) -> "MessageEvent":
++        """Build a minimal MessageEvent for fallback agent processing."""
++        from gateway.platforms.base import MessageEvent, MessageType
++        source = self.build_source(chat_id=chat_id, chat_type="dm", user_id=chat_id, user_name=chat_id)
++        return MessageEvent(
++            text=text, message_type=MessageType.TEXT, source=source,
++            message_id="", raw_message={}, timestamp=datetime.now(),
++        )
++
+     async def _deliver_tutor_reply(self, learner_id: str, content: str) -> None:
+         """Deliver a tutor reply via WeChat (background, after HTTP response)."""
+         try:

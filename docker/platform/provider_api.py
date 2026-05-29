@@ -230,7 +230,33 @@ class _DTTutorSession:
             websockets.connect("ws://deeptutor:8001/api/v1/tutorbot/teacher/ws", close_timeout=10),
             timeout=30,
         )
+        # Start background keepalive pings (every 30s, cancel on close)
+        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
         return self.ws
+
+    async def _keepalive_loop(self):
+        """Periodically ping the WS to keep it alive across idle periods."""
+        import websockets
+        try:
+            while self.ws is not None and _ws_is_alive(self.ws):
+                await asyncio.sleep(30)
+                try:
+                    await asyncio.wait_for(self.ws.send("ping"), timeout=5)
+                except (websockets.ConnectionClosed, OSError, asyncio.TimeoutError):
+                    break
+        except asyncio.CancelledError:
+            pass
+
+    async def _close_ws(self):
+        if getattr(self, "_keepalive_task", None) is not None:
+            self._keepalive_task.cancel()
+            self._keepalive_task = None
+        if self.ws is not None and _ws_is_alive(self.ws):
+            try:
+                await self.ws.close()
+            except Exception:
+                pass
+        self.ws = None
 
     async def _do_send_recv(self, ws, payload: str, trace_id: str) -> dict:
         await asyncio.wait_for(
@@ -286,14 +312,6 @@ class _DTTutorSession:
                 except (json.JSONDecodeError, websockets.ConnectionClosed):
                     break
         return {"ok": False, "error": ws_error or "empty"}
-
-    async def _close_ws(self):
-        if self.ws is not None and _ws_is_alive(self.ws):
-            try:
-                await self.ws.close()
-            except Exception:
-                pass
-        self.ws = None
 
     async def close(self):
         await self._close_ws()
