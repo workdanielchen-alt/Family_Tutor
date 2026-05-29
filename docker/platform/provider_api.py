@@ -1387,10 +1387,7 @@ async def _ocr_image_bytes_ollama(image_bytes: bytes, trace_id: str) -> str:
                         ],
                         "stream": False,
                         "keep_alive": keep_alive,
-                        "options": {
-                            "temperature": 0,
-                            "top_k": 1,
-                        },
+                        "options": {"temperature": 0},
                     },
                 )
                 if resp.status_code == 200:

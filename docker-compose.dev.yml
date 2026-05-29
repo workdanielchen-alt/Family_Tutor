@@ -53,6 +53,8 @@ services:
       - "11435:11434"
     environment:
       - OLLAMA_MODELS=/models
+      - OLLAMA_FLASH_ATTENTION=1
+      - OLLAMA_KV_CACHE_TYPE=q8_0
     volumes:
       # 挂载已有的 MiniCPM-V 4.6 模型文件 (D:\ollama_models)
       - //d/ollama_models:/models
