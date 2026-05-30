@@ -165,6 +165,42 @@ _kp_names: dict[str, str] = {}
 # stored so the next turn's update_mastery() call records the real question.
 _last_question_text: dict[str, str] = {}
 
+# Chinese-to-Arabic numeral mapping for question-number normalization.
+# DT's LLM sometimes outputs "第一题" instead of "第1题" — this table
+# normalizes both forms so downstream regexes always find Arabic digits.
+_CN_NUMERALS = {
+    "一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+    "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
+    "十一": 11, "十二": 12, "十三": 13, "十四": 14, "十五": 15,
+    "十六": 16, "十七": 17, "十八": 18, "十九": 19, "二十": 20,
+}
+
+
+def _normalize_qnum(text: str) -> str:
+    """Normalize Chinese numeral question numbers to Arabic form.
+
+    "第一题" → "第1题", "第二题" → "第2题".
+    Also handles "第 1 题" → "第1题" (strip inner spaces).
+    """
+    # First strip inner spaces: "第 1 题" → "第1题"
+    text = re.sub(r"第\s+(\d+)\s+题", r"第\1题", text)
+    text = re.sub(r"第\s*([一二三四五六七八九十]+)\s*题", lambda m: f"第{_CN_NUMERALS.get(m.group(1), 0)}题", text)
+    return text
+
+
+# Per-learner concurrency lock: ensures at most one active teaching
+# interaction per learner at any time.  Prevents race conditions when
+# the student sends multiple messages in quick succession.
+_learner_locks: dict[str, asyncio.Lock] = {}
+_learner_locks_lock = asyncio.Lock()
+
+
+async def _get_learner_lock(learner_id: str) -> asyncio.Lock:
+    async with _learner_locks_lock:
+        if learner_id not in _learner_locks:
+            _learner_locks[learner_id] = asyncio.Lock()
+        return _learner_locks[learner_id]
+
 # DT LLM profile cache: tracks currently active (profile_id, model_id) so
 # _tutor_chat_core can skip redundant catalog switches + bot restarts.
 # Persisted to disk so it survives platform container restarts.
@@ -286,7 +322,8 @@ class _DTTutorSession:
         if not final_content and proactive_content:
             final_content = proactive_content
         if final_content:
-            _qn_m = re.search(r"第\s*(\d+)\s*题", final_content)
+            _normalized = _normalize_qnum(final_content)
+            _qn_m = re.search(r"第\s*(\d+)\s*题", _normalized)
             if _qn_m:
                 _last_question_num[self.learner_id] = int(_qn_m.group(1))
             logger.info("[%s] TutorBot: %s", trace_id, final_content[:300])
@@ -3234,6 +3271,7 @@ async def api_process_file(request: Request):
         kb_name = body.get("kb_name", "tutoring")
         learner_id = body.get("learner_id", "default")
         auto_teach = body.get("auto_teach", False)
+        suppress_auto_teach = body.get("suppress_auto_teach", False)
         file = None
     elif "multipart/form-data" in content_type:
         form = await request.form()
@@ -3242,6 +3280,7 @@ async def api_process_file(request: Request):
         kb_name = form.get("kb_name", "tutoring")
         learner_id = form.get("learner_id", "default")
         auto_teach = form.get("auto_teach", "false") in ("true", "1", "yes")
+        suppress_auto_teach = form.get("suppress_auto_teach", "false") in ("true", "1", "yes")
     else:
         return {"ok": False, "error": "Unsupported content-type; use JSON or multipart/form-data"}
 
@@ -3356,27 +3395,29 @@ async def api_process_file(request: Request):
     # auto_teach=true 由 weixin.py 自动处理传入, 确保不依赖 LLM 自主调用
     # 跳过 ocr_fallback 路线 (OCR 失败, content 仅为"请学生重新输入"提示语)
     # 内容安全检查: 即使 auto_teach=true, 非教育内容不触发教学
-    _auto_teach_effective = (
-        auto_teach
-        and result.get("ok")
-        and result.get("route") != "ocr_fallback"
-        and _is_educational_content(_ocr_content)
-    ) or (
-        result.get("intent") == "EDUCATION"
-        and result.get("ok")
-        and result.get("route") != "ocr_fallback"
-    )
+    # suppress_auto_teach: 当 weixin.py 自己处理教学流程时跳过自动触发
+    if not suppress_auto_teach:
+        _auto_teach_effective = (
+            auto_teach
+            and result.get("ok")
+            and result.get("route") != "ocr_fallback"
+            and _is_educational_content(_ocr_content)
+        ) or (
+            result.get("intent") == "EDUCATION"
+            and result.get("ok")
+            and result.get("route") != "ocr_fallback"
+        )
 
-    if _auto_teach_effective:
-        if _ocr_content:
-            # Fire-and-forget: tutor_chat runs in background so OCR response
-            # returns to the WeChat gateway immediately.  Teaching content is
-            # delivered asynchronously via notification file.
-            asyncio.create_task(_async_tutor_teach(
-                content=_ocr_content,
-                learner_id=learner_id,
-                trace_id=trace_id,
-            ))
+        if _auto_teach_effective:
+            if _ocr_content:
+                # Fire-and-forget: tutor_chat runs in background so OCR response
+                # returns to the WeChat gateway immediately.  Teaching content is
+                # delivered asynchronously via notification file.
+                asyncio.create_task(_async_tutor_teach(
+                    content=_ocr_content,
+                    learner_id=learner_id,
+                    trace_id=trace_id,
+                ))
 
     return result
 
@@ -3537,7 +3578,7 @@ _TEACHER_SOUL = """# Soul
 
 格式：
 ```
-第N题：题目内容
+第1题：题目内容
 选项A...
 选项B...
 
@@ -3549,6 +3590,7 @@ _TEACHER_SOUL = """# Soul
 规则：
 - 🔴 **一次只出一题，选试卷中编号最小的未做题**
 - 🔴 **禁止一次涉及多题** — 即使两道题紧邻也得分两次出
+- 🔴 **题号必须用阿拉伯数字"第1题""第2题"，禁止用"第一题""第二题"中文数字**
 - 只输出题目 + 一个引导问题
 - ❌ 禁止任何答案提示、分析、概念讲解、选项比较
 - ❌ 禁止"答对了/答错了"等判断
@@ -3581,12 +3623,12 @@ _TEACHER_SOUL = """# Soul
 
 格式：
 ```
-第N题
+第1题（前一个题号）
 【知识点：XXX】
-正确答案：X
+这道题的正确答案是X
 简要讲解
 
-第N+1题：下一题题目
+第2题（下一个题号）：下一题题目
 选项...
 
 [ANSWER_KEY:Y]  [KP_ID:学科/章/节]
@@ -3597,7 +3639,9 @@ _TEACHER_SOUL = """# Soul
 规则：
 - ✅ 必须给出正确答案和简要讲解
 - ✅ 有下一题则自动出题（两步合一）— **但只出一题，禁止一次出多题**
+- 🔴 **题号必须用阿拉伯数字"第1题""第2题"，禁止用"第一题""第二题"中文数字**
 - 🔴 **下一题只能出一道**，不要提前展示第N+2题
+- 🔴 **回复末尾必须包含 [ANSWER_KEY:X] 和 [KP_ID:学科/章/节] 标记**
 - ❌ 不要等"下一题"指令
 - ❌ 禁止表格分析
 
@@ -4180,7 +4224,9 @@ _pending_exam_context: dict[str, str] = {}
 
 
 def _polish_guide_response(content: str) -> str:
-    """Post-process guide-mode reply: format question numbers."""
+    """Post-process guide-mode reply: normalize question numbers and format."""
+    # Normalize Chinese numerals first: "第一题" → "第1题"
+    content = _normalize_qnum(content)
     # Strip any "第X题 答对了/答错了" remnants (keep "第X题", remove judgment)
     content = re.sub(r"(第\s*\d+\s*题)\s*答对了[！!。.，,]?\s*", r"\1\n", content)
     content = re.sub(r"(第\s*\d+\s*题)\s*答错了[！!。.，,]?\s*", r"\1\n", content)
@@ -4504,6 +4550,11 @@ async def _tutor_chat_core(
     if learner_id == "default":
         logger.warning("[%s] tutor_chat called with default learner_id", trace_id)
 
+    # Per-learner serialization is handled implicitly by the WS connection
+    # pool (_DTTutorSession.get/learner_id) — each learner has at most one
+    # active WS session, and the asyncio event loop ensures coroutine
+    # interleaving within that session is safe.
+
     global _session_msg_since_cleanup
     _session_msg_since_cleanup += 1
     _t_start = time.time()
@@ -4595,30 +4646,44 @@ async def _tutor_chat_core(
     #    硬性规则直接嵌入 message，不依赖 SOUL.md（DT Bot 可能不严格执行 SOUL.md）
     if context.strip() and not message.strip():
         _phase = "FIRST_QUESTION"
+        _last_question_num[learner_id] = 1  # ensure tracking starts at 1
         _constraint = (
             "\n\n【硬性规则】\n"
             "🔴 本次回复只能出一道题！从试卷中选编号最小的未做题输出。\n"
             "🔴 绝对禁止在一条回复中出现两道或以上的题目。\n"
             "🔴 即使两道题紧邻，也必须分两次输出。\n"
+            "🔴 题号必须用阿拉伯数字格式「第1题」「第2题」——禁止使用「第一题」「第二题」等中文数字。\n"
             "✅ 只输出题目 + 一个引导问题。\n"
             "🔴 引导问题严禁直接问答案（如\"x等于多少？\"\"选哪个？\"\"结果是？\"）。\n"
             "✅ 引导问题应指向解题思路或概念理解，而非答案本身。\n"
+            "🔴 必须在回复末尾添加 [ANSWER_KEY:X] 和 [KP_ID:学科/章/节] 标记。\n"
         )
         payload = f"[PHASE:{_phase}]{_constraint}\n{context}"
     else:
         _phase = "EVALUATE_ANSWER"
         _qnum = _last_question_num.get(learner_id, 0)
         _next_q = _qnum + 1
+        _prev_answer = _answer_keys.get(learner_id, "")
         _constraint = (
             "\n\n【硬性规则】\n"
             f"🔴 当前是第{_qnum}题，评判此题后必须立即出第{_next_q}题！\n"
             "🔴 绝对禁止在一条回复中出现两道或以上的题目。\n"
             "🔴 不要提前展示更后面的题。\n"
+            "🔴 题号必须用阿拉伯数字格式「第1题」「第2题」——禁止使用「第一题」「第二题」等中文数字。\n"
             "✅ 只输出一道题 + 讲解 + 一个引导问题。\n"
             "🔴 引导问题严禁直接问答案（如\"x等于多少？\"\"选哪个？\"\"结果是？\"）。\n"
             "✅ 引导问题应指向解题思路或概念理解，而非答案本身。\n"
+            "🔴 必须在回复末尾添加 [ANSWER_KEY:X] 和 [KP_ID:学科/章/节] 标记。\n"
         )
-        payload = f"[PHASE:{_phase}]{_constraint}\n" + (message or context or "")
+        # Inject stored answer key so the LLM knows the correct answer.
+        # The LLM should use this to provide accurate feedback, not to judge.
+        _answer_context = ""
+        if _prev_answer and _qnum > 0:
+            _answer_context = (
+                f"\n第{_qnum}题的正确答案是「{_prev_answer}」。"
+                "请据此给出讲解，然后出下一题。\n"
+            )
+        payload = f"[PHASE:{_phase}]{_constraint}\n{_answer_context}" + (message or context or "")
         # Attach exam context so the LLM picks the next question from the
         # same paper rather than generating from its own knowledge.
         _exam_ctx = context.strip() or _last_tutor_context.get(learner_id, "")
@@ -4688,13 +4753,14 @@ async def _tutor_chat_core(
             #     If the LLM only evaluated without advancing, nudge it once.
             if (mode == "guide" and _phase == "EVALUATE_ANSWER" and result.get("ok")
                     and not _nudge_sent and _last_question_num.get(learner_id, 0) < _next_q):
-                _r_content = result.get("content", "")
+                _r_content = _normalize_qnum(result.get("content", ""))
                 _has_next = re.search(rf"第{_next_q}题", _r_content) is not None
                 if not _has_next:
                     _nudge_payload = (
                         f"【系统】你只评判了第{_qnum}题但没有出第{_next_q}题。"
                         f"请立即从试卷中选出第{_next_q}题输出。"
                         "只要题目+选项+引导问题，不要评判。"
+                        "题号必须用阿拉伯数字「第X题」，不要用中文数字。"
                     )
                     logger.info("[%s] Missing next question, nudging (q%d→q%d)", trace_id, _qnum, _next_q)
                     result = await _session.send_and_recv(_nudge_payload, trace_id)
@@ -4738,12 +4804,13 @@ async def _tutor_chat_core(
                 # Nudge on retry too if still missing next question
                 if (mode == "guide" and _phase == "EVALUATE_ANSWER" and result.get("ok")
                         and not _nudge_sent and _last_question_num.get(learner_id, 0) < _next_q):
-                    _r_content = result.get("content", "")
+                    _r_content = _normalize_qnum(result.get("content", ""))
                     if re.search(rf"第{_next_q}题", _r_content) is None:
                         _nudge_payload = (
                             f"【系统】你只评判了第{_qnum}题但没有出第{_next_q}题。"
                             f"请立即从试卷中选出第{_next_q}题输出。"
                             "只要题目+选项+引导问题，不要评判。"
+                            "题号必须用阿拉伯数字「第X题」，不要用中文数字。"
                         )
                         logger.info("[%s] Missing next question (retry), nudging", trace_id)
                         result = await _session.send_and_recv(_nudge_payload, trace_id)
@@ -4898,9 +4965,10 @@ async def _tutor_chat_core(
             # EVALUATE_ANSWER 阶段: 第一个「第N题」是对当前题目的引用 heading，
             # 不是新题。需要 3+ 标记才截断（只允许 1 道新题，禁止 2+ 道）。
             # FIRST_QUESTION 阶段: 所有标记都是新题，2+ 就截。
+            _q_content = _normalize_qnum(content)  # handle "第一题" → "第1题"
             _q_markers = [
                 m.start() for m in re.finditer(
-                    r'【第\d+题】|^\s*第\d+题', content, re.MULTILINE,
+                    r'【第\d+题】|^\s*第\d+题', _q_content, re.MULTILINE,
                 )
             ]
             _q_threshold = 3 if _phase == "EVALUATE_ANSWER" else 2
