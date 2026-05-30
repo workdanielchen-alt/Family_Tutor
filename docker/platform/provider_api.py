@@ -97,11 +97,6 @@ def _ws_is_alive(ws) -> bool:
 
 
 HERMES_AGENT_URL = os.getenv("HERMES_AGENT_URL", "http://hermes_agent:8004")
-# Separate callback ports for dual-gateway (parent=8005, child=8006)
-HERMES_CALLBACK_URLS = [
-    os.getenv("HERMES_CALLBACK_URL", "http://hermes_agent:8005/api/tutor/callback"),
-    os.getenv("HERMES_CHILD_CALLBACK_URL", "http://hermes_agent:8006/api/tutor/callback"),
-]
 DEEPTUTOR_URL = os.getenv("DEEPTUTOR_API_URL", "http://deeptutor:8001")
 UPLOADS_DIR = os.getenv("UPLOADS_DIR", "/data/uploads")
 SOURCES_DIR = os.getenv("SOURCES_DIR", "/data/sources")
@@ -164,6 +159,11 @@ _kp_names: dict[str, str] = {}
 # Last question text per learner: extracted from DT response after 【第X题】,
 # stored so the next turn's update_mastery() call records the real question.
 _last_question_text: dict[str, str] = {}
+
+# Session answer counter per learner: cumulative questions answered in the
+# current teaching session.  Used as fallback completion detection when OCR
+# failed to detect total_questions (regex didn't match any numbered items).
+_session_answered_count: dict[str, int] = {}
 
 # Chinese-to-Arabic numeral mapping for question-number normalization.
 # DT's LLM sometimes outputs "第一题" instead of "第1题" — this table
@@ -1087,16 +1087,24 @@ async def _handle_inbound_file(
             content = await _ocr_image_file(file_path, trace_id)
             if content:
                 logger.info("[%s] OCR success: %d chars from %s", trace_id, len(content), file_path)
-                # If the page contains diagrams (图1, 如图, etc.), get a vision
-                # description and fuse it into the teaching context.
-                if _DIAGRAM_PATTERNS.search(content):
-                    vision_desc = await _describe_diagram(file_path, trace_id)
-                    if vision_desc:
-                        content = f"{content}\n\n[图片中的图形描述]\n{vision_desc}"
-                        logger.info(
-                            "[%s] Vision description appended (%d chars)",
-                            trace_id, len(vision_desc),
-                        )
+            else:
+                logger.warning("[%s] OCR failed for %s", trace_id, file_path)
+
+            # Always run vision description on image files — don't rely on
+            # OCR keyword detection (OCR may garble 如图/图5 → miss the trigger).
+            # Vision is cached (1h TTL), so repeated calls are cheap.
+            vision_desc = await _describe_diagram(file_path, trace_id)
+            if vision_desc:
+                logger.info(
+                    "[%s] Vision description appended (%d chars)",
+                    trace_id, len(vision_desc),
+                )
+                if content:
+                    content = f"{content}\n\n[图片中的图形描述]\n{vision_desc}"
+                else:
+                    content = f"[图片中的图形描述]\n{vision_desc}"
+
+            if content:
                 return _cache_res(
                     {
                         "ok": True,
@@ -1109,7 +1117,7 @@ async def _handle_inbound_file(
             # OCR failed — descriptive fallback so DT Bot can guide user
             content = "用户通过微信发送了一张图片，但图片中的文字未能被自动识别。请用友好的语气请学生将题目文字直接输入发送过来。"
             logger.warning(
-                "[%s] OCR failed, using descriptive fallback for %s", trace_id, file_path
+                "[%s] OCR failed and vision empty, using descriptive fallback for %s", trace_id, file_path
             )
             return _cache_res(
                 {
@@ -1784,17 +1792,35 @@ def _ocr_output_is_garbled(text: str) -> bool:
 
     Returns True when the text is likely useless (garbled/placeholder) so the
     caller can treat it as OCR failure and trigger the ocr_fallback path.
+
+    For mixed-language content (e.g. English math/physics with Chinese labels),
+    checks alphanumeric ratio as well — pure ASCII with meaningful content
+    (digits, letters, math symbols) is NOT garbled even when Chinese < 20%.
     """
     if not text or len(text.strip()) < 10:
         return True
-    # Count Chinese characters, digits, common punctuation
-    good = sum(1 for ch in text if '一' <= ch <= '鿿' or ch.isdigit() or ch in '，。、；：？！.。，;:?!%+-=()（）')
-    garbage = sum(1 for ch in text if ch in 'xX□�' or (ch.isascii() and not ch.isalnum() and ch not in ' .,;:!?+-=()'))
-    # If garbage ratio > 30% or Chinese ratio < 20%, likely garbled
+    garbage = sum(1 for ch in text if ch in 'xX□�' or (ch.isascii() and not ch.isalnum() and ch not in ' .,;:!?+-=()[]{}<>/*^_'))
     if len(text) > 0:
-        chinese_ratio = sum(1 for ch in text if '一' <= ch <= '鿿') / len(text)
+        # Chinese ratio: if < 20%, may still be valid English/math content
+        chinese_count = sum(1 for ch in text if '一' <= ch <= '鿿')
+        chinese_ratio = chinese_count / len(text)
         garbage_ratio = garbage / len(text)
-        return chinese_ratio < 0.2 or garbage_ratio > 0.3
+
+        # High garbage → definitely garbled
+        if garbage_ratio > 0.3:
+            return True
+
+        # Low Chinese but high alphanumeric → meaningful non-Chinese content
+        # (e.g. English math/physics formulas).  BUT also check garbage ratio:
+        # if special chars are common too (e.g. "abc!@#def$%^xyz" repeated),
+        # the output is still garbled despite the alphanumeric count.
+        if chinese_ratio < 0.2:
+            alnum_ratio = sum(1 for ch in text if ch.isalnum()) / len(text)
+            garbage_ratio = garbage / len(text)
+            if alnum_ratio > 0.5 and garbage_ratio < 0.15:
+                return False
+
+        return chinese_ratio < 0.2
     return True
 
 
@@ -2120,55 +2146,9 @@ async def _notify_hermes_agent(
         logger.debug("[notify_ha] notification write failed: %s", e)
 
 
-async def _notify_tutor_callback(learner_id: str, content: str, trace_id: str):
-    """Send teaching response to hermes-agent via HTTP callback.
-
-    Replaces the old notification file bridge. POSTs to both parent and child
-    gateway callback ports — the gateway that has the learner's WeChat contact
-    delivers the message, the other silently ignores.
-    """
-    payload = {
-        "type": "tutor_reply",
-        "learner_id": learner_id,
-        "content": content,
-        "trace_id": trace_id or "",
-    }
-    for url in HERMES_CALLBACK_URLS:
-        try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.post(url, json=payload)
-                if resp.status_code != 200:
-                    logger.debug("[%s] tutor callback %s returned %d", trace_id, url, resp.status_code)
-        except (httpx.TimeoutException, httpx.RequestError):
-            logger.debug("[%s] tutor callback to %s failed (non-fatal)", trace_id, url)
-
-
-async def _async_tutor_teach(content: str, learner_id: str, trace_id: str):
-    """Background task: run tutor_chat and push result via HTTP callback.
-
-    Called fire-and-forget from ``api_process_file`` so the OCR response is
-    not blocked by LLM-based teaching generation.
-    """
-    try:
-        tutor_result = await _tutor_chat_core(
-            message="",
-            learner_id=learner_id,
-            context=content,
-            mode="guide",
-            trace_id=trace_id,
-        )
-        if tutor_result.get("ok") and tutor_result.get("content"):
-            _clean_content = html.unescape(tutor_result["content"])
-            await _notify_tutor_callback(learner_id, _clean_content, trace_id)
-            logger.info("[%s] Async tutor_chat success for %s", trace_id, learner_id)
-        else:
-            logger.warning(
-                "[%s] Async tutor_chat returned no content: %s",
-                trace_id,
-                tutor_result.get("error", "empty response"),
-            )
-    except Exception as e:
-        logger.warning("[%s] Async tutor_chat failed: %s", trace_id, e)
+# _async_tutor_teach / _notify_tutor_callback 已删除 (Path 2).
+# 教学回复统一走 HA 同步路径 (Path 1: _run_teaching_flow → POST /api/tutor/chat).
+# 报告推送走文件轮询路径 (Path 3: report_scheduler → _write_notification).
 
 
 class QuizSyncRequest(BaseModel):
@@ -3270,8 +3250,6 @@ async def api_process_file(request: Request):
         file_path = body.get("file_path", "")
         kb_name = body.get("kb_name", "tutoring")
         learner_id = body.get("learner_id", "default")
-        auto_teach = body.get("auto_teach", False)
-        suppress_auto_teach = body.get("suppress_auto_teach", False)
         file = None
     elif "multipart/form-data" in content_type:
         form = await request.form()
@@ -3279,8 +3257,6 @@ async def api_process_file(request: Request):
         file_path = form.get("file_path", "")
         kb_name = form.get("kb_name", "tutoring")
         learner_id = form.get("learner_id", "default")
-        auto_teach = form.get("auto_teach", "false") in ("true", "1", "yes")
-        suppress_auto_teach = form.get("suppress_auto_teach", "false") in ("true", "1", "yes")
     else:
         return {"ok": False, "error": "Unsupported content-type; use JSON or multipart/form-data"}
 
@@ -3391,34 +3367,9 @@ async def api_process_file(request: Request):
             )
         )
 
-    # 🟢 v7.5: auto_teach 参数或 EDUCATION 意图 → 自动触发引导式教学
-    # auto_teach=true 由 weixin.py 自动处理传入, 确保不依赖 LLM 自主调用
-    # 跳过 ocr_fallback 路线 (OCR 失败, content 仅为"请学生重新输入"提示语)
-    # 内容安全检查: 即使 auto_teach=true, 非教育内容不触发教学
-    # suppress_auto_teach: 当 weixin.py 自己处理教学流程时跳过自动触发
-    if not suppress_auto_teach:
-        _auto_teach_effective = (
-            auto_teach
-            and result.get("ok")
-            and result.get("route") != "ocr_fallback"
-            and _is_educational_content(_ocr_content)
-        ) or (
-            result.get("intent") == "EDUCATION"
-            and result.get("ok")
-            and result.get("route") != "ocr_fallback"
-        )
-
-        if _auto_teach_effective:
-            if _ocr_content:
-                # Fire-and-forget: tutor_chat runs in background so OCR response
-                # returns to the WeChat gateway immediately.  Teaching content is
-                # delivered asynchronously via notification file.
-                asyncio.create_task(_async_tutor_teach(
-                    content=_ocr_content,
-                    learner_id=learner_id,
-                    trace_id=trace_id,
-                ))
-
+    # auto_teach / suppress_auto_teach 参数已移除 (Path 2 删除).
+    # 教学统一由 HA 的 _run_teaching_flow 驱动: HA 先调 /api/process/file (OCR),
+    # 再调 /api/tutor/chat (教学). 此处不再触发异步教学路径.
     return result
 
 
@@ -4423,6 +4374,49 @@ def _strip_analysis(text: str, phase: str) -> str:
     return result
 
 
+# ── Extend _TEACHER_SOUL with casual chat + progress ─────────────────
+_TEACHER_SOUL = _TEACHER_SOUL.rstrip() + """
+
+## 闲聊与教学外的处理
+
+学生消息不一定都是回答题目。请按以下规则判断：
+
+**问当前题的问题（"这题什么意思"、"为什么要这样算"）：**
+- 解释概念/思路后回到引导问题，不要跳到下一题
+
+**请求详细讲解（"不会"、"讲一下"、"不懂"）：**
+- 展开讲解 + 回到题目引导
+
+**说累了/想休息：**
+- 简短回应，不要出题，不要加标记。例如"好的，先休息一下吧"
+
+**闲聊（天气/学校/日常/其他话题）：**
+- 简短友好地回应即可，不要出题，不要加 [ANSWER_KEY] 等标记
+
+## 进度格式
+
+回复中必须体现当前进度，格式为「第X/总题数」，例如：
+- 「第3/10题：题目内容」
+- 首题用「第1题/共10题」
+
+如果暂时不知道总题数，只显示题号即可。
+"""
+
+
+def _detect_total_questions(content: str) -> int:
+    """Estimate total questions from exam text."""
+    nums: list[int] = []
+    for m in re.finditer(
+        r"(?:第|^)\s*(\d+)\s*[.、．）\)](?:\s|(?=[\u4e00-\u9fff\u3000]))|第\s*(\d+)\s*题",
+        content,
+        flags=re.MULTILINE,
+    ):
+        d = m.group(1) or m.group(2)
+        if d:
+            nums.append(int(d))
+    return max(nums) if nums else 0
+
+
 async def _direct_deepseek_teach(
     phase: str,
     learner_id: str,
@@ -4431,6 +4425,7 @@ async def _direct_deepseek_teach(
     mode: str,
     trace_id: str,
     answer_key: str = "",
+    system_content: str | None = None,
 ) -> str | None:
     """Call DeepSeek API directly (bypass DT AgentLoop).
 
@@ -4448,40 +4443,39 @@ async def _direct_deepseek_teach(
     llm_url = "https://api.deepseek.com/v1/chat/completions"
     llm_model = os.getenv("LLM_MODEL", "deepseek-v4-flash")
 
-    # Build rich system prompt: full teaching persona with exam context,
-    # KB references, weak points, due reviews — same as _build_teaching_persona.
-    system_content = _TEACHER_SOUL
-
-    if context.strip():
-        system_content += (
-            f"\n\n### 当前教学内容（优先级最高）\n"
-            f"学生当前正在做以下试卷中的题目，之前的试卷已全部结束、全部作废。\n"
-            f"请完全专注于以下内容：\n\n{context[:3000]}\n"
-        )
-
-    try:
-        _due = await asyncio.to_thread(get_due_reviews, learner_id)
-        if _due:
-            _lines = ["\n### 到期复习知识点（优先复习）"]
-            for r in _due[:3]:
-                _name = r["kp_id"].split("/")[-1]
-                _pct = int(r["level"] * 100)
-                _lines.append(f"- {_name}（掌握度 {_pct}%，上次复习 {r['due_date']}）")
-            system_content += "\n" + "\n".join(_lines) + "\n"
-    except Exception:
-        pass
-
-    try:
-        _weak = await asyncio.to_thread(weak_points, learner_id)
-        if _weak:
-            _lines = ["\n### 该学生薄弱知识点（教学重点）"]
-            for w in _weak[:3]:
-                _name = w["kp_id"].split("/")[-1]
-                _pct = int(w["level"] * 100)
-                _lines.append(f"- {_name}（正确率 {_pct}%，已答 {w['total']} 题）")
-            system_content += "\n" + "\n".join(_lines) + "\n"
-    except Exception:
-        pass
+    # Build rich system prompt: use caller-provided persona when available,
+    # otherwise build inline (legacy path).  The persona already contains
+    # exam context, KB, curriculum, weak points, due reviews.
+    if system_content is None:
+        system_content = _TEACHER_SOUL
+        if context.strip():
+            system_content += (
+                f"\n\n### 当前教学内容（优先级最高）\n"
+                f"学生当前正在做以下试卷中的题目，之前的试卷已全部结束、全部作废。\n"
+                f"请完全专注于以下内容：\n\n{context[:3000]}\n"
+            )
+        try:
+            _due = await asyncio.to_thread(get_due_reviews, learner_id)
+            if _due:
+                _lines = ["\n### 到期复习知识点（优先复习）"]
+                for r in _due[:3]:
+                    _name = r["kp_id"].split("/")[-1]
+                    _pct = int(r["level"] * 100)
+                    _lines.append(f"- {_name}（掌握度 {_pct}%，上次复习 {r['due_date']}）")
+                system_content += "\n" + "\n".join(_lines) + "\n"
+        except Exception:
+            pass
+        try:
+            _weak = await asyncio.to_thread(weak_points, learner_id)
+            if _weak:
+                _lines = ["\n### 该学生薄弱知识点（教学重点）"]
+                for w in _weak[:3]:
+                    _name = w["kp_id"].split("/")[-1]
+                    _pct = int(w["level"] * 100)
+                    _lines.append(f"- {_name}（正确率 {_pct}%，已答 {w['total']} 题）")
+                system_content += "\n" + "\n".join(_lines) + "\n"
+        except Exception:
+            pass
 
     # Phase-specific user message
     _constraint = (
@@ -4655,6 +4649,7 @@ async def _tutor_chat_core(
     context: str,
     mode: str,
     trace_id: str,
+    total_questions: int = 0,
 ) -> dict:
     """tutor_chat 核心逻辑 — 供 HTTP endpoint 和内部直接调用共用.
 
@@ -4664,6 +4659,7 @@ async def _tutor_chat_core(
         context: 首轮上下文 (OCR 全文等), follow-up 留空
         mode: "guide" 或 "explain"
         trace_id: 追踪 ID
+        total_questions: 试卷总题数（用于完成检测）
     Returns:
         {"ok": True, "content": "..."} 或 {"ok": False, "error": "..."}
     """
@@ -4676,11 +4672,10 @@ async def _tutor_chat_core(
     if learner_id == "default":
         logger.warning("[%s] tutor_chat called with default learner_id", trace_id)
 
-    # Per-learner serialization is handled implicitly by the WS connection
-    # pool (_DTTutorSession.get/learner_id) — each learner has at most one
-    # active WS session, and the asyncio event loop ensures coroutine
-    # interleaving within that session is safe.
-
+    # Per-learner serialization is handled by HA's _running_teachings guard
+    # in weixin.py, which prevents concurrent _run_teaching_flow calls for
+    # the same learner.  Platform-side lock (via _get_learner_lock) would
+    # require indenting the entire function body and is not needed.
     global _session_msg_since_cleanup
     _session_msg_since_cleanup += 1
     _t_start = time.time()
@@ -4693,6 +4688,14 @@ async def _tutor_chat_core(
         if len(_last_tutor_context) > _MAX_CACHED_CONTEXTS:
             _last_tutor_context.clear()
         _save_context_to_disk(learner_id)
+
+    # 1b. Resume context: student paused and came back.
+    #     message has content (resume signal), context is empty, but we have
+    #     a cached exam context from before the pause.
+    if message.strip() and not context.strip() and learner_id in _last_tutor_context:
+        _qnum = _last_question_num.get(learner_id, 0)
+        context = _last_tutor_context[learner_id]
+        logger.info("[%s] Resume detected for %s (q%d), context restored", trace_id, learner_id, _qnum)
 
     # 2. Update SOUL.md with current exam context.
     #    DT re-reads SOUL.md on every system prompt build, so this is the
@@ -4773,6 +4776,7 @@ async def _tutor_chat_core(
     if context.strip() and not message.strip():
         _phase = "FIRST_QUESTION"
         _last_question_num[learner_id] = 1  # ensure tracking starts at 1
+        _session_answered_count[learner_id] = 0  # reset counter for new session
         _constraint = (
             "\n\n【硬性规则】\n"
             "🔴 本次回复只能出一道题！从试卷中选编号最小的未做题输出。\n"
@@ -4826,6 +4830,9 @@ async def _tutor_chat_core(
     _skip_ws = False
 
     # 4a. Direct DeepSeek API — fastest path, bypasses DT AgentLoop entirely.
+    # Use _last_persona (built by _update_soul_with_context above) as system
+    # prompt so the Direct path has the same rich context as the DT WS path.
+    _persona = _last_persona.get(learner_id, "")
     if not _skip_ws:
         try:
             _deepseek_content = await _direct_deepseek_teach(
@@ -4836,6 +4843,7 @@ async def _tutor_chat_core(
                 mode=mode,
                 trace_id=trace_id,
                 answer_key=_answer_keys.get(learner_id, ""),
+                system_content=_persona or None,
             )
         except Exception:
             _deepseek_content = ""
@@ -5024,6 +5032,28 @@ async def _tutor_chat_core(
             if _zp:
                 _kp_names[learner_id] = _zp.group(1).strip()
 
+        # Extract question number from reply and advance tracking.
+        # WS path already does this in _DTTutorSession.send_and_recv,
+        # but Direct API/NPU paths skip that method entirely.  This
+        # ensures _last_question_num is updated for ALL three paths.
+        #
+        # CRITICAL: use finditer and take the LAST match.  LLM replies
+        # in EVALUATE_ANSWER phase contain BOTH "第1题" (reference to
+        # the just-evaluated question) AND "第2题" (the new question).
+        # re.search finds only the FIRST ("第1题"), which equals the
+        # current value — the advancement never happens.  Always take
+        # the last occurrence to get the newest question number.
+        _qn_normalized = _normalize_qnum(content)
+        _all_qn = list(re.finditer(r"第\s*(\d+)\s*题", _qn_normalized))
+        if _all_qn:
+            _parsed_qnum = int(_all_qn[-1].group(1))
+            if _parsed_qnum > _last_question_num.get(learner_id, 0):
+                _last_question_num[learner_id] = _parsed_qnum
+                logger.info(
+                    "[%s] Advanced question num to %d for %s",
+                    trace_id, _parsed_qnum, learner_id,
+                )
+
         # === Platform Evaluation ===
         # Three paths, in priority order:
         #   1. Step 2b answer-key comparison (most reliable, no LLM bias)
@@ -5135,39 +5165,94 @@ async def _tutor_chat_core(
             # P1: strip analysis leakage before polish
             content = _strip_analysis(content, _phase)
             content = _polish_guide_response(content)
-            # Inject correct answer prominently when the student just answered.
-            # Strip the LLM's inline 正确答案 first (it will appear in the
-            # platform's prominent banner above), avoiding duplication.
-            # Sources (in priority order):
-            #   1. _mastery_eval["correct_answer"] — stored [ANSWER_KEY:X] (most reliable)
-            #   2. _correct_answer from Path 3 extraction (real answer, not "correct"/"wrong")
-            #   3. Direct _extract_correct_answer() on polished content (last resort)
+            # Strip any short separator (≤20 chars) including ═, ─, —
+            # (LLM often outputs short ══ lines too).  Our injected divider
+            # is 44 chars and won't match the {3,20} range below.
+            content = re.sub(r"\n[═─—]{3,20}\n", "\n", content).strip()
+            # Inject one divider + correct answer between questions.
             if _do_eval:
-                # Move the 正确答案 line to the end of the evaluation section
-                # (just before the next-question separator) so kids see the
-                # explanation first, then the answer prominently at the bottom.
-                _ans_m = re.search(r"^【?正确答案[：:].*$", content, flags=re.MULTILINE)
-                if _ans_m:
-                    _ans_line = _ans_m.group(0)
-                    content = content[: _ans_m.start()] + content[_ans_m.end() :]
-                    _sep_m = re.search(r"\n[-─—]{3,}\n", content)
-                    if _sep_m:
-                        content = (
-                            content[: _sep_m.start()]
-                            + f"\n═══════════════\n{_ans_line}\n═══════════════\n"
-                            + content[_sep_m.start() :]
-                        )
-                    else:
-                        content += f"\n\n═══════════════\n{_ans_line}\n═══════════════"
-                _answer_to_inject = ""
+                _ans_text = ""
                 if _mastery_eval is not None:
-                    _answer_to_inject = str(_mastery_eval.get("correct_answer", ""))
+                    _ans_text = str(_mastery_eval.get("correct_answer", ""))
                 elif _correct_answer and _correct_answer not in ("correct", "wrong"):
-                    _answer_to_inject = _correct_answer
+                    _ans_text = _correct_answer
                 else:
                     _ans = _extract_correct_answer(content)
                     if _ans:
-                        _answer_to_inject = _ans
+                        _ans_text = _ans
+                if _ans_text:
+                    _divider = f"\n{'═' * 44}\n✅ 正确答案：{_ans_text}\n{'═' * 44}\n"
+                    # Insert before the LAST (newest) "第N题" / "【第N题】"
+                    _all_q = list(re.finditer(r"(^|\n)【?第\s*\d+\s*[题、：:]", content))
+                    if _all_q:
+                        _pos = _all_q[-1].start()
+                        content = content[:_pos] + _divider + content[_pos:]
+                    else:
+                        content += _divider
+        # ── Exam completion detection + summary ──
+        if mode == "guide" and result.get("ok"):
+            _qn = _last_question_num.get(learner_id, 0)
+            _has_next_q = bool(re.search(r"第\s*(\d+)\s*题", content))
+            _is_done = ("全部" in content and "完成" in content)
+
+            # Increment answered counter when student submits an answer
+            if _phase == "EVALUATE_ANSWER" and message.strip():
+                _session_answered_count[learner_id] = (
+                    _session_answered_count.get(learner_id, 0) + 1
+                )
+
+            # Compute effective total questions with fallback chain:
+            # 1. Use caller-provided total_questions (> 0 from OCR/regex)
+            # 2. Try _detect_total_questions on the exam context
+            # 3. Use session answered count with 25-question hard cap
+            _effective_total = total_questions
+            if _effective_total <= 0:
+                _detected = _detect_total_questions(
+                    context.strip() or _last_tutor_context.get(learner_id, "")
+                )
+                _effective_total = _detected if _detected > 0 else 0
+
+            _FALLBACK_MAX = 25
+            _using_fallback = False
+            if _effective_total <= 0:
+                _answered = _session_answered_count.get(learner_id, 0)
+                if _answered >= _FALLBACK_MAX:
+                    _is_done = True
+                _effective_total = _FALLBACK_MAX
+                _using_fallback = True
+            else:
+                _is_done = (_qn >= _effective_total or ("全部" in content and "完成" in content))
+
+            # When LLM didn't output a next question (_has_next_q=False),
+            # force completion as long as at least one question was answered.
+            # Otherwise the student gets a response with no next question
+            # and no completion summary — confusing "no feedback" scenario.
+            _min_qn = max(1, _effective_total - 1) if _has_next_q else 1
+            if (_is_done or not _has_next_q) and _qn >= _min_qn:
+                try:
+                    _report = await asyncio.to_thread(generate_daily_report, learner_id)
+                    _weak_list = await asyncio.to_thread(weak_points, learner_id)
+                    _summary_data = _report.get("summary", {}) if _report else {}
+                    _total_r = _summary_data.get("total_questions", 0)
+                    _correct_r = _summary_data.get("correct", 0)
+                    _wrong_r = _summary_data.get("wrong", 0)
+                    if _using_fallback:
+                        _summary = "\n\n🎉 练习完成！"
+                    else:
+                        _summary = f"\n\n🎉 试卷完成！共 {_effective_total} 道题"
+                    if _total_r > 0:
+                        _summary += f"，答对 {_correct_r} 道，答错 {_wrong_r} 道"
+                    if _weak_list:
+                        _wn = [w["kp_id"].split("/")[-1] for w in _weak_list[:3]]
+                        _summary += f"\n【薄弱知识点】{', '.join(_wn)}"
+                    if "完成" not in content[-100:] and "🎉" not in content:
+                        content += _summary
+                    logger.info(
+                        "[%s] Exam complete for %s: %d questions (fallback=%s)",
+                        trace_id, learner_id, _effective_total, _using_fallback,
+                    )
+                except Exception:
+                    pass
         result["content"] = html.unescape(content)
         # Extract and store question text for the next turn's mastery recording.
         _q = _extract_question_text(content)
@@ -5245,6 +5330,7 @@ async def api_tutor_chat(request: Request):
         context=body.get("context", ""),
         mode=body.get("mode", "guide"),
         trace_id=trace_id,
+        total_questions=body.get("total_questions", 0),
     )
 
 
