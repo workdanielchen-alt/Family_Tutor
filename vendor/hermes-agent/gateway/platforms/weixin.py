@@ -2302,9 +2302,10 @@ class WeixinAdapter(BasePlatformAdapter):
                             except Exception:
                                 pass
 
-                # ── Image path: OCR first, then teach ──
+                # ── File path: extract text first, then teach ──
+                # Handles images (OCR), Office docs, PDFs — any file.
                 _teach_context = ""
-                if is_image and media_paths:
+                if media_paths:
                     first_file = media_paths[0]
                     filename = os.path.basename(first_file)
                     try:

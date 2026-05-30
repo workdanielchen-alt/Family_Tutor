@@ -1,5 +1,5 @@
 diff --git a/vendor/hermes-agent/gateway/platforms/weixin.py b/vendor/hermes-agent/gateway/platforms/weixin.py
-index bc846a0d9..a4d11dac1 100644
+index bc846a0d9..3c8fa6574 100644
 --- a/vendor/hermes-agent/gateway/platforms/weixin.py
 +++ b/vendor/hermes-agent/gateway/platforms/weixin.py
 @@ -1511,9 +1511,11 @@ class WeixinAdapter(BasePlatformAdapter):
@@ -74,14 +74,15 @@ index bc846a0d9..a4d11dac1 100644
                  # Send status updates while waiting
                  async def _maybe_send_status():
                      nonlocal _last_status
-@@ -2292,13 +2302,51 @@ class WeixinAdapter(BasePlatformAdapter):
+@@ -2292,13 +2302,52 @@ class WeixinAdapter(BasePlatformAdapter):
                              except Exception:
                                  pass
  
 -                # Start the tutor_chat request
-+                # ── Image path: OCR first, then teach ──
++                # ── File path: extract text first, then teach ──
++                # Handles images (OCR), Office docs, PDFs — any file.
 +                _teach_context = ""
-+                if is_image and media_paths:
++                if media_paths:
 +                    first_file = media_paths[0]
 +                    filename = os.path.basename(first_file)
 +                    try:
@@ -129,7 +130,7 @@ index bc846a0d9..a4d11dac1 100644
                          "mode": "guide",
                      },
                  )
-@@ -2322,8 +2370,18 @@ class WeixinAdapter(BasePlatformAdapter):
+@@ -2322,8 +2371,18 @@ class WeixinAdapter(BasePlatformAdapter):
          except Exception as exc:
              logger.warning("[%s] Tutor chat failed, falling back to agent: %s", self.name, exc)
  
