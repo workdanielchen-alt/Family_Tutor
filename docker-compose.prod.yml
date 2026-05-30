@@ -124,6 +124,8 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./docker/platform/provider_api.py:/app/provider_api.py:ro
       - ./docker/platform/mcp_server.py:/app/mcp_server.py:ro
+    networks:
+      - deeptutor-network
     depends_on:
       ollama:
         condition: service_healthy
