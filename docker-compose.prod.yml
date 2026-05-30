@@ -1,0 +1,131 @@
+# ============================================
+# DeepTutor Production Override — OCR + Local LLM
+# ============================================
+# Adds Ollama with MiniCPM-v4.6 Q4_K_M for OCR/vision.
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+# ============================================
+
+services:
+  # ============================================
+  # rkllama — NPU 推理服务 (PC stub / RK3576 NPU)
+  # ============================================
+  rkllama:
+    image: deepseek-rkllama:latest
+    container_name: rkllama
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - RKLLM_PORT=8080
+      - RKLLM_STUB_MODE=true
+    networks:
+      - deeptutor-network
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health')\" || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ============================================
+  # Ollama — MiniCPM-v4.6 Q4_K_M (OCR/vision)
+  # ============================================
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    ports:
+      # Host 11434 may be taken by Windows Ollama → use 11435
+      - "11435:11434"
+    environment:
+      - OLLAMA_MODELS=/models
+    volumes:
+      # Mount existing model storage (D:\ollama_models → /models)
+      - //d/ollama_models:/models
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+    networks:
+      - deeptutor-network
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ============================================
+  # Hermes Agent — WeChat iLink dual-bot gateway
+  # ============================================
+  hermes_agent:
+    image: deepseek-hermes_agent:latest
+    container_name: hermes_agent
+    restart: unless-stopped
+    ports:
+      - "8004:8004"
+    # Bypass s6-overlay (CRLF issue in type files) — run gateway directly
+    entrypoint: ["/bin/bash", "/opt/hermes/docker/gateway_start.sh"]
+    command: []
+    environment:
+      - WEIXIN_TOKEN=${WEIXIN_TOKEN}
+      - WEIXIN_ACCOUNT_ID=${WEIXIN_ACCOUNT_ID}
+      - CHILD_WEIXIN_TOKEN=${CHILD_WEIXIN_TOKEN}
+      - CHILD_WEIXIN_ACCOUNT_ID=${CHILD_WEIXIN_ACCOUNT_ID}
+      - WEIXIN_HOME_CHANNEL=o9cq802ba7xQQlXcT8l93_xO0jN0@im.wechat
+      - WEIXIN_DM_POLICY=open
+      - WEIXIN_GROUP_POLICY=disabled
+      - WEIXIN_ALLOWED_USERS=
+      - GATEWAY_ALLOW_ALL_USERS=true
+      - API_SERVER_ENABLED=true
+      - API_SERVER_HOST=0.0.0.0
+      - API_SERVER_PORT=8004
+      - API_SERVER_KEY=deepseek-local-key
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - OPENAI_API_KEY=${DEEPSEEK_API_KEY}
+      - HERMES_AGENT_TIMEOUT=120
+      - HERMES_API_TIMEOUT=30
+      - HERMES_OPENAI_TIMEOUT=90
+      - HERMES_HOME=/opt/data
+      - PLATFORM_API_URL=http://platform:8100
+      - HERMES_ALLOW_ROOT_GATEWAY=1
+    volumes:
+      - ./data_dev/hermes:/opt/data:rw
+      - ./data_dev/hermes_child:/opt/data/child:rw
+      - ./data/hermes:/data/hermes
+      - ./config/hermes_config.yaml:/opt/data/config.yaml:ro
+      - ./config/hermes_child_config.yaml:/opt/data/child/config.yaml:ro
+      - ./vendor/hermes-agent/run_agent.py:/opt/hermes/run_agent.py:ro
+      - ./vendor/hermes-agent/gateway/platforms/weixin.py:/opt/hermes/gateway/platforms/weixin.py:ro
+      - ./docker/platform/gateway_start.sh:/opt/hermes/docker/gateway_start.sh:ro
+    networks:
+      - deeptutor-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8004/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ============================================
+  # Platform — enable OCR via ollama
+  # ============================================
+  platform:
+    environment:
+      - OLLAMA_URL=http://ollama:11434
+      - OCR_PROVIDER=ollama
+      - OLLAMA_OCR_MODEL=openbmb/minicpm-v4.6:q4_K_M
+      - HERMES_CONTAINER=hermes_agent
+      - HERMES_AGENT_URL=http://hermes_agent:8004
+      - RKLLM_SERVER_URL=http://rkllama:8080
+      - RKLLM_STUB_MODE=true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./docker/platform/provider_api.py:/app/provider_api.py:ro
+      - ./docker/platform/mcp_server.py:/app/mcp_server.py:ro
+    depends_on:
+      ollama:
+        condition: service_healthy
+      hermes_agent:
+        condition: service_started
