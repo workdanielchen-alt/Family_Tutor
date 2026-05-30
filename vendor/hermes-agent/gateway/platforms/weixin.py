@@ -1511,11 +1511,9 @@ class WeixinAdapter(BasePlatformAdapter):
         _in_session = (self._teaching_sessions.get(effective_chat_id) or
                        self._teaching_sessions.get(sender_id))
         _has_doc = any(p.endswith((".doc", ".docx", ".pdf")) for p in media_paths)
-        _is_image = any(p.endswith((".jpg", ".jpeg", ".png", ".webp")) for p in media_paths)
-        _is_file = _has_doc or _is_image
 
-        # New file always starts fresh teaching (resets old session)
-        if _is_file and _in_session is not None:
+        # New doc always starts fresh teaching (resets old session)
+        if _has_doc and _in_session is not None:
             self._teaching_sessions.pop(effective_chat_id, None)
             self._teaching_sessions.pop(sender_id, None)
             self._save_teaching_sessions()
@@ -1536,13 +1534,13 @@ class WeixinAdapter(BasePlatformAdapter):
                 _in_session = None
                 logger.info("[%s] Chat signal, exited teaching session for %s", self.name, effective_chat_id)
             # Re-enter teaching → tutor_chat (platform preserves old context)
-            if _in_session is None and not _is_file and (
+            if _in_session is None and not _has_doc and (
                 text.strip() in _teach_signals or any(text.strip().startswith(kw) for kw in ("继续", "接着"))
             ):
                 _reenter_teach = True
                 logger.info("[%s] Re-enter teaching signal for %s", self.name, effective_chat_id)
 
-        _should_teach = (_in_session is not None) or (_is_file and _in_session is None) or _reenter_teach
+        _should_teach = (_in_session is not None) or (_has_doc and _in_session is None) or _reenter_teach
 
         if _should_teach:
             if _in_session is not None and _now - _in_session > 7200:
@@ -1556,19 +1554,13 @@ class WeixinAdapter(BasePlatformAdapter):
                 _msg = text.strip() if text.strip() else f"请分析这份{'、'.join(media_paths)}"
 
                 # Quick acknowledgment + fire-and-forget teaching in background
-                if _is_file:
+                if _has_doc:
                     try:
                         await self.send(content=" 正在分析试卷，请稍候...", chat_id=effective_chat_id)
                     except Exception:
                         pass
-
-                # IMMEDIATELY set teaching session BEFORE the async flow
-                # so any follow-up text from the student is routed to teaching
-                # rather than falling through to the general HA LLM (race fix).
-                self._teaching_sessions[effective_chat_id] = time.time()
-                self._save_teaching_sessions()
                 asyncio.create_task(self._run_teaching_flow(
-                    effective_chat_id, _msg, platform_url, _is_file, media_paths, _is_image,
+                    effective_chat_id, _msg, platform_url, _has_doc,
                 ))
                 return
         # ==== END HERMES PATCH ====
@@ -2273,9 +2265,7 @@ class WeixinAdapter(BasePlatformAdapter):
         effective_chat_id: str,
         message: str,
         platform_url: str,
-        is_new_file: bool,
-        media_paths: Optional[List[str]] = None,
-        is_image: bool = False,
+        is_new_doc: bool,
     ) -> None:
         """Fire-and-forget teaching flow with periodic status updates."""
         _STATUS_INTERVAL = 6
@@ -2283,7 +2273,7 @@ class WeixinAdapter(BasePlatformAdapter):
         _last_status = _start
 
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=180)) as session:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as session:
                 # Send status updates while waiting
                 async def _maybe_send_status():
                     nonlocal _last_status
@@ -2302,51 +2292,13 @@ class WeixinAdapter(BasePlatformAdapter):
                             except Exception:
                                 pass
 
-                # ── Image path: OCR first, then teach ──
-                _teach_context = ""
-                if is_image and media_paths:
-                    first_file = media_paths[0]
-                    filename = os.path.basename(first_file)
-                    try:
-                        with open(first_file, "rb") as f:
-                            form = aiohttp.FormData()
-                            form.add_field("file", f, filename=filename)
-                            form.add_field("learner_id", effective_chat_id)
-                            form.add_field("kb_name", "tutoring")
-                            form.add_field("suppress_auto_teach", "1")
-                            resp = await session.post(
-                                f"{platform_url}/api/process/file",
-                                data=form,
-                            )
-                        if resp.status == 200:
-                            data = await resp.json()
-                            if data.get("ok") and data.get("content"):
-                                _teach_context = data["content"].strip()
-                                logger.info(
-                                    "[%s] OCR extracted %d chars for %s",
-                                    self.name, len(_teach_context), effective_chat_id,
-                                )
-                    except Exception as exc:
-                        logger.warning("[%s] OCR failed for %s: %s", self.name, effective_chat_id, exc)
-
-                # ── Build the teaching message ──
-                if _teach_context:
-                    # Image with OCR: use extracted text as context
-                    _teach_msg = message if (
-                        message and not message.startswith("请分析这份")
-                    ) else ""
-                    _teach_ctx = _teach_context
-                else:
-                    # Document or follow-up text: send as-is (original behavior)
-                    _teach_msg = message
-                    _teach_ctx = ""
-
+                # Start the tutor_chat request
                 resp = await session.post(
                     f"{platform_url}/api/tutor/chat",
                     json={
-                        "message": _teach_msg,
+                        "message": message,
                         "learner_id": effective_chat_id,
-                        "context": _teach_ctx,
+                        "context": "",
                         "mode": "guide",
                     },
                 )
@@ -2370,8 +2322,18 @@ class WeixinAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("[%s] Tutor chat failed, falling back to agent: %s", self.name, exc)
 
-        # Fallback to regular agent processing
-        await self.handle_message(self._build_dummy_event(effective_chat_id, message))
+        # Fallback: send a friendly message instead of falling through to the
+        # general HA agent (which would take over the teaching conversation).
+        # The teaching session was already set in _process_message, so the
+        # next student message will retry the teaching flow.
+        try:
+            await self.send(
+                content=" 教学引擎暂时无响应，请再发一次或回复「继续做题」重试。",
+                chat_id=effective_chat_id,
+            )
+        except Exception:
+            pass
+        logger.warning("[%s] Tutor flow failed, kept session alive for %s", self.name, effective_chat_id)
 
     def _build_dummy_event(self, chat_id: str, text: str) -> "MessageEvent":
         """Build a minimal MessageEvent for fallback agent processing."""
