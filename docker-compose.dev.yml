@@ -1,280 +1,92 @@
 # ============================================
-# DeepTutor Docker Compose - Development Override
+# DeepTutor Development Override
 # ============================================
-# Use with: python scripts/docker_compose.py -f docker-compose.yml -f docker-compose.dev.yml up
+# Usage:
+#   python scripts/docker_compose.py -f docker-compose.yml -f docker-compose.dev.yml up -d
+#   python scripts/docker_compose.py -f docker-compose.yml -f docker-compose.dev.yml build
 #
-# This override file provides:
-#   - Hot-reload for both frontend and backend
-#   - Source code mounting for live editing
-#   - Development-friendly logging
+# For LLM services (ollama / rkllama) and WeChat gateway (hermes_agent):
+#   docker compose -f docker-compose.dev.yml up -d ollama hermes_agent
 # ============================================
 
 services:
-  # ============================================
-  # rkllama — 本地 LLM (RK3576 NPU 版, stub on PC)
-  # ============================================
-  rkllama:
-    image: deepseek-rkllama:latest
-    container_name: rkllama
-    restart: unless-stopped
-    ports:
-      - "8080:8080"
-    environment:
-      - RKLLM_PORT=8080
-      - RKLLM_LOG_LEVEL=0
-      - RKLLM_MAX_MEM_MB=3500
-      - RKLLM_STUB_MODE=true
-      # disable stub on real RK3576: RKLLM_STUB_MODE=false
-    working_dir: /app
-    command: python rkllama_server.py
-    shm_size: 256m
-    deploy:
-      resources:
-        limits:
-          memory: 4G
-    networks:
-      - deeptutor-network
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health')\" || exit 1"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
-
-  # ============================================
-  # Ollama — 本地 LLM (MiniCPM-V 4.6 与其他模型)
-  # ============================================
-  ollama:
-    image: ollama/ollama:0.20.5
-    container_name: ollama
-    restart: unless-stopped
-    # 宿主机 11434 已被 Windows Ollama 占用，映射到 11435
-    ports:
-      - "11435:11434"
-    environment:
-      - OLLAMA_MODELS=/models
-      - OLLAMA_KV_CACHE_TYPE=q8_0
-    volumes:
-      # 挂载已有的 MiniCPM-V 4.6 模型文件 (D:\ollama_models)
-      - //d/ollama_models:/models
-      # Modelfile for OCR-optimized derived model
-      - ./config/ollama:/config:ro
-    entrypoint: /bin/sh
-    command:
-      - -c
-      - |
-        ollama serve &
-        until ollama list >/dev/null 2>&1; do sleep 1; done
-        # Create OCR-optimized derived model if not exists
-        ollama create openbmb/minicpm-v4.6-ocr -f /config/Modelfile 2>/dev/null || true
-        wait
-    deploy:
-      resources:
-        limits:
-          memory: 4G
-    networks:
-      - deeptutor-network
-    healthcheck:
-      test: ["CMD", "ollama", "list"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
-
   deeptutor:
     build:
       target: development
-    dns:
-      - 202.96.134.133
-      - 202.96.128.66
-    ports:
-      - "3782:3782"
-
-    deploy:
-      resources:
-        limits:
-          memory: 2G
-
+      args:
+        - HTTP_PROXY=
+        - HTTPS_PROXY=
     volumes:
-      # Mount backend source code for hot-reload (from vendor)
+      # Mount source code for hot-reload
       - ./vendor/deeptutor/deeptutor:/app/deeptutor:ro
       - ./vendor/deeptutor/deeptutor_cli:/app/deeptutor_cli:ro
       - ./scripts:/app/scripts:ro
-
-      # Mount tutor_platform for the OCR pipeline
       - ./tutor_platform:/tutor_platform:ro
-
-      # Mount frontend source for hot-reload
+      - ./domains:/domains:ro
+      - ./config:/app/config:ro
+      # Frontend dev mode: mount source for hot-reload
       - ./web/app:/app/web/app:ro
       - ./web/components:/app/web/components:ro
-      - ./web/lib:/app/web/lib:ro
-      - ./web/hooks:/app/web/hooks:ro
       - ./web/context:/app/web/context:ro
+      - ./web/features:/app/web/features:ro
+      - ./web/hooks:/app/web/hooks:ro
       - ./web/i18n:/app/web/i18n:ro
+      - ./web/lib:/app/web/lib:ro
       - ./web/locales:/app/web/locales:ro
       - ./web/public:/app/web/public:ro
-
-      # Mount config files for hot-reload (tsconfig needs paths alias,
-      # tailwind/postcss for dev compilation, next.config for env changes)
-      - ./web/tsconfig.json:/app/web/tsconfig.json
-      - ./web/tailwind.config.js:/app/web/tailwind.config.js:ro
+      # CSS/Tailwind config — required for Turbopack to compile properly
       - ./web/postcss.config.js:/app/web/postcss.config.js:ro
+      - ./web/tailwind.config.js:/app/web/tailwind.config.js:ro
+      - ./web/app/globals.css:/app/web/app/globals.css:ro
+      - ./web/app/fonts.css:/app/web/app/fonts.css:ro
+      - ./web/tsconfig.json:/app/web/tsconfig.json
       - ./web/next.config.js:/app/web/next.config.js:ro
-
-      # Mount data directories (writable) - output to local ./data
+      # Data persistence
       - ./data/user:/app/data/user
       - ./data/memory:/app/data/memory
       - ./data/knowledge_bases:/app/data/knowledge_bases
-
-    # In development, we might want to see logs directly
-    # Uncomment the following to disable log files and see everything in console
-    # logging:
-    #   driver: "json-file"
-    #   options:
-    #     max-size: "10m"
-    #     max-file: "3"
-
-    networks:
-      - deeptutor-network
-
-  # ============================================
-  # Hermes Agent — WeChat iLink dual-bot gateway
-  # ============================================
-  hermes_agent:
-    image: deepseek-hermes_agent:latest
-    container_name: hermes_agent
-    restart: unless-stopped
-    dns:
-      - 202.96.134.133
-      - 202.96.128.66
-    ports:
-      - "8004:8004"
-    deploy:
-      resources:
-        limits:
-          memory: 512M
     environment:
-      - WEIXIN_TOKEN=${WEIXIN_TOKEN}
-      - WEIXIN_ACCOUNT_ID=${WEIXIN_ACCOUNT_ID}
-      - WEIXIN_HOME_CHANNEL=o9cq802ba7xQQlXcT8l93_xO0jN0@im.wechat
-      - WEIXIN_DM_POLICY=open
-      - WEIXIN_GROUP_POLICY=disabled
-      - WEIXIN_ALLOWED_USERS=
-      - GATEWAY_ALLOW_ALL_USERS=true
-      - CHILD_WEIXIN_TOKEN=${CHILD_WEIXIN_TOKEN}
-      - CHILD_WEIXIN_ACCOUNT_ID=9fd8e4a28c1d@im.bot
-      - API_SERVER_ENABLED=true
-      - API_SERVER_HOST=0.0.0.0
-      - API_SERVER_PORT=8004
-      - API_SERVER_KEY=deepseek-local-key
-      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-sk-8cfebec23e774bdab1020bbdce061fce}
-      - OPENAI_API_KEY=${DEEPSEEK_API_KEY:-sk-8cfebec23e774bdab1020bbdce061fce}
-      - HERMES_AGENT_TIMEOUT=120
-      - HERMES_API_TIMEOUT=30
-      - HERMES_OPENAI_TIMEOUT=90
-      - HERMES_HOME=/opt/data
-      - PLATFORM_API_URL=http://platform:8100
-    volumes:
-      - ./data_dev/hermes:/opt/data:rw
-      - ./data_dev/hermes_child:/opt/data/child:rw
-      - ./data/hermes:/data/hermes
-      - ./config/hermes_config.yaml:/opt/data/config.yaml:ro
-      - ./config/hermes_child_config.yaml:/opt/data/child/config.yaml:ro
-      - ./vendor/hermes-agent/run_agent.py:/opt/hermes/run_agent.py:ro
-      - ./vendor/hermes-agent/gateway/platforms/weixin.py:/opt/hermes/gateway/platforms/weixin.py:ro
-      - ./docker/platform/gateway_start.sh:/opt/hermes/docker/gateway_start.sh:ro
-    command: bash /opt/hermes/docker/gateway_start.sh
-    depends_on:
-      rkllama:
-        condition: service_healthy
+      - DEEPTUTOR_ENV=development
+      - BACKEND_RELOAD=true
     networks:
       - deeptutor-network
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8004/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
 
-  # ============================================
-  # Platform — Provider API + MCP + Cron + Device Manager
-  # ============================================
   platform:
-    image: deepseek-platform:latest
-    container_name: platform
-    restart: unless-stopped
-    dns:
-      - 202.96.134.133
-      - 202.96.128.66
-    ports:
-      - "8100:8100"
-      - "8101:8101"
-    deploy:
-      resources:
-        limits:
-          memory: 1G
-    environment:
-      - PROVIDER_API_PORT=8100
-      - DEVICE_MANAGER_URL=http://localhost:8101
-      - DEVICE_MANAGER_PORT=8101
-      - DEEPTUTOR_API_URL=http://deeptutor:8001
-      - DEEPTUTOR_URL=http://deeptutor:8001
-      - HERMES_AGENT_URL=http://hermes_agent:8004
-      - OLLAMA_URL=http://ollama:11434
-      - OCR_PROVIDER=ollama
-      - OLLAMA_OCR_MODEL=openbmb/minicpm-v4.6-ocr
-      - RKLLM_SERVER_URL=http://rkllama:8080
-      - MASTERY_DIR=/data/mastery
-      - CHROMA_PERSIST_DIR=/data/chromadb
-      - EMBEDDING_MODEL=bge-m3
-      - DOMAINS_SUBJECT=math
-      - INGEST_STATUS_DIR=/data/ingest_status
-      - UPLOADS_DIR=/data/uploads
-      - SOURCES_DIR=/data/sources
-      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
-      - SESSION_CLEANUP_THRESHOLD=2000
-      - RKLLM_STUB_MODE=true
-      - CRON_INTERVAL_S=60
-      - QUIZ_SYNC_INTERVAL_S=60
-      - HERMES_CONTAINER=hermes_agent
-      - DEVICE_IP=127.0.0.1
-      - WEIXIN_TOKEN=${WEIXIN_TOKEN}
-      - CHILD_WEIXIN_TOKEN=${CHILD_WEIXIN_TOKEN}
-      - PYTHONPATH=/vendor/hermes-agent:/
+    build:
+      context: .
+      dockerfile: docker/platform/Dockerfile
+      args:
+        - HTTP_PROXY=
+        - HTTPS_PROXY=
     volumes:
-      # 挂载重建的 tutor_platform 和 domains 模块
       - ./tutor_platform:/tutor_platform:ro
       - ./domains:/domains:ro
-      # 挂载 provider API 和 MCP server 源码 (容器内 /app 目录)
+      - ./config:/app/config:ro
+      - ./vendor/hermes-agent:/vendor/hermes-agent:ro
       - ./docker/platform/provider_api.py:/app/provider_api.py:ro
       - ./docker/platform/mcp_server.py:/app/mcp_server.py:ro
-      # 挂载 config 目录（知识点 YAML 热生效）
-      - ./config:/app/config:ro
-      # 持久化数据目录
+      - ./docker/platform/device_manager_api.py:/app/device_manager_api.py:ro
+      # Data persistence
       - ./data/mastery:/data/mastery
       - ./data/chromadb:/data/chromadb
       - ./data/ingest_status:/data/ingest_status
       - ./data/uploads:/data/uploads
       - ./data/sources:/data/sources
-      # 共享通知目录: platform 写通知 → hermes_agent 消费后推送微信
       - ./data/hermes:/data/hermes
-      - ./data_dev/hermes_child:/data/hermes_child
-      # Docker socket: allow exec into hermes_agent for QR login operations
       - /var/run/docker.sock:/var/run/docker.sock:ro
-    depends_on:
-      rkllama:
-        condition: service_healthy
-      ollama:
-        condition: service_started
-      deeptutor:
-        condition: service_started
-      hermes_agent:
-        condition: service_started
+    environment:
+      - DEEPTUTOR_ENV=development
+      - PROVIDER_API_PORT=8100
+      - DEVICE_MANAGER_PORT=8101
+      - DEEPTUTOR_API_URL=http://deeptutor:8001
+      - RKLLM_STUB_MODE=true
+      - PYTHONPATH=/vendor/hermes-agent:/tutor_platform:/
     networks:
       - deeptutor-network
-    healthcheck:
-      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8100/health')\" || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
+    depends_on:
+      deeptutor:
+        condition: service_started
+
+networks:
+  deeptutor-network:
+    driver: bridge
