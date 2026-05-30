@@ -4423,6 +4423,132 @@ def _strip_analysis(text: str, phase: str) -> str:
     return result
 
 
+async def _direct_deepseek_teach(
+    phase: str,
+    learner_id: str,
+    context: str,
+    message: str,
+    mode: str,
+    trace_id: str,
+    answer_key: str = "",
+) -> str | None:
+    """Call DeepSeek API directly (bypass DT AgentLoop).
+
+    Much faster than the DT WS path (~3-5s vs 30-80s) and gives us
+    full control over the system prompt format.  No WS, no profile
+    switching, no bot restarts, no AgentLoop overhead.
+
+    Falls back to None on any failure so the caller can retry via WS.
+    """
+    api_key = os.getenv("DEEPSEEK_API_KEY", "")
+    if not api_key:
+        logger.warning("[%s] Direct DeepSeek: DEEPSEEK_API_KEY not set", trace_id)
+        return None
+
+    llm_url = "https://api.deepseek.com/v1/chat/completions"
+    llm_model = os.getenv("LLM_MODEL", "deepseek-v4-flash")
+
+    # Build rich system prompt: full teaching persona with exam context,
+    # KB references, weak points, due reviews — same as _build_teaching_persona.
+    system_content = _TEACHER_SOUL
+
+    if context.strip():
+        system_content += (
+            f"\n\n### 当前教学内容（优先级最高）\n"
+            f"学生当前正在做以下试卷中的题目，之前的试卷已全部结束、全部作废。\n"
+            f"请完全专注于以下内容：\n\n{context}\n"
+        )
+
+    try:
+        _due = await asyncio.to_thread(get_due_reviews, learner_id)
+        if _due:
+            _lines = ["\n### 到期复习知识点（优先复习）"]
+            for r in _due[:5]:
+                _name = r["kp_id"].split("/")[-1]
+                _pct = int(r["level"] * 100)
+                _lines.append(f"- {_name}（掌握度 {_pct}%，上次复习 {r['due_date']}）")
+            system_content += "\n" + "\n".join(_lines) + "\n"
+    except Exception:
+        pass
+
+    try:
+        _weak = await asyncio.to_thread(weak_points, learner_id)
+        if _weak:
+            _lines = ["\n### 该学生薄弱知识点（教学重点）"]
+            for w in _weak[:5]:
+                _name = w["kp_id"].split("/")[-1]
+                _pct = int(w["level"] * 100)
+                _lines.append(f"- {_name}（正确率 {_pct}%，已答 {w['total']} 题）")
+            system_content += "\n" + "\n".join(_lines) + "\n"
+    except Exception:
+        pass
+
+    # Phase-specific user message
+    _constraint = (
+        "\n\n【硬性规则】\n"
+        "🔴 题号必须用阿拉伯数字「第1题」「第2题」——禁止中文数字。\n"
+        "🔴 每次只能出一道题。\n"
+        "🔴 回复末尾必须包含 [ANSWER_KEY:X] 和 [KP_ID:学科/章/节] 标记。\n"
+    )
+    if phase == "FIRST_QUESTION":
+        _constraint += (
+            "🔴 本次回复只能出一道题！从试卷中选编号最小的未做题输出。\n"
+            "✅ 只输出题目 + 一个引导问题。\n"
+        )
+        user_content = f"[PHASE:{phase}]{_constraint}\n{context}"
+    else:
+        _qnum = _last_question_num.get(learner_id, 0)
+        _next_q = _qnum + 1
+        _prev_answer = _answer_keys.get(learner_id, "")
+        _constraint += (
+            f"🔴 当前是第{_qnum}题，评判此题后必须立即出第{_next_q}题！\n"
+            "✅ 评判 + 下一题必须在一轮回复中完成。\n"
+        )
+        _answer_context = ""
+        if _prev_answer and _qnum > 0:
+            _answer_context = f"\n第{_qnum}题的正确答案是「{_prev_answer}」。请据此给出讲解。\n"
+        user_content = f"[PHASE:{phase}]{_constraint}\n{_answer_context}{message}"
+        _exam_ctx = context.strip() or _last_tutor_context.get(learner_id, "")
+        if _exam_ctx:
+            user_content += f"\n\n# 当前试卷（下一题必须从此试卷中选取）\n{_exam_ctx[:6000]}"
+
+    payload = {
+        "model": llm_model,
+        "messages": [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": 0.7,
+        "max_tokens": 2048,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                llm_url,
+                json=payload,
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            if resp.status_code != 200:
+                logger.warning("[%s] Direct DeepSeek call failed: HTTP %d", trace_id, resp.status_code)
+                return None
+            data = resp.json()
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            if not content or len(content.strip()) < 20:
+                logger.warning("[%s] Direct DeepSeek call too short (%d chars)", trace_id, len(content))
+                return None
+            logger.info("[%s] Direct DeepSeek call succeeded (%d chars, %.1fs)",
+                        trace_id, len(content),
+                        data.get("usage", {}).get("total_time", 0))
+            return content
+    except httpx.TimeoutException:
+        logger.warning("[%s] Direct DeepSeek call timed out", trace_id)
+        return None
+    except Exception as e:
+        logger.warning("[%s] Direct DeepSeek call failed: %s", trace_id, e)
+        return None
+
+
 async def _direct_llm_teach(
     phase: str,
     learner_id: str,
@@ -4692,21 +4818,47 @@ async def _tutor_chat_core(
 
     _nudge_sent = False  # track if we already nudged for next question
 
-    # 4. Direct LLM call for NPU path (replaces DT AgentLoop profile switching + WS).
-    #    When the local LLM lock is available, call rkllama's OpenAI-compatible API
-    #    directly without going through DT AgentLoop.  This avoids profile switching,
-    #    bot restarts, and WS overhead.  If it fails or returns weak content, fall
-    #    through to the existing DeepSeek WS path.
-    _llm_local = False
+    # 4. Direct LLM paths (bypass DT AgentLoop for speed).
+    #    Three tiers, each falling through to the next on failure:
+    #    4a. DeepSeek Direct API  (~3-5s, primary path)
+    #    4b. Local NPU (rkllama)  (~10-30s, when lock available)
+    #    4c. DT WebSocket path    (~30-80s, last resort)
     _skip_ws = False
-    if os.getenv("RKLLM_STUB_MODE", "").lower() != "true":
+
+    # 4a. Direct DeepSeek API — fastest path, bypasses DT AgentLoop entirely.
+    if not _skip_ws:
+        try:
+            _deepseek_content = await _direct_deepseek_teach(
+                phase=_phase,
+                learner_id=learner_id,
+                context=_soul_context or "",
+                message=message,
+                mode=mode,
+                trace_id=trace_id,
+                answer_key=_answer_keys.get(learner_id, ""),
+            )
+        except Exception:
+            _deepseek_content = ""
+            logger.warning("[%s] Direct DeepSeek path failed", trace_id)
+        if _deepseek_content and len(_deepseek_content.strip()) >= 20:
+            _skip_ws = True
+            result = {"ok": True, "content": _deepseek_content}
+            logger.info(
+                "[%s] Direct DeepSeek path succeeded (%d chars), skipping WS",
+                trace_id,
+                len(_deepseek_content),
+            )
+
+    # 4b. Direct local NPU (rkllama), when the LLM lock is available.
+    _llm_local = False
+    if not _skip_ws and os.getenv("RKLLM_STUB_MODE", "").lower() != "true":
         try:
             await asyncio.wait_for(_llm_lock.acquire(), timeout=5)
             _llm_local = True
         except asyncio.TimeoutError:
             pass
 
-    if _llm_local:
+    if _llm_local and not _skip_ws:
         try:
             _direct_content = await _direct_llm_teach(
                 phase=_phase,
