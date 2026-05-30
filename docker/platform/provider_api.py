@@ -4456,14 +4456,14 @@ async def _direct_deepseek_teach(
         system_content += (
             f"\n\n### 当前教学内容（优先级最高）\n"
             f"学生当前正在做以下试卷中的题目，之前的试卷已全部结束、全部作废。\n"
-            f"请完全专注于以下内容：\n\n{context}\n"
+            f"请完全专注于以下内容：\n\n{context[:3000]}\n"
         )
 
     try:
         _due = await asyncio.to_thread(get_due_reviews, learner_id)
         if _due:
             _lines = ["\n### 到期复习知识点（优先复习）"]
-            for r in _due[:5]:
+            for r in _due[:3]:
                 _name = r["kp_id"].split("/")[-1]
                 _pct = int(r["level"] * 100)
                 _lines.append(f"- {_name}（掌握度 {_pct}%，上次复习 {r['due_date']}）")
@@ -4475,7 +4475,7 @@ async def _direct_deepseek_teach(
         _weak = await asyncio.to_thread(weak_points, learner_id)
         if _weak:
             _lines = ["\n### 该学生薄弱知识点（教学重点）"]
-            for w in _weak[:5]:
+            for w in _weak[:3]:
                 _name = w["kp_id"].split("/")[-1]
                 _pct = int(w["level"] * 100)
                 _lines.append(f"- {_name}（正确率 {_pct}%，已答 {w['total']} 题）")
@@ -4523,7 +4523,7 @@ async def _direct_deepseek_teach(
     }
 
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.post(
                 llm_url,
                 json=payload,
