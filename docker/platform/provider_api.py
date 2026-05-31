@@ -54,6 +54,7 @@ from domains.tutoring.mastery import (
     update_mastery,
     weak_points,
 )
+from tutor_platform.quiz_session import get_store as get_quiz_session_store
 from tutor_platform.quiz_sync import sync_quiz_to_mastery
 from tutor_platform.storage import validate_provider_config
 from tutor_platform.unified_provider import (
@@ -1208,7 +1209,9 @@ async def _handle_inbound_file(
             if _temp_link and os.path.exists(_temp_link):
                 os.unlink(_temp_link)
 
-            if content:
+            # markitdown returns partial garbage (<50 chars) for old .doc format.
+            # Fall through to antiword when the result is too short.
+            if content and (len(content) >= 50 or ext not in {".doc", ".ppt", ".pps", ".xls"}):
                 logger.info(
                     "[%s] markitdown extracted %d chars from %s", trace_id, len(content), file_path
                 )
@@ -1226,7 +1229,7 @@ async def _handle_inbound_file(
                     }
                 )
 
-            # ── markitdown declined; try specialized fallbacks ──
+            # ── markitdown declined or returned too little; try specialized fallbacks ──
             if ext == ".doc":
                 content = _extract_with_antiword(file_path)
             elif ext in {".ppt", ".pps"}:
@@ -2374,6 +2377,13 @@ async def _periodic_task_loop():
                         _pushed_count,
                     )
 
+            # ── Quiz session cleanup: expire stale sessions ──
+            try:
+                from tutor_platform.quiz_session import get_store
+                get_store().expire_stale()
+            except Exception:
+                logger.debug("[periodic] quiz_session cleanup skipped")
+
         except Exception:
             logger.warning("[periodic] tick failed", exc_info=True)
 
@@ -3278,6 +3288,7 @@ async def api_process_file(request: Request):
         file_path = body.get("file_path", "")
         kb_name = body.get("kb_name", "tutoring")
         learner_id = body.get("learner_id", "default")
+        create_quiz = body.get("create_quiz", False)
         file = None
     elif "multipart/form-data" in content_type:
         form = await request.form()
@@ -3285,6 +3296,7 @@ async def api_process_file(request: Request):
         file_path = form.get("file_path", "")
         kb_name = form.get("kb_name", "tutoring")
         learner_id = form.get("learner_id", "default")
+        create_quiz = form.get("create_quiz", "0") in ("1", "true", "yes")
     else:
         return {"ok": False, "error": "Unsupported content-type; use JSON or multipart/form-data"}
 
@@ -3395,9 +3407,50 @@ async def api_process_file(request: Request):
             )
         )
 
-    # auto_teach / suppress_auto_teach 参数已移除 (Path 2 删除).
-    # 教学统一由 HA 的 _run_teaching_flow 驱动: HA 先调 /api/process/file (OCR),
-    # 再调 /api/tutor/chat (教学). 此处不再触发异步教学路径.
+    # ── 创建 quiz session (可选) ──
+    # HA 传 create_quiz=1 时，自动从 OCR 文本创建 quiz session 并返回 session_id
+    if create_quiz and result.get("ok") and result.get("content"):
+        try:
+            ocr_text = result["content"]
+            # 如果文本太短（<20字），不视为试卷
+            if len(ocr_text.strip()) >= 20:
+                from tutor_platform.quiz_session import get_store as _get_qs_store
+                import tutor_platform.quiz_session as _qs_mod
+                import json as _json
+
+                _store = _get_qs_store()
+                # 直接用 OCR 文本调用 LLM 出题
+                _questions = await _generate_quiz_from_ocr(
+                    ocr_text, 40, learner_id
+                )
+                if _questions:
+                    _public = []
+                    for _q in _questions:
+                        _pq = dict(_q)
+                        _pq.pop("correct_answer", None)
+                        _pq.pop("explanation", None)
+                        _public.append(_pq)
+
+                    _session = _store.create(
+                        learner_id=learner_id,
+                        questions=_public,
+                        questions_with_answer=_questions,
+                        source_file=file.filename if file and file.filename else "",
+                        source_ocr_text=ocr_text,
+                    )
+                    result["session_id"] = _session.session_id
+                    result["total_questions"] = _session.total_questions
+                    result["frontend_url"] = (
+                        f"http://{_DEVICE_IP}:3782" if _DEVICE_IP
+                        else "http://localhost:3782"
+                    )
+                    logger.info(
+                        "[%s] quiz session created: %s (%d questions)",
+                        trace_id, _session.session_id, _session.total_questions,
+                    )
+        except Exception as _qexc:
+            logger.warning("[%s] quiz session creation failed: %s", trace_id, _qexc)
+
     return result
 
 
@@ -5698,17 +5751,38 @@ async def api_vision(req: VisionRequest, request: Request = None):
 
 @app.get("/api/mastery/")
 def api_list_learners():
-    """列出所有有掌握度数据的学习者."""
+    """列出有实际掌握度数据的学习者 (跳过 session 文件和空数据)."""
     mastery_root = "/data/mastery"
     if not os.path.isdir(mastery_root):
         return []
     try:
-        learners = sorted(
-            f.name.removesuffix(".json")
-            for f in os.scandir(mastery_root)
-            if f.is_file() and f.name.endswith(".json")
-        )
-        return learners
+        learners = []
+        for f in os.scandir(mastery_root):
+            if not (f.is_file() and f.name.endswith(".json")):
+                continue
+            name = f.name.removesuffix(".json")
+            # skip session files and test artifacts
+            if name.endswith("_session") or name.startswith("_") or name.startswith("e2e-") or name.startswith("test"):
+                continue
+            # only include learners with real mastery data
+            try:
+                data = json.loads(open(f.path, "r", encoding="utf-8").read())
+                total = data.get("total_questions", 0) or 0
+                mastery = data.get("mastery", {})
+                lid = data.get("learner_id", "").strip()
+                if not lid:
+                    continue
+                if total > 0 or mastery:
+                    learners.append((lid, total))
+            except Exception:
+                continue
+        # Deduplicate and sort by total_questions descending
+        seen = {}
+        for lid, total in learners:
+            if lid not in seen or total > seen[lid]:
+                seen[lid] = total
+        result = sorted(seen.items(), key=lambda x: -x[1])
+        return [lid for lid, _ in result]
     except OSError as e:
         logger.warning("Failed to list learners: %s", e)
         return []
@@ -5721,6 +5795,27 @@ def api_get_mastery(learner_id: str, kp_id: str = ""):
     from domains.tutoring.mastery import get_mastery_summary
 
     return get_mastery_summary(learner_id)
+
+
+@app.get("/api/mastery/{learner_id}/summary")
+def api_get_mastery_summary(learner_id: str):
+    """返回聚合掌握度摘要 (total_questions, accuracy, mastered, total_kp)."""
+    from domains.tutoring.mastery import _load as _load_mastery
+
+    data = _load_mastery(learner_id)
+    mastered = sum(
+        1 for kp in data.get("mastery", {}).values()
+        if kp.get("level", 0) >= 0.6
+    )
+    total_kp = len(data.get("mastery", {}))
+    total_q = data.get("total_questions", 0)
+    correct = data.get("correct_count", 0)
+    return {
+        "total_questions": total_q,
+        "accuracy": round(correct / total_q, 2) if total_q > 0 else 0,
+        "mastered": mastered,
+        "total_kp": total_kp,
+    }
 
 
 @app.get("/api/mastery/{learner_id}/wrong")
@@ -5754,11 +5849,20 @@ def api_get_answer_history(learner_id: str, limit: int = 20, kp_id: str = ""):
 
 @app.post("/api/mastery/{learner_id}")
 async def api_update_mastery(learner_id: str, req: dict):
-    domain = req.get("domain", "math")
-    topic = req.get("topic", "")
+    # Accept kp_id directly, or construct from domain/topic
+    kp_id = req.get("kp_id", "")
+    if not kp_id:
+        domain = req.get("domain", "math")
+        topic = req.get("topic", "")
+        kp_id = f"{domain}/{topic}" if topic else domain
     correct = req.get("correct", False)
-    kp_id = f"{domain}/{topic}" if topic else domain
-    return await asyncio.to_thread(update_mastery, learner_id, kp_id, correct)
+    question = req.get("question", "")
+    user_answer = req.get("user_answer", "")
+    correct_answer = req.get("correct_answer", "")
+    return await asyncio.to_thread(
+        update_mastery, learner_id, kp_id, correct,
+        question=question, user_answer=user_answer, correct_answer=correct_answer,
+    )
 
 
 @app.get("/api/mastery/{learner_id}/report")
@@ -6154,12 +6258,30 @@ async def _generate_exam_paper(
                 learner_id,
             )
 
+            # Build flat questions list for interactive frontend QuizViewer
+            flat_questions = []
+            for sec in sections:
+                sec_type = sec.get("type", "")
+                qs = sec.get("questions", [])
+                for q in qs:
+                    flat_questions.append({
+                        "num": q.get("num", len(flat_questions) + 1),
+                        "section_type": sec_type,
+                        "question": q.get("question", ""),
+                        "options": q.get("options", {}),
+                        "kpi": q.get("kpi", ""),
+                        "difficulty": q.get("difficulty", "medium"),
+                        "correct_answer": q.get("correct_answer", ""),
+                        "explanation": q.get("explanation", ""),
+                    })
+
             return {
                 "ok": True,
                 "exam_text": exam_text,
                 "title": title,
                 "kp_covered": sorted(kp_covered),
                 "total": total,
+                "questions": flat_questions,
                 "sections": [
                     {"type": s["type"], "count": len(s.get("questions", []))}
                     for s in sections
@@ -7169,6 +7291,420 @@ async def mdns_status():
         "ip": _DEVICE_IP or "",
         "engines": {"avahi": avahi_alive, "zeroconf": zeroconf_alive},
     }
+
+
+# ── Quiz Session endpoints ────────────────────────────────────
+# 微信发卷 → WEBUI QuizViewer 答题 (2026-05)
+# 文档: docs/wechat-quiz-viewer-design.md
+
+import tutor_platform.quiz_session as qs_mod
+
+
+@app.post("/api/quiz/create-from-ocr")
+async def api_quiz_create_from_ocr(request: Request):
+    """从 OCR 文本创建 QuizSession，调 mimic pipeline 出题。"""
+    body = await request.json()
+    learner_id = str(body.get("learner_id", "default"))
+    ocr_text = str(body.get("ocr_text", "")).strip()
+    source_file = str(body.get("source_file", ""))
+    total_questions = int(body.get("total_questions", 0))
+
+    if not ocr_text:
+        return {"ok": False, "error": "ocr_text 不能为空"}
+
+    # 调 mimic 管道出题: 将 OCR 文本模拟为"试卷"传给 LLM
+    questions = await _generate_quiz_from_ocr(ocr_text, total_questions, learner_id)
+    if not questions:
+        return {"ok": False, "error": "出题失败，请重试"}
+
+    # 分离答案（前端不返回 correct_answer/explanation）
+    public_questions = []
+    for q in questions:
+        pq = dict(q)
+        pq.pop("correct_answer", None)
+        pq.pop("explanation", None)
+        public_questions.append(pq)
+
+    # 提取知识点和标题
+    all_kps = list({q.get("knowledge_context", "") for q in questions if q.get("knowledge_context")})
+    first_question = questions[0].get("question", "") if questions else ""
+    title = body.get("title", "") or _infer_title(source_file, ocr_text, first_question)
+
+    store = get_quiz_session_store()
+    session = store.create(
+        learner_id=learner_id,
+        questions=public_questions,
+        questions_with_answer=questions,
+        title=title,
+        kp_covered=all_kps,
+        source_file=source_file,
+        source_ocr_text=ocr_text,
+    )
+    return {
+        "ok": True,
+        "session_id": session.session_id,
+        "total_questions": session.total_questions,
+        "kp_covered": session.kp_covered,
+        "title": session.title,
+        "expires_at": session.expires_at,
+    }
+
+
+@app.get("/api/quiz/session/{session_id}")
+async def api_quiz_get_session(session_id: str):
+    """获取 QuizSession（题目不含答案）。"""
+    store = get_quiz_session_store()
+    session = store.get(session_id)
+    if not session:
+        return _quiz_error(404, "试卷不存在")
+    if session.is_expired and session.status not in ("completed",):
+        store.mark_expired(session_id)
+        return _quiz_error(410, "答题链接已过期")
+    return {
+        "ok": True,
+        "session_id": session.session_id,
+        "learner_id": session.learner_id,
+        "status": session.status,
+        "title": session.title,
+        "total_questions": session.total_questions,
+        "completed": session.completed,
+        "questions": session.questions_with_answer,
+        "kp_covered": session.kp_covered,
+        "created_at": session.created_at,
+        "expires_at": session.expires_at,
+        "completed_at": session.completed_at,
+    }
+
+
+@app.get("/api/quiz/{session_id}/questions")
+async def api_quiz_get_questions(session_id: str):
+    """返回含答案的完整题目（供 DT deep_question capability 内部调用）。"""
+    store = get_quiz_session_store()
+    session = store.get(session_id)
+    if not session:
+        return {"ok": False, "error": "试卷不存在"}
+    return {
+        "ok": True,
+        "questions": session.questions_with_answer,
+        "answered_question_ids": list(session.answers.keys()),
+    }
+
+
+@app.post("/api/quiz/answer")
+async def api_quiz_answer(request: Request):
+    """提交单题答案并返回批改结果。"""
+    body = await request.json()
+    session_id = str(body.get("session_id", ""))
+    question_id = str(body.get("question_id", ""))
+    learner_id = str(body.get("learner_id", ""))
+    user_answer = str(body.get("answer", "")).strip()
+
+    if not session_id or not question_id:
+        return {"ok": False, "error": "缺少参数"}
+
+    store = get_quiz_session_store()
+    session = store.get(session_id)
+    if not session:
+        return _quiz_error(404, "试卷不存在")
+    if session.learner_id != learner_id:
+        return _quiz_error(403, "学习者不匹配")
+    if session.status == "completed":
+        return _quiz_error(400, "试卷已完成")
+    if session.is_expired:
+        store.mark_expired(session_id)
+        return _quiz_error(410, "答题链接已过期")
+
+    # 查找题目
+    question = None
+    for q in session.questions_with_answer:
+        if q.get("question_id") == question_id:
+            question = q
+            break
+    if not question:
+        return _quiz_error(404, f"题目 {question_id} 不存在")
+
+    # 判题
+    correct_answer = str(question.get("correct_answer", "")).strip()
+    is_correct = _check_answer(user_answer, correct_answer)
+
+    # 记录
+    record = qs_mod.AnswerRecord(
+        question_id=question_id,
+        user_answer=user_answer,
+        is_correct=is_correct,
+        kp_id=question.get("knowledge_context", ""),
+        attempted_at=__import__("time").time(),
+    )
+    session.answers[question_id] = record
+    session.completed = sum(1 for q in session.questions_with_answer if q.get("question_id") in session.answers)
+    if session.status == "pending":
+        session.status = "active"
+    store.save(session)
+
+    # 检查是否全部完成
+    session_completed = session.completed >= session.total_questions
+    if session_completed and session.status != "completed":
+        await _finish_quiz_session(session, store)
+
+    return {
+        "ok": True,
+        "is_correct": is_correct,
+        "correct_answer": correct_answer,
+        "explanation": question.get("explanation", ""),
+        "completed": session.completed,
+        "total": session.total_questions,
+        "session_completed": session_completed,
+    }
+
+
+@app.post("/api/quiz/complete")
+async def api_quiz_complete(request: Request):
+    """显式完成试卷（最后一道题自动触发，此端点用于手动触发）。"""
+    body = await request.json()
+    session_id = str(body.get("session_id", ""))
+    learner_id = str(body.get("learner_id", ""))
+
+    store = get_quiz_session_store()
+    session = store.get(session_id)
+    if not session:
+        return _quiz_error(404, "试卷不存在")
+    if session.learner_id != learner_id:
+        return _quiz_error(403, "学习者不匹配")
+
+    session = await _finish_quiz_session(session, store)
+    return {
+        "ok": True,
+        "total": session.total_questions,
+        "completed": session.completed,
+        "accuracy": session.accuracy,
+        "weak_kps": [kp for kp in session.kp_covered if kp],
+    }
+
+
+@app.get("/api/quiz/pending/{learner_id}")
+async def api_quiz_pending(learner_id: str):
+    """获取学习者待完成的试卷列表（Space 面板使用）。"""
+    store = get_quiz_session_store()
+    sessions = store.get_pending(learner_id, limit=20)
+    return {
+        "ok": True,
+        "sessions": [
+            {
+                "session_id": s.session_id,
+                "title": s.title or "未命名练习",
+                "total_questions": s.total_questions,
+                "completed": s.completed,
+                "created_at": s.created_at,
+                "expires_at": s.expires_at,
+                "source_file": s.source_file,
+            }
+            for s in sessions
+        ],
+        "total_pending": len(sessions),
+    }
+
+
+# ── Quiz Session 内部辅助 ──────────────────────────────────────
+
+
+def _quiz_error(code: int, msg: str) -> dict:
+    from fastapi.responses import JSONResponse
+
+    return JSONResponse(status_code=code, content={"ok": False, "error": msg})
+
+
+async def _generate_quiz_from_ocr(
+    ocr_text: str, total_questions: int, learner_id: str
+) -> list[dict]:
+    """通过 LLM 从 OCR 文本中提取题目，返回 QuizQuestion[]。"""
+    # 设计说明：后续可对接 deep_question mimic pipeline，
+    # 当前先用 LLM 直接提取。
+    import json as json_lib
+    import os as _os
+    import traceback as tb
+
+    api_key = _os.getenv("DEEPSEEK_API_KEY", "")
+    if not api_key:
+        logger.error("[quiz] DEEPSEEK_API_KEY 未配置，无法出题")
+        return []
+
+    api_url = _os.getenv("PRACTICE_LLM_URL", "https://api.deepseek.com/v1/chat/completions")
+    model = _os.getenv("PRACTICE_LLM_MODEL") or _os.getenv("LLM_MODEL", "deepseek-chat")
+
+    system_prompt = (
+        "你是一位资深学科出题专家。根据以下试卷OCR文本提取题目，生成结构化JSON。\n\n"
+        "规则：\n"
+        "1. 识别每一道题，保留原题的知识点和难度\n"
+        "2. 每道题包含: question_id, question, question_type, options, correct_answer, explanation, difficulty, knowledge_context\n"
+        "3. question_type 取值为: choice | fill_in_blank | short_answer\n"
+        "4. options 格式: {\"A\": \"...\", \"B\": \"...\", \"C\": \"...\", \"D\": \"...\"}\n"
+        "5. 如果原题有选项但OCR识别不全，根据上下文补全\n"
+        "6. 如果OCR文本中没有明确题目，则根据主题自行生成\n"
+        "7. correct_answer 填写选项字母(选择题)或答案文本\n"
+        "8. explanation 写简要解析，指出考察点\n"
+        "9. knowledge_context 标注知识点路径如 \"数学/分数\"\n"
+        f"10. 最多生成 {max(total_questions, 1)} 道题"
+    )
+    user_prompt = f"## 试卷OCR文本\n{ocr_text[:16000]}\n\n## 要求\n提取并生成最多 {max(total_questions, 1)} 道题，以JSON数组返回。\n格式: [{{\"question_id\":\"q1\",\"question\":\"...\",\"question_type\":\"choice\",\"options\":{{\"A\":\"...\",\"B\":\"...\",\"C\":\"...\",\"D\":\"...\"}},\"correct_answer\":\"A\",\"explanation\":\"...\",\"difficulty\":\"easy\",\"knowledge_context\":\"...\"}}]"
+
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(
+                api_url,
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "temperature": 0.3,
+                    "max_tokens": 8192,
+                },
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            if resp.status_code != 200:
+                logger.error("[quiz] LLM error: HTTP %s", resp.status_code)
+                return []
+
+            content = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+            if not content:
+                return []
+
+            # 解析 JSON
+            try:
+                questions = json_lib.loads(content)
+            except json_lib.JSONDecodeError:
+                import re
+
+                m = re.search(r"```(?:json)?\s*([\s\S]*?)```", content)
+                if m:
+                    questions = json_lib.loads(m.group(1))
+                else:
+                    logger.error("[quiz] LLM 返回无法解析: %s", content[:300])
+                    return []
+
+            if isinstance(questions, dict) and "questions" in questions:
+                questions = questions["questions"]
+            if not isinstance(questions, list):
+                return []
+
+            # 标准化
+            result = []
+            for i, q in enumerate(questions):
+                if not isinstance(q, dict) or not q.get("question"):
+                    continue
+                result.append({
+                    "question_id": str(q.get("question_id", f"q{i+1}")),
+                    "question": str(q.get("question", "")),
+                    "question_type": str(q.get("question_type", "choice")),
+                    "options": q.get("options", {}),
+                    "correct_answer": str(q.get("correct_answer", "")),
+                    "explanation": str(q.get("explanation", "")),
+                    "difficulty": str(q.get("difficulty", "medium")),
+                    "knowledge_context": str(q.get("knowledge_context", "")),
+                })
+            return result
+    except httpx.TimeoutException:
+        logger.error("[quiz] LLM 超时")
+    except Exception:
+        logger.error("[quiz] 出题异常: %s", tb.format_exc())
+    return []
+
+
+def _check_answer(user_answer: str, correct_answer: str) -> bool:
+    """判题：支持选项字母(A/B/C/D)和文本答案。"""
+    ua = user_answer.strip().upper()
+    ca = correct_answer.strip().upper()
+    if ua == ca:
+        return True
+    # 选项字母匹配: "A" vs "A. xxx" 或 "A" vs "A"
+    if len(ua) == 1 and ua.isalpha() and ca.startswith(ua):
+        return True
+    if len(ca) == 1 and ca.isalpha() and ua.startswith(ca):
+        return True
+    # 忽略大小写和标点
+    import re
+
+    ua_clean = re.sub(r"[^a-zA-Z0-9一-鿿]", "", ua)
+    ca_clean = re.sub(r"[^a-zA-Z0-9一-鿿]", "", ca)
+    return ua_clean == ca_clean
+
+
+def _infer_title(source_file: str, ocr_text: str, first_question: str) -> str:
+    """从文件名或 OCR 文本推断试卷标题。"""
+    if source_file:
+        name = Path(source_file).stem
+        # 清理常见后缀
+        for suffix in ["_test", "_exam", "_试卷", "_练习", "_作业"]:
+            if name.endswith(suffix):
+                name = name[: -len(suffix)]
+        return name
+    # 从第一道题提取主题
+    import re
+
+    m = re.search(r"[（(]?([一-鿿]{2,8}(?:单元|章|节|专题|练习))[）)]?", ocr_text)
+    if m:
+        return m.group(1)
+    if first_question:
+        return first_question[:20] + "..."
+    return "练习"
+
+
+async def _finish_quiz_session(session: qs_mod.QuizSession, store: qs_mod.QuizSessionStore) -> qs_mod.QuizSession:
+    """完成试卷：标记状态 + 写入掌握度 + 推送通知。"""
+    session = store.mark_completed(session.session_id)
+    if not session:
+        return session
+
+    # 写入掌握度
+    try:
+        from domains.tutoring.mastery import update_mastery
+
+        for qid, record in session.answers.items():
+            question = None
+            for q in session.questions_with_answer:
+                if q.get("question_id") == qid:
+                    question = q
+                    break
+            if not question:
+                continue
+            await asyncio.to_thread(
+                update_mastery,
+                session.learner_id,
+                record.kp_id or question.get("knowledge_context", "general"),
+                record.is_correct,
+                question=question.get("question", ""),
+                user_answer=record.user_answer,
+                correct_answer=question.get("correct_answer", ""),
+            )
+    except Exception as exc:
+        logger.error("[quiz] 写入掌握度失败: %s", exc)
+
+    # 推完成通知
+    try:
+        await _push_quiz_complete_notification(session)
+    except Exception as exc:
+        logger.error("[quiz] 推送通知失败: %s", exc)
+
+    return session
+
+
+async def _push_quiz_complete_notification(session: qs_mod.QuizSession):
+    """推送到微信通知目录，由 Hermes Agent _consume_report_notifications 轮询发送。"""
+    from tutor_platform.report_scheduler import _write_notification
+
+    correct = sum(1 for a in session.answers.values() if a.is_correct)
+    total = session.total_questions
+    accuracy = round(correct / total * 100) if total > 0 else 0
+    weak = [kp for kp in session.kp_covered if kp]
+
+    content = (
+        f"✅ {session.title or '练习'} 已完成\n"
+        f"正确: {correct}/{total} ({accuracy}%)\n"
+        + (f"薄弱: {', '.join(weak)}" if weak else "")
+    )
+    # write_notification 使用 Hermes Agent 共享通知目录，target="parent" 推给家长
+    _write_notification(session.learner_id, "exam", content, target="parent")
 
 
 def run_provider_api(port: int = 8100):

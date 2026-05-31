@@ -29,9 +29,11 @@ export interface PeriodStats {
 
 export interface PracticeQuestion {
   question: string;
-  options: string[];
-  answer: string;
+  question_type?: string;
+  options?: Record<string, string>;
+  correct_answer: string;
   explanation?: string;
+  difficulty?: string;
 }
 
 // ── HTTP helpers ─────────────────────────────────────────────
@@ -73,7 +75,7 @@ export async function listLearners(): Promise<string[]> {
 export async function fetchMasterySummary(
   learnerId: string,
 ): Promise<MasterySummary> {
-  return apiGet<MasterySummary>(`/mastery/${learnerId}`);
+  return apiGet<MasterySummary>(`/mastery/${learnerId}/summary`);
 }
 
 export async function fetchWrongAnswers(
@@ -98,16 +100,107 @@ export async function fetchWeakPoints(
   return data.weak_points;
 }
 
+function toPerDay(daily: Record<string, { total?: number }>): { date: string; total: number }[] {
+  return Object.entries(daily || {}).map(([date, ds]) => ({
+    date,
+    total: ds.total || 0,
+  }));
+}
+
 export async function fetchWeeklyStats(
   learnerId: string,
 ): Promise<PeriodStats> {
-  return apiGet<PeriodStats>(`/mastery/${learnerId}/stats/weekly`);
+  const raw = await apiGet<any>(`/mastery/${learnerId}/stats/weekly`);
+  return { total: raw.total, accuracy: raw.accuracy, per_day: toPerDay(raw.daily) };
 }
 
 export async function fetchMonthlyStats(
   learnerId: string,
 ): Promise<PeriodStats> {
-  return apiGet<PeriodStats>(`/mastery/${learnerId}/stats/monthly`);
+  const raw = await apiGet<any>(`/mastery/${learnerId}/stats/monthly`);
+  return { total: raw.total, accuracy: raw.accuracy, per_day: toPerDay(raw.daily) };
+}
+
+
+// ── Quiz Session (微信发卷→WEBUI答题) ──────────────────────
+
+export interface QuizSessionQuestion {
+  question_id: string;
+  question: string;
+  question_type: string;
+  options?: Record<string, string>;
+  difficulty?: string;
+  knowledge_context?: string;
+}
+
+export interface QuizSessionData {
+  session_id: string;
+  learner_id?: string;
+  status: string;
+  title: string;
+  total_questions: number;
+  completed: number;
+  questions: QuizSessionQuestion[];
+  kp_covered: string[];
+  created_at: number;
+  expires_at: number;
+  completed_at?: number | null;
+}
+
+export interface QuizAnswerResult {
+  ok: boolean;
+  is_correct: boolean;
+  correct_answer: string;
+  explanation: string;
+  completed: number;
+  total: number;
+  session_completed: boolean;
+}
+
+export interface PendingQuizSession {
+  session_id: string;
+  title: string;
+  total_questions: number;
+  completed: number;
+  created_at: number;
+  expires_at: number;
+  source_file: string;
+}
+
+export async function fetchQuizSession(
+  sessionId: string,
+): Promise<QuizSessionData> {
+  return apiGet(`/quiz/session/${sessionId}`);
+}
+
+export async function submitQuizAnswer(
+  sessionId: string,
+  questionId: string,
+  learnerId: string,
+  answer: string,
+): Promise<QuizAnswerResult> {
+  return apiPost("/quiz/answer", {
+    session_id: sessionId,
+    question_id: questionId,
+    learner_id: learnerId,
+    answer,
+  });
+}
+
+export async function completeQuizSession(
+  sessionId: string,
+  learnerId: string,
+): Promise<{ ok: boolean; total: number; completed: number; accuracy: number; weak_kps: string[] }> {
+  return apiPost("/quiz/complete", {
+    session_id: sessionId,
+    learner_id: learnerId,
+  });
+}
+
+export async function fetchPendingQuizSessions(
+  learnerId: string,
+): Promise<{ sessions: PendingQuizSession[]; total_pending: number }> {
+  return apiGet(`/quiz/pending/${learnerId}`);
 }
 
 // ── Practice / Exam / Report ────────────────────────────────
@@ -124,12 +217,26 @@ export async function generatePractice(
   });
 }
 
+export interface ExamQuestion {
+  num: number;
+  section_type: string;
+  question: string;
+  options?: Record<string, string>;
+  kpi: string;
+  difficulty: string;
+  correct_answer: string;
+  explanation: string;
+}
+
 export async function generateExam(
   learnerId: string,
 ): Promise<{
+  ok: boolean;
   exam_text: string;
   title: string;
   kp_covered: string[];
+  total: number;
+  questions: ExamQuestion[];
 }> {
   return apiPost("/practice/exam", {
     learner_id: learnerId,
@@ -143,5 +250,23 @@ export async function generateReport(
   return apiPostText("/report/generate", {
     learner_id: learnerId,
     type,
+  });
+}
+
+// ── Record answer to mastery ───────────────────────────────
+export async function recordQuizAnswer(
+  learnerId: string,
+  kpId: string,
+  correct: boolean,
+  question: string,
+  userAnswer: string,
+  correctAnswer: string,
+): Promise<void> {
+  await apiPost(`/mastery/${learnerId}`, {
+    kp_id: kpId,
+    correct,
+    question,
+    user_answer: userAnswer,
+    correct_answer: correctAnswer,
   });
 }

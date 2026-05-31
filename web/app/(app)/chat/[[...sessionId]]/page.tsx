@@ -107,6 +107,7 @@ import {
 } from "@/lib/tools-settings";
 import { downloadChatMarkdown } from "@/lib/chat-export";
 import type { SpaceMemoryFile } from "@/lib/space-items";
+import { fetchPendingQuizSessions, type PendingQuizSession } from "@/lib/platform-api";
 import {
   selectedBooksToPayload,
   type SelectedBookReference,
@@ -532,6 +533,7 @@ export default function ChatPage() {
   const kbMenuRef = useRef<HTMLDivElement>(null);
   const kbBtnRef = useRef<HTMLButtonElement>(null);
   const initialLoadRef = useRef(false);
+  const forceQuizRef = useRef(false);
   // Bridge ref: ``ChatComposer`` writes a prefill function into this on
   // mount; ``ChatMessageList`` reads it via ``handlePrefillComposer`` so an
   // ``AskUserOptions`` chip click can drop text into the composer textarea.
@@ -599,6 +601,22 @@ export default function ChatPage() {
     }
   }, [capabilityNeedsConfig, ensureActivityPanelOpen]);
   const hasMessages = state.messages.length > 0;
+
+  // ── Pending quiz sessions from WeChat ──────────────────────────
+  const [pendingQuizzes, setPendingQuizzes] = useState<PendingQuizSession[]>([]);
+  const refreshPendingQuizzes = useCallback(async () => {
+    try {
+      const data = await fetchPendingQuizSessions("default");
+      setPendingQuizzes(data.sessions ?? []);
+    } catch { /* ignore */ }
+  }, []);
+  useEffect(() => {
+    void refreshPendingQuizzes();
+    const onVisible = () => { if (document.visibilityState === "visible") void refreshPendingQuizzes(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  }, [refreshPendingQuizzes]);
+
   // Time-of-day greeting: seeded once on mount from the user's local clock so
   // the heading stays stable while they're on the page. State (not useMemo)
   // because the random pick would otherwise mismatch SSR ↔ client hydration.
@@ -908,6 +926,25 @@ export default function ChatPage() {
     }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // ── Nav from /chat/quiz/{id} redirect ──
+  // Loads a preexisting quiz session into the chat via deep_question
+  // with preexisting_quiz_session_id config. QuizViewer renders natively.
+  const quizAutoLoadRef = useRef(false);
+  useEffect(() => {
+    const qsId = sessionStorage.getItem("dt:nav-quiz-session");
+    if (!qsId || quizAutoLoadRef.current) return;
+    quizAutoLoadRef.current = true;
+    sessionStorage.removeItem("dt:nav-quiz-session");
+    setCapability("deep_question");
+    setQuizConfig({ ...DEFAULT_QUIZ_CONFIG, topic: "", num_questions: 1 });
+    setCapabilityConfigConfirmed(true);
+    setActivityPanelOpen(false);
+    forceQuizRef.current = true;
+    setTimeout(() => {
+      sendMessage("", undefined, { preexisting_quiz_session_id: qsId });
+    }, 5000);
+  }, [sendMessage, setCapability, setQuizConfig, setCapabilityConfigConfirmed, setActivityPanelOpen]);
+
   // When URL param changes (sidebar navigation), load the corresponding session
   const prevSessionIdParam = useRef(sessionIdParam);
   useEffect(() => {
@@ -923,12 +960,12 @@ export default function ChatPage() {
     }
   }, [sessionIdParam, loadSession, newSession, router, state.sessionId]);
 
-  // When a new session_id is assigned by the server, update the URL
+  // When a new session_id is assigned by the server, silently update URL
   useEffect(() => {
     if (state.sessionId && !sessionIdParam) {
-      router.replace(`/chat/${state.sessionId}`, { scroll: false });
+      window.history.replaceState(null, "", `/chat/${state.sessionId}`);
     }
-  }, [state.sessionId, sessionIdParam, router]);
+  }, [state.sessionId, sessionIdParam]);
 
   useEffect(() => {
     setActiveSessionId(state.sessionId || sessionIdParam || null);
@@ -1416,7 +1453,9 @@ export default function ChatPage() {
       }));
       let config: Record<string, unknown> | undefined;
 
-      if (isQuizMode) {
+      // forceQuizRef ensures quiz mode even if the isQuizMode closure
+      // is stale from a timing edge case (nav-topic effect vs handleSend).
+      if (isQuizMode || forceQuizRef.current) {
         config = buildQuizWSConfig(quizConfig);
         if (quizConfig.mode === "mimic" && quizPdf) {
           const b64 = extractBase64FromDataUrl(
@@ -1462,6 +1501,7 @@ export default function ChatPage() {
         skillsPayload,
         memoryPayload,
       );
+      forceQuizRef.current = false;
       shouldAutoScrollRef.current = true;
       setAttachments([]);
       setSelectedBookReferences([]);
@@ -1807,6 +1847,36 @@ export default function ChatPage() {
                     {t(welcomeGreeting)}
                   </h1>
                 </div>
+
+                {/* ── Pending quiz sessions from WeChat ── */}
+                {pendingQuizzes.length > 0 && (
+                  <div className="mt-8 w-full max-w-md space-y-3">
+                    <p className="text-center text-[13px] font-medium text-[var(--muted-foreground)]">
+                      来自微信的待完成试卷
+                    </p>
+                    {pendingQuizzes.slice(0, 5).map((s) => (
+                      <button
+                        key={s.session_id}
+                        onClick={() => {
+                          window.location.href = `/chat/quiz/${s.session_id}`;
+                        }}
+                        className="flex w-full items-center justify-between rounded-xl border border-[var(--border)]/60 bg-[var(--card)] px-4 py-3 text-left shadow-sm transition-all hover:border-[var(--primary)]/40 hover:bg-[var(--primary)]/[0.03]"
+                      >
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate text-[14px] font-medium text-[var(--foreground)]">
+                            {s.title || "练习"}
+                          </p>
+                          <p className="text-[12px] text-[var(--muted-foreground)]">
+                            {s.completed}/{s.total_questions} 题已完成
+                          </p>
+                        </div>
+                        <span className="ml-3 shrink-0 rounded-lg bg-[var(--primary)] px-3 py-1.5 text-[12px] font-medium text-white">
+                          {s.completed > 0 ? "继续" : "开始答题"}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
             ) : (
               <div

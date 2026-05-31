@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import {
   BarChart3,
   BookOpen,
+  ChevronDown,
   Loader2,
   RefreshCw,
   AlertCircle,
@@ -32,8 +33,14 @@ import {
   type WeakPoint,
   type WrongAnswer,
   type PeriodStats,
-  type PracticeQuestion,
 } from "@/lib/platform-api";
+import dynamic from "next/dynamic";
+import type { QuizQuestion } from "@/lib/quiz-types";
+import { QuizFollowupProvider } from "@/context/QuizFollowupContext";
+
+const QuizViewer = dynamic(() => import("@/components/quiz/QuizViewer"), {
+  ssr: false,
+});
 
 // ── Learner ID ───────────────────────────────────────────────
 // Auto-detect on mount: use the first real learner, fall back to "default".
@@ -90,7 +97,7 @@ function DayBar({ day, count, max }: { day: string; count: number; max: number }
   );
 }
 
-// ── Practice Modal ───────────────────────────────────────────
+// ── Practice Modal (uses DT's built-in QuizViewer) ─────────────
 
 function PracticeModal({
   questions,
@@ -99,100 +106,147 @@ function PracticeModal({
   onRegenerate,
   loading,
 }: {
-  questions: PracticeQuestion[];
+  questions: QuizQuestion[];
   kpId: string;
   onClose: () => void;
   onRegenerate: () => void;
   loading: boolean;
 }) {
+  const [showAnswers, setShowAnswers] = useState(false);
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-      <div className="max-h-[80vh] w-full max-w-2xl overflow-y-auto rounded-2xl border border-[var(--border)] bg-[var(--card)] p-6 shadow-xl">
-        <div className="mb-4 flex items-center justify-between">
-          <h2 className="text-lg font-semibold text-[var(--foreground)]">
+      <div className="flex max-h-[90vh] w-full max-w-3xl flex-col rounded-2xl border border-[var(--border)] bg-[var(--card)] shadow-xl">
+        {/* Header */}
+        <div className="flex items-center justify-between gap-2 border-b border-[var(--border)]/60 px-5 py-3">
+          <h2 className="text-[15px] font-semibold text-[var(--foreground)]">
             练习 — {kpId.split("/").pop()}
           </h2>
-          <button onClick={onClose} className="rounded-lg p-1.5 hover:bg-[var(--muted)]/40">
-            <X size={18} />
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => { setShowAnswers(false); onRegenerate(); }}
+              disabled={loading}
+              className="rounded-lg border border-[var(--border)] px-3 py-1.5 text-[12px] text-[var(--foreground)] hover:bg-[var(--muted)]/40 disabled:opacity-40"
+            >
+              {loading ? "生成中..." : "重新出题"}
+            </button>
+            <button onClick={onClose} className="rounded-lg p-1.5 hover:bg-[var(--muted)]/40">
+              <X size={18} />
+            </button>
+          </div>
         </div>
 
-        {loading ? (
-          <div className="flex items-center justify-center py-12">
-            <Loader2 className="animate-spin" size={24} />
-            <span className="ml-3 text-[14px] text-[var(--muted-foreground)]">生成练习中...</span>
-          </div>
-        ) : questions.length === 0 ? (
-          <div className="flex flex-col items-center gap-3 py-12 text-[var(--muted-foreground)]">
-            <AlertCircle size={24} />
-            <p>没有生成练习题</p>
-          </div>
-        ) : (
-          <div className="space-y-4">
-            {questions.map((q, i) => (
-              <div key={i} className="rounded-xl border border-[var(--border)]/60 bg-[var(--muted)]/20 p-4">
-                <p className="mb-2 text-[14px] font-medium">
-                  {i + 1}. {q.question}
-                </p>
-                {q.options && q.options.length > 0 && (
-                  <ul className="mb-2 space-y-1 pl-4">
-                    {q.options.map((opt, j) => (
-                      <li key={j} className="text-[13px] text-[var(--foreground)]">
-                        {opt}
-                      </li>
-                    ))}
-                  </ul>
-                )}
-                <p className="text-[12px] text-[var(--muted-foreground)]">
-                  答案: <span className="text-green-600">{q.answer}</span>
-                </p>
-                {q.explanation && (
-                  <p className="mt-1 text-[12px] text-[var(--muted-foreground)]">
-                    {q.explanation}
-                  </p>
-                )}
-              </div>
-            ))}
-          </div>
-        )}
-
-        <div className="mt-4 flex justify-end gap-2">
-          <button
-            onClick={onClose}
-            className="rounded-lg border border-[var(--border)] px-4 py-2 text-[13px] text-[var(--foreground)] hover:bg-[var(--muted)]/40"
-          >
-            关闭
-          </button>
-          <button
-            onClick={onRegenerate}
-            disabled={loading}
-            className="rounded-lg bg-[var(--primary)] px-4 py-2 text-[13px] text-[var(--primary-foreground)] hover:opacity-90 disabled:opacity-50"
-          >
-            {loading ? "生成中..." : "重新生成"}
-          </button>
+        {/* Content */}
+        <div className="flex-1 overflow-y-auto px-5 py-4">
+          {loading ? (
+            <div className="flex items-center justify-center py-16">
+              <Loader2 className="animate-spin" size={24} />
+              <span className="ml-3 text-[14px] text-[var(--muted-foreground)]">正在根据你的错题生成练习...</span>
+            </div>
+          ) : questions.length === 0 ? (
+            <div className="flex flex-col items-center gap-3 py-16 text-[var(--muted-foreground)]">
+              <AlertCircle size={24} />
+              <p>没有生成练习题</p>
+            </div>
+          ) : (
+            <QuizFollowupProvider>
+              <QuizViewer questions={questions} language="zh" />
+            </QuizFollowupProvider>
+          )}
         </div>
       </div>
     </div>
   );
 }
 
-// ── Exam Modal ───────────────────────────────────────────────
+// ── Exam Modal (interactive QuizViewer) ────────────────────────
 
 function ExamModal({
   examText,
   title,
   kpCovered,
+  questions,
+  loading,
   onClose,
   onRegenerate,
-  loading,
 }: {
   examText: string;
   title: string;
   kpCovered: string[];
+  questions: QuizQuestion[];
+  loading: boolean;
   onClose: () => void;
   onRegenerate: () => void;
-  loading: boolean;
 }) {
+  const [examComplete, setExamComplete] = useState(false);
+
+  // Loading state
+  if (loading) {
+    return (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+        <div className="flex items-center justify-center rounded-2xl border border-[var(--border)] bg-[var(--card)] px-12 py-16 shadow-xl">
+          <Loader2 className="animate-spin text-[var(--muted-foreground)]" size={24} />
+          <span className="ml-3 text-[14px] text-[var(--muted-foreground)]">生成试卷中...</span>
+        </div>
+      </div>
+    );
+  }
+
+  // Interactive mode: QuizViewer with structured questions
+  if (questions.length > 0) {
+    return (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+        <div className="flex max-h-[90vh] w-full max-w-3xl flex-col rounded-2xl border border-[var(--border)] bg-[var(--card)] shadow-xl">
+          {/* Header */}
+          <div className="flex items-center justify-between gap-2 border-b border-[var(--border)]/60 px-5 py-3">
+            <div className="min-w-0 flex-1">
+              <h2 className="truncate text-[15px] font-semibold text-[var(--foreground)]">{title}</h2>
+              {kpCovered.length > 0 && (
+                <p className="mt-0.5 truncate text-[11px] text-[var(--muted-foreground)]">
+                  覆盖 {kpCovered.length} 个知识点
+                </p>
+              )}
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={onRegenerate}
+                disabled={loading}
+                className="rounded-lg border border-[var(--border)] px-3 py-1.5 text-[12px] text-[var(--foreground)] hover:bg-[var(--muted)]/40 disabled:opacity-40"
+              >
+                重新出题
+              </button>
+              <button
+                onClick={examComplete ? onClose : undefined}
+                className={`rounded-lg px-3 py-1.5 text-[12px] font-medium ${
+                  examComplete
+                    ? "bg-green-500 text-white hover:bg-green-600"
+                    : "border border-[var(--border)] text-[var(--muted-foreground)] hover:bg-[var(--muted)]/40"
+                }`}
+              >
+                {examComplete ? "完成试卷 ✓" : "答题后完成"}
+              </button>
+              <button onClick={onClose} className="rounded-lg p-1.5 hover:bg-[var(--muted)]/40">
+                <X size={18} />
+              </button>
+            </div>
+          </div>
+          {/* Content */}
+          <div className="flex-1 overflow-y-auto px-5 py-4">
+            <QuizFollowupProvider>
+              <QuizViewer
+                questions={questions}
+                language="zh"
+                autoAdvance={false}
+                onComplete={() => setExamComplete(true)}
+              />
+            </QuizFollowupProvider>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Fallback: show raw text (when API returns no parsed questions)
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
       <div className="max-h-[80vh] w-full max-w-3xl overflow-y-auto rounded-2xl border border-[var(--border)] bg-[var(--card)] p-6 shadow-xl">
@@ -210,16 +264,9 @@ function ExamModal({
           </button>
         </div>
 
-        {loading ? (
-          <div className="flex items-center justify-center py-12">
-            <Loader2 className="animate-spin" size={24} />
-            <span className="ml-3 text-[14px] text-[var(--muted-foreground)]">生成试卷中...</span>
-          </div>
-        ) : (
-          <div className="prose prose-sm max-w-none whitespace-pre-wrap rounded-xl border border-[var(--border)]/60 bg-[var(--muted)]/20 p-4 text-[13px] leading-relaxed text-[var(--foreground)]">
-            {examText}
-          </div>
-        )}
+        <div className="whitespace-pre-wrap rounded-xl border border-[var(--border)]/60 bg-[var(--muted)]/20 p-4 text-[13px] leading-relaxed text-[var(--foreground)]">
+          {examText}
+        </div>
 
         <div className="mt-4 flex justify-end gap-2">
           <button
@@ -279,6 +326,128 @@ function ReportModal({
   );
 }
 
+// ── Collapsible Weak Points Section ──────────────────────────────
+
+function WeakPointsSection({
+  weakPoints,
+  handleExam,
+  handleOpenPractice,
+}: {
+  weakPoints: WeakPoint[];
+  handleExam: () => void;
+  handleOpenPractice: (kpId: string) => void;
+}) {
+  const [collapsed, setCollapsed] = useState(true);
+  return (
+    <section className="rounded-xl border border-[var(--border)]/60 bg-[var(--card)] p-4 shadow-sm">
+      <div className="flex items-center justify-between">
+        <button
+          onClick={() => setCollapsed((c) => !c)}
+          className="flex items-center gap-2 text-[14px] font-medium text-[var(--foreground)]"
+        >
+          <ChevronDown
+            size={16}
+            className={`transition-transform ${collapsed ? "-rotate-90" : ""}`}
+          />
+          薄弱知识点（{weakPoints.length}）
+        </button>
+        <button
+          onClick={handleExam}
+          className="flex items-center gap-1.5 rounded-lg bg-amber-500 px-3 py-1.5 text-[12px] text-white hover:bg-amber-600"
+        >
+          <FileText size={13} />
+          生成强化试卷
+        </button>
+      </div>
+      {!collapsed && (
+        <div className="mt-3 space-y-2">
+          {weakPoints.map((wp) => (
+            <div
+              key={wp.kp_id}
+              className="flex items-center justify-between rounded-lg border border-[var(--border)]/60 bg-[var(--muted)]/20 p-3"
+            >
+              <div className="min-w-0">
+                <p className="truncate text-[13px] font-medium text-[var(--foreground)]">
+                  {wp.kp_id.split("/").pop()}
+                </p>
+                <p className="text-[12px] text-[var(--muted-foreground)]">
+                  掌握度 {Math.round(wp.level * 100)}% · 答 {wp.total} 对{" "}
+                  {wp.correct}
+                </p>
+              </div>
+              <button
+                onClick={() => handleOpenPractice(wp.kp_id)}
+                className="flex shrink-0 items-center gap-1 rounded-lg border border-[var(--border)] px-3 py-1.5 text-[12px] text-[var(--foreground)] hover:bg-[var(--muted)]/40"
+              >
+                <Sparkles size={13} />
+                生成练习
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+// ── Collapsible Wrong Answers Section ────────────────────────────
+
+function WrongAnswersSection({
+  wrongAnswers,
+  onPractice,
+}: {
+  wrongAnswers: WrongAnswer[];
+  onPractice: (kpId: string) => void;
+}) {
+  const [collapsed, setCollapsed] = useState(true);
+  return (
+    <section className="rounded-xl border border-[var(--border)]/60 bg-[var(--card)] p-4 shadow-sm">
+      <button
+        onClick={() => setCollapsed((c) => !c)}
+        className="flex w-full items-center gap-2 text-[14px] font-medium text-[var(--foreground)]"
+      >
+        <ChevronDown
+          size={16}
+          className={`transition-transform ${collapsed ? "-rotate-90" : ""}`}
+        />
+        <ClipboardList size={16} />
+        最近错题（{wrongAnswers.length}）
+      </button>
+      {!collapsed && (
+        <div className="mt-3 space-y-2">
+          {wrongAnswers.map((wa, i) => (
+            <div
+              key={i}
+              className="rounded-lg border border-[var(--border)]/60 bg-[var(--muted)]/20 p-3"
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0 flex-1 space-y-1">
+                  <p className="text-[13px] leading-relaxed text-[var(--foreground)]">
+                    <span className="mr-1.5 font-medium text-[var(--muted-foreground)]">#{i + 1}</span>
+                    {wa.question}
+                  </p>
+                  <div className="flex flex-wrap gap-3 text-[12px]">
+                    <span className="text-red-500">你的答案: {wa.user_answer || "-"}</span>
+                    <span className="text-green-600">正确答案: {wa.correct_answer}</span>
+                    <span className="text-[var(--muted-foreground)]">{wa.kp_id.split("/").pop()}</span>
+                  </div>
+                </div>
+                <button
+                  onClick={() => onPractice(wa.kp_id)}
+                  className="flex shrink-0 items-center gap-1 rounded-lg border border-[var(--border)] px-3 py-1.5 text-[12px] text-[var(--foreground)] hover:bg-[var(--muted)]/40"
+                >
+                  <Sparkles size={13} />
+                  巩固练习
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
 // ── Main Dashboard Section ───────────────────────────────────
 
 const LS_KEY = "learning-dashboard-learner-id";
@@ -335,7 +504,7 @@ export default function LearningDashboardSection() {
   // Modal states
   const [practiceModal, setPracticeModal] = useState<{
     kpId: string;
-    questions: PracticeQuestion[];
+    questions: QuizQuestion[];
     loading: boolean;
   } | null>(null);
   const [examModal, setExamModal] = useState<{
@@ -343,6 +512,7 @@ export default function LearningDashboardSection() {
     title: string;
     kps: string[];
     loading: boolean;
+    questions: QuizQuestion[];
   } | null>(null);
   const [reportModal, setReportModal] = useState<{
     content: string;
@@ -374,35 +544,75 @@ export default function LearningDashboardSection() {
 
   // ── Handlers ──────────────────────────────────────────────
 
-  const handlePractice = useCallback(
+  const handleOpenPractice = useCallback(
     async (kpId: string) => {
       setPracticeModal({ kpId, questions: [], loading: true });
       try {
         const result = await generatePractice(learnerId, kpId);
-        setPracticeModal({ kpId, questions: result.questions, loading: false });
-      } catch {
-        setPracticeModal((prev) =>
-          prev ? { ...prev, loading: false } : null,
+        const questions: QuizQuestion[] = (result.questions || []).map(
+          (pq, i) => {
+            // options: API returns {"A":"...","B":"..."} directly
+            const hasOptions = pq.options && Object.keys(pq.options).length > 0;
+            return {
+              question_id: `practice_${i}`,
+              question: pq.question,
+              question_type: (
+                pq.question_type === "multiple_choice" || pq.question_type === "choice" || hasOptions
+                  ? "choice"
+                  : pq.question_type === "fill_in_blank"
+                    ? "fill_in_blank"
+                    : hasOptions ? "choice" : "short_answer"
+              ) as QuizQuestion["question_type"],
+              options: hasOptions ? pq.options : undefined,
+              correct_answer: pq.correct_answer || "",
+              explanation: pq.explanation || "",
+              difficulty: pq.difficulty || "medium",
+            };
+          },
         );
+        setPracticeModal({ kpId, questions, loading: false });
+      } catch {
+        setPracticeModal({ kpId, questions: [], loading: false });
       }
     },
     [learnerId],
   );
 
   const handleExam = useCallback(async () => {
-    setExamModal({ text: "", title: "生成中...", kps: [], loading: true });
+    setExamModal({ text: "", title: "生成中...", kps: [], loading: true, questions: [] });
     try {
       const result = await generateExam(learnerId);
+      if (!result.ok) {
+        setExamModal({ text: result.exam_text || "生成失败", title: result.title || "强化训练", kps: result.kp_covered || [], loading: false, questions: [] });
+        return;
+      }
+      // Map backend ExamQuestion[] (with section_type) → QuizQuestion[]
+      const sectionTypeMap: Record<string, string> = {
+        "选择题": "choice",
+        "填空题": "fill_in_blank",
+        "解答题": "short_answer",
+      };
+      const quizQuestions: QuizQuestion[] = (result.questions || []).map(
+        (eq, i) => ({
+          question_id: `exam_${eq.num || i + 1}`,
+          question: eq.question,
+          question_type: (sectionTypeMap[eq.section_type] || "short_answer") as QuizQuestion["question_type"],
+          options: eq.options && Object.keys(eq.options).length > 0 ? eq.options : undefined,
+          correct_answer: eq.correct_answer,
+          explanation: eq.explanation || "",
+          difficulty: eq.difficulty || "medium",
+          knowledge_context: eq.kpi || undefined,
+        }),
+      );
       setExamModal({
         text: result.exam_text,
-        title: result.title,
-        kps: result.kp_covered,
+        title: result.title || "强化训练",
+        kps: result.kp_covered || [],
         loading: false,
+        questions: quizQuestions,
       });
     } catch {
-      setExamModal((prev) =>
-        prev ? { ...prev, text: "生成失败", loading: false } : null,
-      );
+      setExamModal({ text: "生成失败", title: "强化训练", kps: [], loading: false, questions: [] });
     }
   }, [learnerId]);
 
@@ -558,95 +768,11 @@ export default function LearningDashboardSection() {
             </section>
           )}
 
-          {/* ── Weak Points ── */}
-          {weakPoints.length > 0 && (
-            <section className="rounded-xl border border-[var(--border)]/60 bg-[var(--card)] p-4 shadow-sm">
-              <div className="mb-3 flex items-center justify-between">
-                <h3 className="text-[14px] font-medium text-[var(--foreground)]">
-                  薄弱知识点（{weakPoints.length}）
-                </h3>
-                <button
-                  onClick={handleExam}
-                  className="flex items-center gap-1.5 rounded-lg bg-amber-500 px-3 py-1.5 text-[12px] text-white hover:bg-amber-600"
-                >
-                  <FileText size={13} />
-                  生成强化试卷
-                </button>
-              </div>
-              <div className="space-y-2">
-                {weakPoints.map((wp) => (
-                  <div
-                    key={wp.kp_id}
-                    className="flex items-center justify-between rounded-lg border border-[var(--border)]/60 bg-[var(--muted)]/20 p-3"
-                  >
-                    <div className="min-w-0">
-                      <p className="truncate text-[13px] font-medium text-[var(--foreground)]">
-                        {wp.kp_id.split("/").pop()}
-                      </p>
-                      <p className="text-[12px] text-[var(--muted-foreground)]">
-                        掌握度 {Math.round(wp.level * 100)}% · 答 {wp.total} 对{" "}
-                        {wp.correct}
-                      </p>
-                    </div>
-                    <button
-                      onClick={() => handlePractice(wp.kp_id)}
-                      className="flex shrink-0 items-center gap-1 rounded-lg border border-[var(--border)] px-3 py-1.5 text-[12px] text-[var(--foreground)] hover:bg-[var(--muted)]/40"
-                    >
-                      <Sparkles size={13} />
-                      生成练习
-                    </button>
-                  </div>
-                ))}
-              </div>
-            </section>
-          )}
+          {/* ── Weak Points (collapsible) ── */}
+          {weakPoints.length > 0 && <WeakPointsSection weakPoints={weakPoints} handleExam={handleExam} handleOpenPractice={handleOpenPractice} />}
 
-          {/* ── Wrong Answers ── */}
-          {wrongAnswers.length > 0 && (
-            <section className="rounded-xl border border-[var(--border)]/60 bg-[var(--card)] p-4 shadow-sm">
-              <h3 className="mb-3 flex items-center gap-2 text-[14px] font-medium text-[var(--foreground)]">
-                <ClipboardList size={16} />
-                最近错题（{wrongAnswers.length}）
-              </h3>
-              <div className="overflow-x-auto">
-                <table className="w-full text-left text-[13px]">
-                  <thead>
-                    <tr className="border-b border-[var(--border)]/60 text-[12px] text-[var(--muted-foreground)]">
-                      <th className="w-8 pb-2 font-medium">#</th>
-                      <th className="pb-2 font-medium">题目</th>
-                      <th className="pb-2 font-medium">你的答案</th>
-                      <th className="pb-2 font-medium">正确答案</th>
-                      <th className="pb-2 font-medium">知识点</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {wrongAnswers.map((wa, i) => (
-                      <tr
-                        key={i}
-                        className="border-b border-[var(--border)]/30 last:border-0"
-                      >
-                        <td className="py-2.5 align-top text-[var(--muted-foreground)]">
-                          {i + 1}
-                        </td>
-                        <td className="max-w-[200px] truncate py-2.5 align-top">
-                          {wa.question}
-                        </td>
-                        <td className="py-2.5 align-top text-red-500">
-                          {wa.user_answer || "-"}
-                        </td>
-                        <td className="py-2.5 align-top text-green-600">
-                          {wa.correct_answer}
-                        </td>
-                        <td className="py-2.5 align-top text-[var(--muted-foreground)]">
-                          {wa.kp_id.split("/").pop()}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </section>
-          )}
+          {/* ── Wrong Answers (collapsible) ── */}
+          {wrongAnswers.length > 0 && <WrongAnswersSection wrongAnswers={wrongAnswers} onPractice={handleOpenPractice} />}
 
           {/* ── Report Generation ── */}
           <section className="rounded-xl border border-[var(--border)]/60 bg-[var(--card)] p-4 shadow-sm">
@@ -684,7 +810,7 @@ export default function LearningDashboardSection() {
           kpId={practiceModal.kpId}
           loading={practiceModal.loading}
           onClose={() => setPracticeModal(null)}
-          onRegenerate={() => handlePractice(practiceModal.kpId)}
+          onRegenerate={() => handleOpenPractice(practiceModal.kpId)}
         />
       )}
 
@@ -693,6 +819,7 @@ export default function LearningDashboardSection() {
           examText={examModal.text}
           title={examModal.title}
           kpCovered={examModal.kps}
+          questions={examModal.questions}
           loading={examModal.loading}
           onClose={() => setExamModal(null)}
           onRegenerate={handleExam}
