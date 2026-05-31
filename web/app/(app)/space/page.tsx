@@ -3,4 +3,3 @@ import LearningDashboardSection from "@/components/space/LearningDashboardSectio
 export default function SpaceIndexPage() {
   return <LearningDashboardSection />;
 }
-

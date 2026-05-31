@@ -339,3 +339,37 @@ Web 作答 → record_quiz_result → platform MCP
 
 > **文档版本**: v1.0
 > **日期**: 2026-05-31
+
+## 实施记录
+
+### 2026-05-31 已完成
+
+**后端（已部署生效）**：
+- `docker/platform/provider_api.py` — 引导式教学优化（年龄段语气/激励规则/分隔线/DeepSeek重试/WS超时60s/题数估算）
+- `vendor/hermes-agent/gateway/platforms/weixin.py` — weixin侧优化（渐进式反馈/信号扩展/idle检测/死锁TTL/send超时）
+
+**前端（需重建镜像）**：
+- `web/app/(app)/space/page.tsx` — 首页从 ChatHistorySection 改为 LearningDashboardSection
+- `web/lib/space-items.ts` — 侧边栏添加「Learning Progress」入口
+- `web/next.config.js` — distDir 恢复 ./.next2
+
+**文档**：
+- `docs/guided-teaching-analysis.md` — 引导式教学全链路分析
+- `docs/dt-web-deep-learning-plan.md` — Web 深度学习模块串联方案
+
+**Git 提交**（GitHub: family_tutor main, 6 commits）：
+- `e19df0e70` — self.send加15s超时 + 限流日志
+- `9a3db6427` — space首页改为LearningDashboard
+- `347cb1732` — 侧边栏添加学习进度入口
+- `5383aa225` — DT Web深度学习串联方案文档
+- `a06151722` — tutor_chat POST加90s硬超时
+- `50773aa6c` — 改用试卷原本题号体系出题
+
+### 前端生效条件
+
+当前 Docker 镜像是生产构建（standalone server.js），volume mount 的源码不会被重新编译。需在有 Docker Hub 网络的环境下重建镜像：
+
+```bash
+python scripts/docker_compose.py build deeptutor
+python scripts/docker_compose.py -f docker-compose.yml -f docker-compose.dev.yml up -d deeptutor
+```
