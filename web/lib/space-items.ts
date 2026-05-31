@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  BarChart3,
   ClipboardList,
   History,
   NotebookPen,
@@ -9,6 +10,7 @@ import {
 } from "lucide-react";
 
 export type SpaceItemKey =
+  | "dashboard"
   | "chat_history"
   | "notebooks"
   | "question_bank"
@@ -25,6 +27,13 @@ export interface SpaceItem {
 }
 
 export const SPACE_ITEMS: SpaceItem[] = [
+  {
+    key: "dashboard",
+    href: "/space",
+    label: "Learning Progress",
+    description: "Mastery overview, weak points, wrong answers and practice.",
+    icon: BarChart3,
+  },
   {
     key: "chat_history",
     href: "/space/chat-history",
