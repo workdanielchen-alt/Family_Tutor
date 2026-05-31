@@ -1,5 +1,6 @@
-import ChatHistorySection from "@/components/space/ChatHistorySection";
+import LearningDashboardSection from "@/components/space/LearningDashboardSection";
 
 export default function SpaceIndexPage() {
-  return <ChatHistorySection />;
+  return <LearningDashboardSection />;
 }
+
