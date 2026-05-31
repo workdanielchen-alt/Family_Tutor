@@ -252,7 +252,10 @@ class _DTTutorSession:
         try:
             ws = await self._ensure_ws()
             return await self._do_send_recv(ws, payload, trace_id)
-        except (websockets.ConnectionClosed, OSError, asyncio.TimeoutError) as e:
+        except asyncio.TimeoutError as e:
+            logger.warning("[%s] DT WS timed out (60s), not retrying: %s", trace_id, e)
+            raise
+        except (websockets.ConnectionClosed, OSError) as e:
             logger.warning("[%s] DT WS disconnected, reconnecting: %s", trace_id, e)
             await self._close_ws()
             ws = await self._ensure_ws()
@@ -305,7 +308,7 @@ class _DTTutorSession:
         proactive_content = ""
         ws_error = ""
         while True:
-            raw = await asyncio.wait_for(ws.recv(), timeout=180)
+            raw = await asyncio.wait_for(ws.recv(), timeout=60)
             data = json.loads(raw)
             msg_type = data.get("type", "")
             c = data.get("content", "")
@@ -1105,6 +1108,26 @@ async def _handle_inbound_file(
                     content = f"[图片中的图形描述]\n{vision_desc}"
 
             if content:
+                _ocr_raw_len = len(content.strip())
+                # Tiered OCR quality: short text gets flagged for guidance
+                if _ocr_raw_len < 80:
+                    _guidance = (
+                        "【系统提示】这张图片只识别出了部分文字。请用鼓励的语气请求学生："
+                        "如果图片不清晰，可以重新拍一张发给老师；如果题目不多，也可以直接打字发过来。"
+                        f"\n\n已识别内容：\n{content}"
+                    )
+                    logger.info(
+                        "[%s] OCR partial (%d chars), using tiered fallback", trace_id, _ocr_raw_len
+                    )
+                    return _cache_res(
+                        {
+                            "ok": True,
+                            "content": _guidance,
+                            "intent": "EDUCATION",
+                            "route": "ocr_fallback",
+                            "storage": {"ok": False},
+                        }
+                    )
                 return _cache_res(
                     {
                         "ok": True,
@@ -1114,15 +1137,20 @@ async def _handle_inbound_file(
                         "storage": {"ok": False},
                     }
                 )
-            # OCR failed — descriptive fallback so DT Bot can guide user
-            content = "用户通过微信发送了一张图片，但图片中的文字未能被自动识别。请用友好的语气请学生将题目文字直接输入发送过来。"
+            # OCR failed — tiered fallback
+            _fb_msg = (
+                "用户通过微信发送了一张图片，但图片中的文字未能被自动识别。\n"
+                "请用友好的语气引导学生：①把手机拿平拍 ②光线好一些不要反光 "
+                "③如果图片不清晰可以重新拍一张发给老师。\n"
+                "不方便拍照的话，也可以直接把题目打字发过来。"
+            )
             logger.warning(
-                "[%s] OCR failed and vision empty, using descriptive fallback for %s", trace_id, file_path
+                "[%s] OCR failed and vision empty, using tiered fallback for %s", trace_id, file_path
             )
             return _cache_res(
                 {
                     "ok": True,
-                    "content": content,
+                    "content": _fb_msg,
                     "intent": "EDUCATION",
                     "route": "ocr_fallback",
                     "storage": {"ok": False},
@@ -3806,6 +3834,68 @@ async def _build_teaching_persona(
     _persona = _TEACHER_EXPLAIN_SOUL if mode == "explain" else _TEACHER_SOUL
     _exam = context.strip()[:8000]
     _subject = _detect_exam_subject(context) if _exam else os.getenv("DOMAINS_SUBJECT", "math")
+
+    # ── Age-appropriate tone injection ──
+    # 1. Check learner profile for stored grade
+    # 2. Fall back to exam content inference
+    # 3. Default to balanced middle-grade tone
+    _grade_tag = ""
+    try:
+        _profile_path = os.path.join(
+            os.getenv("MASTERY_DIR", "/data/mastery"),
+            f"_profile_{base64.urlsafe_b64encode(learner_id.encode()).decode().rstrip('=')}.json",
+        )
+        if os.path.exists(_profile_path):
+            with open(_profile_path, encoding="utf-8") as _pf:
+                _profile = json.load(_pf)
+            _grade_tag = _profile.get("grade", "")
+    except Exception:
+        pass
+    if not _grade_tag:
+        # Infer from exam content: keywords indicating primary vs middle school
+        _exam_lower = (_exam or "").lower()
+        if any(kw in _exam_lower for kw in ("一年级", "二年级", "三年级", "1年级", "2年级", "3年级", "小学一年级", "小学二年级", "小学三年级")):
+            _grade_tag = "primary_low"
+        elif any(kw in _exam_lower for kw in ("四年级", "五年级", "六年级", "4年级", "5年级", "6年级", "小学四年级", "小学五年级", "小学六年级")):
+            _grade_tag = "primary_high"
+        elif any(kw in _exam_lower for kw in ("七年级", "八年级", "九年级", "初一", "初二", "初三", "7年级", "8年级", "9年级", "初中")):
+            _grade_tag = "middle"
+    _age_instructions = ""
+    if _grade_tag == "primary_low":
+        _age_instructions = (
+            "\n\n## 教学风格指令（学生为小学低年级）\n"
+            "- 语气亲切活泼，称呼「小朋友」\n"
+            "- 多用「我们一起看看」「试试看」等鼓励性表达\n"
+            "- 答对 → 「太棒了！🎉」级别热情鼓励\n"
+            "- 答错 → 「没关系，这道题有点绕，我们换个角度想」\n"
+            "- 用生活化的例子解释概念\n"
+            "- 单次教学不超过5道题，超过建议休息\n"
+            "- 引导问题要非常具体、指向明确\n"
+            "- 多用易懂的短句\n"
+        )
+    elif _grade_tag == "primary_high":
+        _age_instructions = (
+            "\n\n## 教学风格指令（学生为小学高年级）\n"
+            "- 朋友式语气\n"
+            "- 答对 → 「完全正确！」+ 知识点总结\n"
+            "- 答错 → 「这个地方容易被绕进去，我们来看...」\n"
+            "- 可接受少量抽象概念讲解\n"
+            "- 引导问题留适量思考空间\n"
+            "- 适当强调解题方法和技巧\n"
+        )
+    elif _grade_tag == "middle":
+        _age_instructions = (
+            "\n\n## 教学风格指令（学生为初中生）\n"
+            "- 专业尊重的语气\n"
+            "- 答对 → 扩展性提问（「还能用其他方法解吗？」）\n"
+            "- 答错 → 归因分析（概念不清/计算失误/审题问题）\n"
+            "- 关注方法论和思维过程\n"
+            "- 引导问题注重逻辑推理\n"
+            "- 可接受一定的抽象推导\n"
+        )
+    if _age_instructions:
+        _persona += _age_instructions
+
     if _exam:
         _persona += (
             "\n\n### 当前教学内容（优先级最高）\n"
@@ -4393,6 +4483,30 @@ _TEACHER_SOUL = _TEACHER_SOUL.rstrip() + """
 **闲聊（天气/学校/日常/其他话题）：**
 - 简短友好地回应即可，不要出题，不要加 [ANSWER_KEY] 等标记
 
+## 正向反馈系统（严格遵守）
+
+学生每做出一次回答，根据表现给予对应的反馈。遵循以下规则：
+
+### 答对时的反馈
+- ✅ 答对1题 → "很好！答对了！" 级别鼓励
+- ✅ 连续答对3题 → " 已经连续答对3道了！状态很好！"
+- ✅ 连续答对5题 → "🔥 连续答对5道，今天状态火热！"
+- ✅ 首次答对薄弱知识点题 → " 这个知识点掌握了，进步很大！"
+- ✅ 今日首答正确 → "今天第一道题就对了，好开局！"
+
+### 答错时的反馈
+- ✅ 第1次答错 → "这道题有点绕，我们换个角度想想" 级别引导
+- ✅ 第2次答错 → 换一个更简单的角度提问
+- ✅ 第3次答错 → 先讲知识点，再出基础变式题
+- ✅ 连续3次同一知识点答错 → 建议休息
+- ✅ 学生说"好难""不会" → 降低难度，给分步提示
+- ❌ 避免在同一题上纠缠超过3轮
+
+### 禁止内容
+- ❌ 禁止"这题很简单"、"怎么又错了"等负面暗示
+- ❌ 禁止"这么简单都不会"等贬低语气
+- ❌ 禁止长时间说教
+
 ## 进度格式
 
 回复中必须体现当前进度，格式为「第X/总题数」，例如：
@@ -4516,31 +4630,49 @@ async def _direct_deepseek_teach(
         "max_tokens": 2048,
     }
 
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(
-                llm_url,
-                json=payload,
-                headers={"Authorization": f"Bearer {api_key}"},
-            )
-            if resp.status_code != 200:
-                logger.warning("[%s] Direct DeepSeek call failed: HTTP %d", trace_id, resp.status_code)
-                return None
-            data = resp.json()
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-            if not content or len(content.strip()) < 20:
-                logger.warning("[%s] Direct DeepSeek call too short (%d chars)", trace_id, len(content))
-                return None
-            logger.info("[%s] Direct DeepSeek call succeeded (%d chars, %.1fs)",
-                        trace_id, len(content),
-                        data.get("usage", {}).get("total_time", 0))
-            return content
-    except httpx.TimeoutException:
-        logger.warning("[%s] Direct DeepSeek call timed out", trace_id)
-        return None
-    except Exception as e:
-        logger.warning("[%s] Direct DeepSeek call failed: %s", trace_id, e)
-        return None
+    _last_err = ""
+    for _attempt in range(2):
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.post(
+                    llm_url,
+                    json=payload,
+                    headers={"Authorization": f"Bearer {api_key}"},
+                )
+                if resp.status_code != 200:
+                    _last_err = f"HTTP {resp.status_code}"
+                    logger.warning("[%s] Direct DeepSeek call failed: %s (attempt %d)", trace_id, _last_err, _attempt + 1)
+                    if _attempt == 0:
+                        await asyncio.sleep(1)
+                        continue
+                    return None
+                data = resp.json()
+                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                if not content or len(content.strip()) < 20:
+                    _last_err = f"too short ({len(content)} chars)"
+                    logger.warning("[%s] Direct DeepSeek call %s (attempt %d)", trace_id, _last_err, _attempt + 1)
+                    if _attempt == 0:
+                        await asyncio.sleep(1)
+                        continue
+                    return None
+                logger.info("[%s] Direct DeepSeek call succeeded (%d chars, %.1fs)",
+                            trace_id, len(content),
+                            data.get("usage", {}).get("total_time", 0))
+                return content
+        except httpx.TimeoutException:
+            _last_err = "timeout"
+            logger.warning("[%s] Direct DeepSeek call timed out (attempt %d)", trace_id, _attempt + 1)
+            if _attempt == 0:
+                await asyncio.sleep(1)
+                continue
+            return None
+        except Exception as e:
+            _last_err = str(e)
+            logger.warning("[%s] Direct DeepSeek call failed: %s (attempt %d)", trace_id, _last_err, _attempt + 1)
+            if _attempt == 0:
+                await asyncio.sleep(1)
+                continue
+            return None
 
 
 async def _direct_llm_teach(
@@ -5165,10 +5297,9 @@ async def _tutor_chat_core(
             # P1: strip analysis leakage before polish
             content = _strip_analysis(content, _phase)
             content = _polish_guide_response(content)
-            # Strip any short separator (≤20 chars) including ═, ─, —
-            # (LLM often outputs short ══ lines too).  Our injected divider
-            # is 44 chars and won't match the {3,20} range below.
-            content = re.sub(r"\n[═─—]{3,20}\n", "\n", content).strip()
+            # Strip ALL separator-only lines from LLM output (any length),
+            # then inject ONE clean divider below — prevents "1长1短2条分隔线".
+            content = re.sub(r"\n[═─—━\-*]{3,}\n", "\n", content).strip()
             # Inject one divider + correct answer between questions.
             if _do_eval:
                 _ans_text = ""
@@ -5181,7 +5312,7 @@ async def _tutor_chat_core(
                     if _ans:
                         _ans_text = _ans
                 if _ans_text:
-                    _divider = f"\n{'═' * 44}\n✅ 正确答案：{_ans_text}\n{'═' * 44}\n"
+                    _divider = f"\n{'─' * 14}\n✅ 正确答案：{_ans_text}\n{'─' * 14}\n"
                     # Insert before the LAST (newest) "第N题" / "【第N题】"
                     _all_q = list(re.finditer(r"(^|\n)【?第\s*\d+\s*[题、：:]", content))
                     if _all_q:
@@ -5201,27 +5332,36 @@ async def _tutor_chat_core(
                     _session_answered_count.get(learner_id, 0) + 1
                 )
 
-            # Compute effective total questions with fallback chain:
-            # 1. Use caller-provided total_questions (> 0 from OCR/regex)
-            # 2. Try _detect_total_questions on the exam context
-            # 3. Use session answered count with 25-question hard cap
+            # Compute effective total questions with multi-strategy fallback chain:
+            # Level 1: Caller-provided total_questions (from OCR regex on exam text)
+            # Level 2: _detect_total_questions on exam context (sequence-number heuristic)
+            # Level 3: Explicit count from exam text ("共X题""X道题" declarations)
+            # Level 4: session_answered_count + 2 (prevent premature completion)
+            # Level 5: 25-question hard cap
             _effective_total = total_questions
             if _effective_total <= 0:
                 _detected = _detect_total_questions(
                     context.strip() or _last_tutor_context.get(learner_id, "")
                 )
                 _effective_total = _detected if _detected > 0 else 0
+            # Level 3: try explicit count declarations
+            if _effective_total <= 0:
+                _ctx_text = context.strip() or _last_tutor_context.get(learner_id, "")
+                _explicit = re.search(r"[共总]有?(\d+)[题道]", _ctx_text)
+                if _explicit:
+                    _effective_total = int(_explicit.group(1))
 
             _FALLBACK_MAX = 25
             _using_fallback = False
             if _effective_total <= 0:
                 _answered = _session_answered_count.get(learner_id, 0)
-                if _answered >= _FALLBACK_MAX:
-                    _is_done = True
-                _effective_total = _FALLBACK_MAX
-                _using_fallback = True
-            else:
-                _is_done = (_qn >= _effective_total or ("全部" in content and "完成" in content))
+                # Level 4: answered + 2 prevents marking done when still going
+                if _answered >= 2:
+                    _effective_total = _answered + 2
+                else:
+                    _effective_total = _FALLBACK_MAX
+                    _using_fallback = True
+            _is_done = (_qn >= _effective_total or ("全部" in content and "完成" in content))
 
             # When LLM didn't output a next question (_has_next_q=False),
             # force completion as long as at least one question was answered.

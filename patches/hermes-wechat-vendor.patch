@@ -1,8 +1,8 @@
 diff --git a/vendor/hermes-agent/gateway/platforms/weixin.py b/vendor/hermes-agent/gateway/platforms/weixin.py
-index 3c8fa6574..779afc7ed 100644
+index 3c8fa6574..061465cc5 100644
 --- a/vendor/hermes-agent/gateway/platforms/weixin.py
 +++ b/vendor/hermes-agent/gateway/platforms/weixin.py
-@@ -1196,18 +1196,20 @@ class WeixinAdapter(BasePlatformAdapter):
+@@ -1196,18 +1196,24 @@ class WeixinAdapter(BasePlatformAdapter):
          self._dedup = MessageDeduplicator(ttl_seconds=MESSAGE_DEDUP_TTL_SECONDS)
  
          # ==== HERMES PATCH 2026-05-22: teaching session tracking for DT follow-up ====
@@ -27,10 +27,14 @@ index 3c8fa6574..779afc7ed 100644
 +        # ==== END HERMES PATCH ====
 +        # ==== HERMES PATCH 2026-05-30: per-learner teaching concurrency guard ====
 +        self._running_teachings: set[str] = set()
-         # ==== END HERMES PATCH ====
++        # ==== END HERMES PATCH ====
++        # ==== HERMES PATCH 2026-05-31: P0-1 staged feedback, P1-5/P2-9 improvements ====
++        self._page_acked: set[str] = set()
++        # ==== END HERMES PATCH ====
  
          self._account_id = str(extra.get("account_id") or os.getenv("WEIXIN_ACCOUNT_ID", "")).strip()
-@@ -1290,8 +1292,7 @@ class WeixinAdapter(BasePlatformAdapter):
+         token_str = str(extra.get("token") or os.getenv("WEIXIN_TOKEN", "")).strip()
+@@ -1290,8 +1296,7 @@ class WeixinAdapter(BasePlatformAdapter):
          self._send_session = aiohttp.ClientSession(trust_env=True, connector=_make_ssl_connector(), timeout=_no_aiohttp_timeout)
          self._token_store.restore(self._account_id)
          self._poll_task = asyncio.create_task(self._poll_loop(), name="weixin-poll")
@@ -40,7 +44,7 @@ index 3c8fa6574..779afc7ed 100644
          self._report_notif_task = asyncio.create_task(
              self._consume_report_notifications(), name="weixin-report"
          )
-@@ -1502,75 +1503,15 @@ class WeixinAdapter(BasePlatformAdapter):
+@@ -1502,75 +1507,15 @@ class WeixinAdapter(BasePlatformAdapter):
              logger.debug("[%s] LLM lock acquire failed (non-fatal)", self.name)
          # ==== END HERMES PATCH ====
  
@@ -125,7 +129,7 @@ index 3c8fa6574..779afc7ed 100644
          # ==== END HERMES PATCH ====
  
          await self.handle_message(event)
-@@ -2233,40 +2174,9 @@ class WeixinAdapter(BasePlatformAdapter):
+@@ -2233,40 +2178,9 @@ class WeixinAdapter(BasePlatformAdapter):
              await asyncio.sleep(3)
      # ==== END HERMES PATCH ====
  
@@ -149,406 +153,222 @@ index 3c8fa6574..779afc7ed 100644
 -    async def _handle_tutor_callback(self, request: "web.Request") -> "web.Response":
 -        """Receive teaching response from platform and deliver via WeChat."""
 -        try:
--            data = await request.json()
--            _lid = data.get("learner_id", "")
--            _ct = data.get("content", "")
--            if _lid and _ct:
--                self._teaching_sessions[_lid] = time.time()
--                self._save_teaching_sessions()
--                # Fire-and-forget iLink send (can take 5-10s, don't block HTTP response)
--                asyncio.create_task(self._deliver_tutor_reply(_lid, _ct))
--            return web.Response(status=200, text="ok")
+-            body = await request.json()
+-            chat_id = body.get("chat_id", "")
+-            content = body.get("content", "")
+-            if chat_id and content:
+-                await self.send(content=content, chat_id=chat_id)
+-                logger.info("[%s] Tutor callback delivered to %s (%d chars)", self.name, chat_id, len(content))
+-                return web.Response(status=200, text="ok")
+-            return web.Response(status=400, text="missing chat_id or content")
 -        except json.JSONDecodeError:
--            return web.Response(status=400, text="invalid json")
+-            return web.Response(status=400, text="invalid JSON")
 -        except Exception as exc:
 -            logger.warning("[%s] Tutor callback error: %s", self.name, exc)
--            return web.Response(status=500, text=str(exc))
-+    # _start_callback_server / _handle_tutor_callback / _deliver_tutor_reply 已删除
-+    # (Path 2 HTTP 回调路径). 教学回复统一走 _run_teaching_flow 同步路径.
-+    # 报告推送走 _consume_report_notifications 文件轮询路径.
- 
+-            return web.Response(status=500, text="internal error")
+-    # ==== END HERMES PATCH ====
+-
+     # ── Teaching flow (consolidated, no HTTP callbacks) ────────────
      async def _run_teaching_flow(
          self,
-@@ -2277,58 +2187,75 @@ class WeixinAdapter(BasePlatformAdapter):
-         media_paths: Optional[List[str]] = None,
-         is_image: bool = False,
+@@ -2279,16 +2193,34 @@ class WeixinAdapter(BasePlatformAdapter):
      ) -> None:
--        """Fire-and-forget teaching flow with periodic status updates."""
--        _STATUS_INTERVAL = 6
-+        """Fire-and-forget teaching flow."""
-+        if effective_chat_id in self._running_teachings:
-+            logger.debug("[%s] Teaching already running for %s, skipping", self.name, effective_chat_id)
-+            try:
-+                await self.send(content=" 正在处理，请稍候...", chat_id=effective_chat_id)
-+            except Exception:
-+                pass
-+            return
-+        self._running_teachings.add(effective_chat_id)
-         _start = time.time()
--        _last_status = _start
--
+         """Fire-and-forget teaching flow."""
+         if effective_chat_id in self._running_teachings:
+-            logger.debug("[%s] Teaching already running for %s, skipping", self.name, effective_chat_id)
++            logger.debug(
++                "[%s] Teaching already running for %s, skipping", self.name, effective_chat_id
++            )
+             try:
+                 await self.send(content=" 正在处理，请稍候...", chat_id=effective_chat_id)
+             except Exception:
+                 pass
+             return
+         self._running_teachings.add(effective_chat_id)
+-        _start = time.time()
          try:
++            # P0-1: Send immediate "reading" acknowledgment for file path
++            if is_new_file and media_paths:
++                try:
++                    _ack = "📎 收到！正在读题"
++                    if len(media_paths) > 1:
++                        _ack += f"（共{len(media_paths)}页）"
++                    _ack += "..."
++                    await self.send(content=_ack, chat_id=effective_chat_id)
++                except Exception:
++                    pass
++            elif is_new_file:
++                try:
++                    await self.send(
++                        content="📎 收到！正在读题...", chat_id=effective_chat_id
++                    )
++                except Exception:
++                    pass
++
              async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=180)) as session:
--                # Send status updates while waiting
--                async def _maybe_send_status():
--                    nonlocal _last_status
--                    elapsed = time.time() - _start
--                    if elapsed - (_last_status - _start) >= _STATUS_INTERVAL:
--                        _last_status = time.time()
--                        statuses = [
--                            "  正在识别题目类型...",
--                            "  正在生成详细讲解...",
--                            "  即将完成...",
--                        ]
--                        idx = min(int(elapsed / _STATUS_INTERVAL) - 1, len(statuses) - 1)
--                        if idx >= 0:
--                            try:
--                                await self.send(content=statuses[idx], chat_id=effective_chat_id)
--                            except Exception:
--                                pass
--
--                # ── File path: extract text first, then teach ──
--                # Handles images (OCR), Office docs, PDFs — any file.
-+                # ── File path: extract text from ALL pages, then teach ──
-+                # Handles images (OCR), Office docs, PDFs — any file type.
-                 _teach_context = ""
-+                _page_count = 0
-                 if media_paths:
--                    first_file = media_paths[0]
--                    filename = os.path.basename(first_file)
--                    try:
--                        with open(first_file, "rb") as f:
--                            form = aiohttp.FormData()
--                            form.add_field("file", f, filename=filename)
--                            form.add_field("learner_id", effective_chat_id)
--                            form.add_field("kb_name", "tutoring")
--                            form.add_field("suppress_auto_teach", "1")
--                            resp = await session.post(
--                                f"{platform_url}/api/process/file",
--                                data=form,
--                            )
--                        if resp.status == 200:
--                            data = await resp.json()
--                            if data.get("ok") and data.get("content"):
--                                _teach_context = data["content"].strip()
--                                logger.info(
--                                    "[%s] OCR extracted %d chars for %s",
--                                    self.name, len(_teach_context), effective_chat_id,
-+                    _page_texts: list[str] = []
-+                    for _idx, _fp in enumerate(media_paths):
-+                        _filename = os.path.basename(_fp)
-+                        try:
-+                            with open(_fp, "rb") as f:
-+                                form = aiohttp.FormData()
-+                                form.add_field("file", f, filename=_filename)
-+                                form.add_field("learner_id", effective_chat_id)
-+                                form.add_field("kb_name", "tutoring")
-+                                form.add_field("suppress_auto_teach", "1")
+                 # ── File path: extract text from ALL pages, then teach ──
+                 # Handles images (OCR), Office docs, PDFs — any file type.
+@@ -2299,38 +2231,65 @@ class WeixinAdapter(BasePlatformAdapter):
+                         _filename = os.path.basename(_fp)
+                         try:
+                             with open(_fp, "rb") as f:
+-                                form = aiohttp.FormData()
+-                                form.add_field("file", f, filename=_filename)
+-                                form.add_field("learner_id", effective_chat_id)
+-                                form.add_field("kb_name", "tutoring")
+-                                form.add_field("suppress_auto_teach", "1")
+-                                resp = await session.post(
+-                                    f"{platform_url}/api/process/file",
+-                                    data=form,
+-                                )
++                                _form = aiohttp.FormData()
++                                _form.add_field("file", f, filename=_filename)
++                                _form.add_field("learner_id", effective_chat_id)
++                                _form.add_field("kb_name", "tutoring")
++                                _form.add_field("suppress_auto_teach", "1")
 +                                resp = await session.post(
 +                                    f"{platform_url}/api/process/file",
-+                                    data=form,
-                                 )
--                    except Exception as exc:
--                        logger.warning("[%s] OCR failed for %s: %s", self.name, effective_chat_id, exc)
-+                            if resp.status == 200:
-+                                data = await resp.json()
-+                                if data.get("ok") and data.get("content"):
-+                                    _txt = data["content"].strip()
-+                                    if _txt:
-+                                        _page_texts.append(f"--- 第{_idx+1}页 ---\n{_txt}")
-+                                        _page_count += 1
-+                                        logger.info(
-+                                            "[%s] OCR page %d: %d chars for %s",
-+                                            self.name, _idx + 1, len(_txt), effective_chat_id,
++                                    data=_form,
++                                )
+                             if resp.status == 200:
+                                 data = await resp.json()
+                                 if data.get("ok") and data.get("content"):
+                                     _txt = data["content"].strip()
+                                     if _txt:
+-                                        _page_texts.append(f"--- 第{_idx+1}页 ---\n{_txt}")
++                                        _page_texts.append(
++                                            f"--- 第{_idx+1}页 ---\n{_txt}"
 +                                        )
-+                        except Exception as exc:
-+                            logger.warning(
-+                                "[%s] OCR failed for page %d (%s): %s",
-+                                self.name, _idx + 1, _filename, exc,
-+                            )
-+                    if _page_texts:
-+                        _teach_context = "\n\n".join(_page_texts)
-+
-+                # ── Send page detection progress (only on new files) ──
-+                if _page_count > 1:
-+                    _total_q = len(re.findall(
-+                        r"(?:第|^)\s*(\d+)\s*[.、．）\)]\s|[（(]\s*\d+\s*[）)]\s*|[」】]?\s*(?:选|填|计|证|解|化简|求|判|作|画|已知|若|设|如|在|将|把|当|对于|如图|下列|根据|按照|观察|思考|探究|阅读|理解)\S{0,4}",
-+                        _teach_context[:3000],
-+                    ))
-+                    _total_q = max(_total_q, 0)
-+                    _cur = self._teaching_sessions.get(effective_chat_id)
-+                    if isinstance(_cur, dict):
-+                        _cur["total_questions"] = _total_q
-+                        self._save_teaching_sessions()
+                                         _page_count += 1
+                                         logger.info(
+                                             "[%s] OCR page %d: %d chars for %s",
+-                                            self.name, _idx + 1, len(_txt), effective_chat_id,
++                                            self.name,
++                                            _idx + 1,
++                                            len(_txt),
++                                            effective_chat_id,
++                                        )
++                                        # P0-1: Per-page progress
++                                        if (
++                                            len(media_paths) > 1
++                                            and _page_count < len(media_paths)
++                                        ):
++                                            try:
++                                                await self.send(
++                                                    content=f"📄 第{_page_count}/{len(media_paths)}页已看清...",
++                                                    chat_id=effective_chat_id,
++                                                )
++                                            except Exception:
++                                                pass
+                         except Exception as exc:
+                             logger.warning(
+                                 "[%s] OCR failed for page %d (%s): %s",
+-                                self.name, _idx + 1, _filename, exc,
++                                self.name, _idx + 1, _filename, exc
+                             )
+                     if _page_texts:
+                         _teach_context = "\n\n".join(_page_texts)
+ 
+-                # ── Send page detection progress (only on new files) ──
+-                if _page_count > 1:
+-                    _total_q = len(re.findall(
+-                        r"(?:第|^)\s*(\d+)\s*[.、．）\)]\s|[（(]\s*\d+\s*[）)]\s*|[」】]?\s*(?:选|填|计|证|解|化简|求|判|作|画|已知|若|设|如|在|将|把|当|对于|如图|下列|根据|按照|观察|思考|探究|阅读|理解)\S{0,4}",
+-                        _teach_context[:3000],
+-                    ))
++                # P0-1: Send "preparing questions" after OCR completes
++                if _page_count > 0:
 +                    try:
-+                        _page_msg = f"📝 已识别试卷，共 {_page_count} 页"
-+                        if _total_q > 0:
-+                            _page_msg += f"、约 {_total_q} 道题"
-+                        _page_msg += "，开始学习！"
++                        _page_msg = f"📄 已识别 {_page_count} 页"
++                        if len(media_paths) > 1:
++                            _page_msg += "，正在出题..."
++                        else:
++                            _page_msg += "，正在出题..."
 +                        await self.send(content=_page_msg, chat_id=effective_chat_id)
 +                    except Exception:
 +                        pass
++                    _cur = self._teaching_sessions.get(effective_chat_id)
++                    if isinstance(_cur, dict):
++                        _cur["total_questions"] = 0
++                        self._save_teaching_sessions()
  
                  # ── Build the teaching message ──
                  if _teach_context:
-@@ -2342,6 +2269,11 @@ class WeixinAdapter(BasePlatformAdapter):
-                     _teach_msg = message
-                     _teach_ctx = ""
- 
-+                # Pass total_questions from session so platform can detect completion
-+                _tq = 0
-+                _cur_s = self._teaching_sessions.get(effective_chat_id)
-+                if isinstance(_cur_s, dict):
-+                    _tq = _cur_s.get("total_questions", 0)
-                 resp = await session.post(
-                     f"{platform_url}/api/tutor/chat",
-                     json={
-@@ -2349,16 +2281,33 @@ class WeixinAdapter(BasePlatformAdapter):
-                         "learner_id": effective_chat_id,
-                         "context": _teach_ctx,
-                         "mode": "guide",
-+                        "total_questions": _tq,
-                     },
-                 )
--                await _maybe_send_status()
--
-                 if resp.status == 200:
-                     data = await resp.json()
-                     reply = data.get("content", "") if data.get("ok") else ""
-                     if reply:
-+                        # Release the concurrency guard BEFORE iLink send
-+                        # (5-10s).  Otherwise a fast student follow-up during
-+                        # the send window gets blocked with no feedback.
-+                        self._running_teachings.discard(effective_chat_id)
-                         await self.send(content=reply, chat_id=effective_chat_id)
--                        self._teaching_sessions[effective_chat_id] = time.time()
-+                        # Update session (don't overwrite with timestamp)
-+                        _cur = self._teaching_sessions.get(effective_chat_id)
-+                        if isinstance(_cur, dict):
-+                            _cur["last_active"] = time.time()
-+                            # Extract question number from reply
-+                            _qn_m = re.search(r"第\s*(\d+)\s*[题/]", reply)
-+                            if _qn_m:
-+                                _cur["question_num"] = int(_qn_m.group(1))
-+                            # Detect total questions
-+                            _tq_m = re.search(r"第\d+[题/]\s*(\d+)", reply)
-+                            if _tq_m:
-+                                _cur["total_questions"] = int(_tq_m.group(1))
-+                        else:
-+                            # Fallback: create new session
-+                            self._teaching_sessions[effective_chat_id] = self._new_session("active")
-                         self._save_teaching_sessions()
-                         logger.info(
-                             "[%s] Tutor reply sent to %s (%d chars, %.1fs)",
-@@ -2370,19 +2319,22 @@ class WeixinAdapter(BasePlatformAdapter):
-                 logger.warning("[%s] Tutor chat returned empty, falling back", self.name)
-         except Exception as exc:
-             logger.warning("[%s] Tutor chat failed, falling back to agent: %s", self.name, exc)
-+        finally:
-+            self._running_teachings.discard(effective_chat_id)
- 
--        # Fallback: send a friendly message instead of falling through to the
--        # general HA agent (which would take over the teaching conversation).
--        # The teaching session was already set in _process_message, so the
--        # next student message will retry the teaching flow.
-+        # Teaching session is preserved so the next student message retries
-+        # automatically.
-         try:
-             await self.send(
--                content=" 教学引擎暂时无响应，请再发一次或回复「继续做题」重试。",
-+                content=" 教学未响应，请重试",
-                 chat_id=effective_chat_id,
-             )
-         except Exception:
-             pass
--        logger.warning("[%s] Tutor flow failed, kept session alive for %s", self.name, effective_chat_id)
-+        logger.warning(
-+            "[%s] Tutor flow failed for %s, session preserved for retry",
-+            self.name, effective_chat_id,
-+        )
- 
-     def _build_dummy_event(self, chat_id: str, text: str) -> "MessageEvent":
-         """Build a minimal MessageEvent for fallback agent processing."""
-@@ -2393,23 +2345,40 @@ class WeixinAdapter(BasePlatformAdapter):
-             message_id="", raw_message={}, timestamp=datetime.now(),
-         )
- 
--    async def _deliver_tutor_reply(self, learner_id: str, content: str) -> None:
--        """Deliver a tutor reply via WeChat (background, after HTTP response)."""
--        try:
--            await self.send(content=content, chat_id=learner_id)
--            logger.info("[%s] Tutor reply delivered to %s (%d chars)", self.name, learner_id, len(content))
--        except Exception as exc:
--            logger.warning("[%s] Tutor reply delivery failed for %s: %s", self.name, learner_id, exc)
-+    @staticmethod
-+    def _new_session(state: str = "active", question_num: int = 0,
-+                     total_questions: int = 0, trace_id: str = "") -> dict:
-+        _now = time.time()
-+        return {
-+            "state": state,
-+            "started_at": _now,
-+            "last_active": _now,
-+            "question_num": question_num,
-+            "total_questions": total_questions,
-+            "trace_id": trace_id,
-+        }
- 
-     def _load_teaching_sessions(self) -> None:
--        """Load persisted teaching sessions from disk."""
-+        """Load persisted teaching sessions from disk.
-+        
-+        ɢ Supports both old (timestamp) and new (dict) disk formats.
-+        """
-         try:
-             if self._teaching_sessions_path.exists():
-                 data = json.loads(self._teaching_sessions_path.read_text(encoding="utf-8"))
-                 now = time.time()
-                 for k, v in data.items():
--                    if now - v < 7200:
--                        self._teaching_sessions[k] = v
-+                    if isinstance(v, (int, float)):
-+                        # Old format: timestamp → migrate to dict
-+                        if now - v < 7200:
-+                            self._teaching_sessions[k] = self._new_session("active")
-+                            self._teaching_sessions[k]["last_active"] = v
-+                    elif isinstance(v, dict):
-+                        # New format: dict with state
-+                        _state = v.get("state", "active")
-+                        _last = v.get("last_active", v.get("started_at", now))
-+                        if now - _last < 7200:
-+                            self._teaching_sessions[k] = v
-         except Exception:
+@@ -2394,12 +2353,21 @@ class WeixinAdapter(BasePlatformAdapter):
              pass
  
-@@ -2421,6 +2390,131 @@ class WeixinAdapter(BasePlatformAdapter):
-             )
-         except Exception:
-             pass
-+
-+    # ── 子网关路由：三态会话教学引擎 ────────────────────────────
-+    _PAUSE_SIGNALS = {"累了", "休息一下", "聊会天", "想聊天",
-+                      "不学了", "先不学了", "休息", "歇会",
-+                      "先休息", "不想学了", "聊聊天", "说会话"}
-+    _RESUME_SIGNALS = {"继续", "接着", "回来", "好了",
-+                       "继续做题", "接着学", "开始学习",
-+                       "回来做题", "继续学习", "开始做题"}
-+
-+    async def _route_child_message(
-+        self, event, text: str, media_paths: list,
-+        chat_id: str, sender_id: str,
-+    ) -> None:
-+        """子网关：三态会话路由（教学 ↔ 暂停 ↔ 无会话）"""
-+        _session = self._teaching_sessions.get(chat_id) or \
-+                   self._teaching_sessions.get(sender_id)
-+        _is_file = bool(media_paths)
-+        _now = time.time()
-+
-+        # ── 1. 新文件 → 总是重置教学 ──
-+        if _is_file:
-+            self._teaching_sessions[chat_id] = self._new_session("active")
-+            self._save_teaching_sessions()
-+            platform_url = os.getenv("PLATFORM_API_URL", "http://platform:8100")
-+            # Quick acknowledgment so the student knows the file was received
+     # ── 子网关路由：三态会话教学引擎 ────────────────────────────
++    # P1-5: Extended pause/resume signals for child-friendly expressions
+     _PAUSE_SIGNALS = {"累了", "休息一下", "聊会天", "想聊天",
+                       "不学了", "先不学了", "休息", "歇会",
+-                      "先休息", "不想学了", "聊聊天", "说会话"}
++                      "先休息", "不想学了", "聊聊天", "说会话",
++                      "等一下", "妈妈叫我", "吃饭了", "要走了",
++                      "下次再做", "先不做了", "先放这", "等会儿",
++                      "先去", "有事", "待会", "先不学了",
++                      "不想做了", "太累了", "困了", "歇会",
++                      "离开一下"}
+     _RESUME_SIGNALS = {"继续", "接着", "回来", "好了",
+                        "继续做题", "接着学", "开始学习",
+-                       "回来做题", "继续学习", "开始做题"}
++                       "回来做题", "继续学习", "开始做题",
++                       "回来了", "来了", "做完了", "我好了",
++                       "我又来了", "继续吧", "开始吧", "来吧",
++                       "我回来了", "好了继续"}
+ 
+     async def _route_child_message(
+         self, event, text: str, media_paths: list,
+@@ -2412,14 +2380,18 @@ class WeixinAdapter(BasePlatformAdapter):
+         # ── 1. 新文件 → 总是重置教学 ──
+         if _is_file:
+             self._teaching_sessions[chat_id] = self._new_session("active")
++            self._teaching_sessions[chat_id]["acknowledged"] = False
+             self._save_teaching_sessions()
+             platform_url = os.getenv("PLATFORM_API_URL", "http://platform:8100")
+-            # Quick acknowledgment so the student knows the file was received
+-            try:
+-                await self.send(content="📎 收到，正在处理...", chat_id=chat_id)
+-            except Exception:
+-                pass
+-            asyncio.create_task(self._run_teaching_flow(
++            # P0-1: Immediate acknowledgment in _route_child_message
 +            try:
-+                await self.send(content="📎 收到，正在处理...", chat_id=chat_id)
++                _ack = "📎 收到！正在读题"
++                if len(media_paths) > 1:
++                    _ack += f"（共{len(media_paths)}页）"
++                _ack += "..."
++                await self.send(content=_ack, chat_id=chat_id)
 +            except Exception:
-+                pass
-+            asyncio.create_task(self._run_teaching_flow(
-+                chat_id, "", platform_url, True, media_paths, False,
-+            ))
-+            return
-+
-+        # ── 2. 教学态（Active）──
-+        if _session and _session.get("state") == "active":
-+            # 检查过期
-+            if _now - _session.get("last_active", _now) > 7200:
-+                self._teaching_sessions.pop(chat_id, None)
-+                self._teaching_sessions.pop(sender_id, None)
-+                self._save_teaching_sessions()
-+                await self.handle_message(event)
-+                return
-+
-+            # 暂停信号 → 切换暂停态
-+            if text.strip() in self._PAUSE_SIGNALS or \
-+               any(text.strip().startswith(kw) for kw in ("累了", "休息", "聊")):
++                pass            asyncio.create_task(self._run_teaching_flow(
+                 chat_id, "", platform_url, True, media_paths, False,
+             ))
+             return
+@@ -2440,6 +2412,29 @@ class WeixinAdapter(BasePlatformAdapter):
+                     pass
+                 return
+ 
++            # P2-9: Idle detection on student return
++            _idle_secs = _now - _session.get("last_active", _now)
++            if _idle_secs > 600 and _session.get("question_num", 0) > 0:
 +                _session["state"] = "paused"
 +                _session["last_active"] = _now
 +                self._save_teaching_sessions()
-+                logger.info("[%s] Teaching paused for %s", self.name, chat_id)
 +                try:
 +                    await self.send(
-+                        content=" 好的，休息一下~ 随时说「继续做题」回来学习！",
++                        content=" 你很久没回复了，先休息一下~ 说「继续做题」回来继续！",
 +                        chat_id=chat_id,
 +                    )
 +                except Exception:
 +                    pass
 +                return
-+
-+            # 其他所有消息（答案、问问题、请求讲解、闲聊）→ tutor_chat
-+            _msg = text.strip() if text.strip() else "继续"
-+            platform_url = os.getenv("PLATFORM_API_URL", "http://platform:8100")
-+            self._teaching_sessions[chat_id] = _session
-+            self._save_teaching_sessions()
-+            asyncio.create_task(self._run_teaching_flow(
-+                chat_id, _msg, platform_url, False, [], False,
-+            ))
-+            return
-+
-+        # ── 3. 暂停态（Paused）──
-+        if _session and _session.get("state") == "paused":
-+            # 检查过期
-+            if _now - _session.get("last_active", _now) > 7200:
-+                self._teaching_sessions.pop(chat_id, None)
-+                self._teaching_sessions.pop(sender_id, None)
-+                self._save_teaching_sessions()
-+                await self.handle_message(event)
-+                return
-+
-+            # 恢复信号 → 切回教学态
-+            if text.strip() in self._RESUME_SIGNALS or \
-+               any(text.strip().startswith(kw) for kw in ("继续", "接着", "回来", "好了继续")):
-+                _session["state"] = "active"
-+                _session["last_active"] = _now
-+                self._save_teaching_sessions()
-+                _qn = _session.get("question_num", 0)
++            elif _idle_secs > 300 and _session.get("question_num", 0) > 0:
 +                try:
 +                    await self.send(
-+                        content=f" 好，回来了！继续学习！",
++                        content=" 还在吗？需要提示的话告诉老师哦~",
 +                        chat_id=chat_id,
 +                    )
 +                except Exception:
 +                    pass
-+                logger.info("[%s] Teaching resumed for %s (q%d)", self.name, chat_id, _qn)
-+                platform_url = os.getenv("PLATFORM_API_URL", "http://platform:8100")
-+                asyncio.create_task(self._run_teaching_flow(
-+                    chat_id, text.strip() or "继续", platform_url, False, [], False,
-+                ))
-+                return
 +
-+            # 暂停态其他消息 → HA 闲聊
-+            await self.handle_message(event)
-+            return
-+
-+        # ── 4. 无会话 → HA agent（默认）──
-+        await self.handle_message(event)
-+
-+    # ── 父网关路由：简化消息处理 ─────────────────────────────
-+    async def _route_parent_message(
-+        self, event, text: str, media_paths: list, chat_id: str,
-+    ) -> None:
-+        """父网关：不教学，文件提示+文字走 HA agent（MCP 工具处理）"""
-+        if media_paths:
-+            try:
-+                await self.send(
-+                    content=" 这是孩子的学习功能哦，让孩子直接发给我吧~\n"
-+                            "您可以发「出练习题」给孩子布置作业，"
-+                            "或发「学习报告」查看学习情况。",
-+                    chat_id=chat_id,
-+                )
-+            except Exception:
-+                pass
-+            return
-+        await self.handle_message(event)
-     # ==== END HERMES PATCH ====
- 
- 
+             # 其他所有消息（答案、问问题、请求讲解、闲聊）→ tutor_chat
+             _msg = text.strip() if text.strip() else "继续"
+             platform_url = os.getenv("PLATFORM_API_URL", "http://platform:8100")
