@@ -2292,7 +2292,16 @@ class WeixinAdapter(BasePlatformAdapter):
                         # (5-10s).  Otherwise a fast student follow-up during
                         # the send window gets blocked with no feedback.
                         self._running_teachings.discard(effective_chat_id)
-                        await self.send(content=reply, chat_id=effective_chat_id)
+                        try:
+                            await asyncio.wait_for(
+                                self.send(content=reply, chat_id=effective_chat_id),
+                                timeout=15,
+                            )
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                "[%s] WeChat send timed out for %s (rate limited?)",
+                                self.name, effective_chat_id,
+                            )
                         # Update session (don't overwrite with timestamp)
                         _cur = self._teaching_sessions.get(effective_chat_id)
                         if isinstance(_cur, dict):
