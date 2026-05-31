@@ -2271,15 +2271,18 @@ class WeixinAdapter(BasePlatformAdapter):
                 _cur_s = self._teaching_sessions.get(effective_chat_id)
                 if isinstance(_cur_s, dict):
                     _tq = _cur_s.get("total_questions", 0)
-                resp = await session.post(
-                    f"{platform_url}/api/tutor/chat",
-                    json={
-                        "message": _teach_msg,
-                        "learner_id": effective_chat_id,
-                        "context": _teach_ctx,
-                        "mode": "guide",
-                        "total_questions": _tq,
-                    },
+                resp = await asyncio.wait_for(
+                    session.post(
+                        f"{platform_url}/api/tutor/chat",
+                        json={
+                            "message": _teach_msg,
+                            "learner_id": effective_chat_id,
+                            "context": _teach_ctx,
+                            "mode": "guide",
+                            "total_questions": _tq,
+                        },
+                    ),
+                    timeout=90,
                 )
                 if resp.status == 200:
                     data = await resp.json()

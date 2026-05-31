@@ -4633,7 +4633,7 @@ async def _direct_deepseek_teach(
     _last_err = ""
     for _attempt in range(2):
         try:
-            async with httpx.AsyncClient(timeout=60) as client:
+            async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.post(
                     llm_url,
                     json=payload,
