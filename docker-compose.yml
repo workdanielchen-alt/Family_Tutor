@@ -107,6 +107,7 @@ services:
       - ./data/knowledge_bases:/data/knowledge_bases
       - ./data/hermes:/data/hermes
       - ./data/quiz_sessions:/data/quiz_sessions
+      - ./data/teach_sessions:/data/teach_sessions
     depends_on:
       deeptutor:
         condition: service_started
