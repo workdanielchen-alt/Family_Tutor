@@ -7848,11 +7848,15 @@ async def api_teach_start(request: Request):
             session.first_question = reply
             store.mark_active(session.session_id)
 
-            # 估算总题数
+            # 估算总题数（LLM 输出中有则取，无则从 OCR 文本检测）
             import re
-            _tq_m = re.search(r"第\d+[题/]\s*(\d+)", reply)
+            _tq_m = re.search(r"(?:共|/)\s*(\d+)\s*题", reply)
             if _tq_m:
                 session.total_questions = int(_tq_m.group(1))
+            else:
+                _detected = _detect_total_questions(ocr_text)
+                if _detected:
+                    session.total_questions = _detected
             _cur_qn = 1
             session.current_question = _cur_qn
             store.save(session)
