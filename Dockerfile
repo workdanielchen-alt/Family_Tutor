@@ -115,8 +115,9 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 # Copy requirements and install Python dependencies
 COPY requirements/ ./requirements/
 COPY requirements.txt ./
-RUN pip install --upgrade pip && \
-    pip install -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --upgrade pip --default-timeout=120 && \
+    pip install --default-timeout=120 -r requirements.txt
 
 # Unset proxy at end of stage so downstream stages don't inherit it
 ENV HTTP_PROXY= HTTPS_PROXY=

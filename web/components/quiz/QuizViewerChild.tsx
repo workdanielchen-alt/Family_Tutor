@@ -197,13 +197,26 @@ export default function QuizViewerChild({ questions, onComplete, language = "zh"
           })}
         </div>
       ) : isFillInBlankQuizQuestion(q.question_type) ? (
-        <div>
+        <div className="space-y-3">
+          {/* 将 ____ 替换为高亮占位符 */}
+          <div className="text-[17px] leading-relaxed text-[var(--foreground)]">
+            {q.question.split("____").map((part, i, arr) => (
+              <span key={i}>
+                {part}
+                {i < arr.length - 1 && (
+                  <span className="mx-1 inline-block min-w-[80px] border-b-2 border-dashed border-[var(--primary)]/50 bg-[var(--primary)]/[0.05] px-2 text-[var(--primary)]">
+                    ?
+                  </span>
+                )}
+              </span>
+            ))}
+          </div>
           <input
             type="text"
             value={ans.typed}
             onChange={e => updateAns({ typed: e.target.value })}
             disabled={ans.submitted}
-            placeholder="输入答案..."
+            placeholder="在此填写答案..."
             className="w-full rounded-xl border border-[var(--border)] bg-[var(--card)] px-4 py-3.5 text-[16px] outline-none transition-colors focus:border-[var(--primary)]/50 disabled:bg-[var(--muted)]"
           />
         </div>

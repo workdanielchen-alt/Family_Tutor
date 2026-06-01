@@ -1,0 +1,50 @@
+diff --git a/vendor/hermes-agent/gateway/platforms/weixin.py b/vendor/hermes-agent/gateway/platforms/weixin.py
+index 96b1cd92c..64a86ee95 100644
+--- a/vendor/hermes-agent/gateway/platforms/weixin.py
++++ b/vendor/hermes-agent/gateway/platforms/weixin.py
+@@ -2247,6 +2247,45 @@ class WeixinAdapter(BasePlatformAdapter):
+                     if _page_texts:
+                         _teach_context = "\n\n".join(_page_texts)
+ 
++                # ── Try to create a teaching session for WEBUI ──
++                # 成功后发简单消息告知，跳过微信内教学
++                if _teach_context:
++                    _teach_start_ok = False
++                    try:
++                        _ts_resp = await session.post(
++                            f"{platform_url}/api/teach/start",
++                            json={
++                                "ocr_text": _teach_context,
++                                "learner_id": effective_chat_id,
++                                "source_file": media_paths[0] if media_paths else "",
++                            },
++                            timeout=aiohttp.ClientTimeout(total=120),
++                        )
++                        if _ts_resp.status == 200:
++                            _ts_data = await _ts_resp.json()
++                            if _ts_data.get("ok"):
++                                _teach_start_ok = True
++                    except Exception as _ts_exc:
++                        logger.warning(
++                            "[%s] teach/start failed: %s", self.name, _ts_exc,
++                        )
++
++                    if _teach_start_ok:
++                        self._running_teachings.discard(effective_chat_id)
++                        try:
++                            await asyncio.wait_for(
++                                self.send(
++                                    content="✅ 已收到，让孩子在电脑上打开看看吧\U0001F449",
++                                    chat_id=effective_chat_id,
++                                ),
++                                timeout=15,
++                            )
++                        except asyncio.TimeoutError:
++                            logger.warning(
++                                "[%s] teach notify send timed out", self.name,
++                            )
++                        return
++
+                 # ── Keep total_questions init; skip "preparing questions" msg (1-card UX) ──
+                 if _page_count > 0:
+                     _cur = self._teaching_sessions.get(effective_chat_id)

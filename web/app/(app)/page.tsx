@@ -2,21 +2,15 @@
 
 import { useEffect } from "react";
 import { useRouter } from "next/navigation";
-import { useAppShell } from "@/context/AppShellContext";
 
 /**
- * Root page: redirects to /child/home in child mode, /chat otherwise.
+ * Root page: redirects to /chat for backward compatibility.
+ * Child mode is handled by (app)/layout.tsx path matching.
  */
 export default function HomePage() {
   const router = useRouter();
-  const { uiMode } = useAppShell();
 
   useEffect(() => {
-    if (uiMode === "child") {
-      router.replace("/home");
-      return;
-    }
-
     const params = new URLSearchParams(window.location.search);
     const sessionId = params.get("session");
     const capability = params.get("capability");
@@ -30,7 +24,7 @@ export default function HomePage() {
     if (query.length) target += `?${query.join("&")}`;
 
     router.replace(target);
-  }, [router, uiMode]);
+  }, [router]);
 
   return null;
 }

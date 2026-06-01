@@ -66,6 +66,10 @@ function resolveImageSrc(url: string | null | undefined): string | undefined {
 interface QuizViewerProps {
   questions: QuizQuestion[];
   sessionId?: string | null;
+  /** When true, auto-advance to the next question 1.5s after submission. */
+  autoAdvance?: boolean;
+  /** Called when the last question is submitted (autoAdvance must be true). */
+  onComplete?: () => void;
   /**
    * The ``turn_id`` of the assistant turn that produced this quiz. Scopes
    * notebook lookups/upserts so two quizzes generated in the same chat
@@ -191,6 +195,8 @@ export default function QuizViewer({
   sessionId,
   turnId,
   language = "en",
+  autoAdvance = true,
+  onComplete,
 }: QuizViewerProps) {
   const { t } = useTranslation();
   const followupController = useQuizFollowupController();
@@ -535,6 +541,23 @@ export default function QuizViewer({
     updateAnswer({ submitted: true });
     void upsertSingleQuestion(q, newAnswer, idx);
   };
+
+  // Auto-advance to next question after submission, or call onComplete on last
+  const autoAdvanceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    if (!autoAdvance || !ans.submitted) return;
+    const isLast = idx >= questions.length - 1;
+    autoAdvanceTimerRef.current = setTimeout(() => {
+      if (isLast) {
+        onComplete?.();
+      } else {
+        setIdx((i) => i + 1);
+      }
+    }, 1500);
+    return () => {
+      if (autoAdvanceTimerRef.current) clearTimeout(autoAdvanceTimerRef.current);
+    };
+  }, [autoAdvance, ans.submitted, idx, questions.length, onComplete]);
 
   const handleReset = () => {
     // Reset typed/selected state but keep an attached image so the learner

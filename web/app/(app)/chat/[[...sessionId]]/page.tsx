@@ -107,7 +107,14 @@ import {
 } from "@/lib/tools-settings";
 import { downloadChatMarkdown } from "@/lib/chat-export";
 import type { SpaceMemoryFile } from "@/lib/space-items";
-import { fetchPendingQuizSessions, type PendingQuizSession } from "@/lib/platform-api";
+import { fetchAllPendingQuizSessions, type PendingQuizSession } from "@/lib/platform-api";
+import {
+  startTeach,
+  continueTeach,
+  fetchAllPendingTeach,
+  fetchTeachSession,
+  type PendingTeachSession,
+} from "@/lib/platform-api";
 import {
   selectedBooksToPayload,
   type SelectedBookReference,
@@ -606,7 +613,7 @@ export default function ChatPage() {
   const [pendingQuizzes, setPendingQuizzes] = useState<PendingQuizSession[]>([]);
   const refreshPendingQuizzes = useCallback(async () => {
     try {
-      const data = await fetchPendingQuizSessions("default");
+      const data = await fetchAllPendingQuizSessions();
       setPendingQuizzes(data.sessions ?? []);
     } catch { /* ignore */ }
   }, []);
@@ -616,6 +623,69 @@ export default function ChatPage() {
     document.addEventListener("visibilitychange", onVisible);
     return () => document.removeEventListener("visibilitychange", onVisible);
   }, [refreshPendingQuizzes]);
+
+  // ── Teach sessions (引导式教学) ───────────────────────────
+  const [pendingTeach, setPendingTeach] = useState<PendingTeachSession[]>([]);
+  const [teachSessionId, setTeachSessionId] = useState<string | null>(null);
+  const [teachConversation, setTeachConversation] = useState<
+    { role: "assistant" | "user"; content: string }[]
+  >([]);
+  const [teachLoading, setTeachLoading] = useState(false);
+  const [teachDone, setTeachDone] = useState(false);
+
+  const refreshPendingTeach = useCallback(async () => {
+    try {
+      const data = await fetchAllPendingTeach();
+      setPendingTeach(data.sessions ?? []);
+    } catch { /* ignore */ }
+  }, []);
+  useEffect(() => {
+    void refreshPendingTeach();
+    const onVisible = () => { if (document.visibilityState === "visible") void refreshPendingTeach(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  }, [refreshPendingTeach]);
+
+  const startTeachSession = useCallback(async (sessionId: string) => {
+    try {
+      const data = await fetchTeachSession(sessionId);
+      if (!data.ok || !data.first_question) return;
+      setTeachSessionId(sessionId);
+      setTeachConversation([{ role: "assistant", content: data.first_question }]);
+      setTeachDone(false);
+    } catch { /* ignore */ }
+  }, []);
+
+  const submitTeachAnswer = useCallback(async (answer: string) => {
+    if (!teachSessionId || teachLoading) return;
+    setTeachLoading(true);
+    // 先追加用户答案到对话
+    setTeachConversation((prev) => [...prev, { role: "user", content: answer }]);
+    try {
+      const data = await continueTeach({
+        teach_session_id: teachSessionId,
+        message: answer,
+        learner_id: "default",
+      });
+      if (data.ok && data.reply) {
+        setTeachConversation((prev) => [...prev, { role: "assistant", content: data.reply! }]);
+        if (data.done) {
+          setTeachDone(true);
+        }
+      } else {
+        setTeachConversation((prev) => [
+          ...prev,
+          { role: "assistant", content: `⚠️ ${data.error || "提交失败"}` },
+        ]);
+      }
+    } catch {
+      setTeachConversation((prev) => [
+        ...prev,
+        { role: "assistant", content: "⚠️ 网络错误，请重试" },
+      ]);
+    }
+    setTeachLoading(false);
+  }, [teachSessionId, teachLoading]);
 
   // Time-of-day greeting: seeded once on mount from the user's local clock so
   // the heading stays stable while they're on the page. State (not useMemo)
@@ -1490,6 +1560,24 @@ export default function ChatPage() {
         (attachments.some((a) => a.type === "image")
           ? t("Please analyze the attached image(s).")
           : "");
+      if (attachments.length > 0 && !teachSessionId) {
+        const fileAttach = attachments[0];
+        setAttachments([]);
+        try {
+          const data = await startTeach({
+            file_base64: fileAttach.base64,
+            filename: fileAttach.filename,
+            learner_id: "default",
+          });
+          if (data.ok && data.teach_session_id && data.first_question) {
+            setTeachSessionId(data.teach_session_id);
+            setTeachConversation([{ role: "assistant", content: data.first_question }]);
+            setTeachDone(false);
+          }
+        } catch { /* ignore */ }
+        return;
+      }
+
       sendMessage(
         messageContent,
         extraAttachments,
@@ -1877,6 +1965,34 @@ export default function ChatPage() {
                     ))}
                   </div>
                 )}
+
+                {/* ── Pending teach tasks (引导式教学) ── */}
+                {pendingTeach.length > 0 && !teachSessionId && (
+                  <div className="mt-4 w-full max-w-md space-y-3">
+                    <p className="text-center text-[13px] font-medium text-[var(--muted-foreground)]">
+                      📚 待完成的教学任务
+                    </p>
+                    {pendingTeach.slice(0, 5).map((s) => (
+                      <button
+                        key={s.session_id}
+                        onClick={() => startTeachSession(s.session_id)}
+                        className="flex w-full items-center justify-between rounded-xl border border-[var(--border)]/60 bg-[var(--card)] px-4 py-3 text-left shadow-sm transition-all hover:border-[var(--primary)]/40 hover:bg-[var(--primary)]/[0.03]"
+                      >
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate text-[14px] font-medium text-[var(--foreground)]">
+                            {s.source === "wechat" ? "👨‍👩‍👧 家长发来的" : "📄 已上传"}
+                          </p>
+                          <p className="text-[12px] text-[var(--muted-foreground)]">
+                            {s.current_question || 0}/{s.total_questions || "?"} 题
+                          </p>
+                        </div>
+                        <span className="ml-3 shrink-0 rounded-lg bg-[var(--primary)] px-3 py-1.5 text-[12px] font-medium text-white">
+                          开始教学
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
             ) : (
               <div
@@ -1995,6 +2111,61 @@ export default function ChatPage() {
               onCancelStreaming={cancelStreamingTurn}
               prefillInputRef={prefillInputRef}
             />
+
+            {/* ── Teach Mode UI (引导式教学) ── */}
+            {teachSessionId && (
+              <div className="mx-auto w-full max-w-2xl border-t border-[var(--border)]/50 bg-[var(--background)] px-4 pb-4 pt-3">
+                {/* Teach conversation messages */}
+                <div className="mb-3 max-h-60 space-y-2 overflow-y-auto">
+                  {teachConversation.map((msg, i) => (
+                    <div
+                      key={i}
+                      className={`rounded-xl px-3 py-2 text-[15px] leading-relaxed ${
+                        msg.role === "user"
+                          ? "ml-8 bg-[var(--primary)]/[0.08] text-[var(--foreground)]"
+                          : "mr-8 bg-[var(--muted)]/50 text-[var(--foreground)]"
+                      }`}
+                    >
+                      <div className="whitespace-pre-wrap">{msg.content}</div>
+                    </div>
+                  ))}
+                  {teachLoading && (
+                    <div className="mr-8 animate-pulse rounded-xl bg-[var(--muted)]/50 px-3 py-2 text-[13px] text-[var(--muted-foreground)]">
+                      思考中...
+                    </div>
+                  )}
+                </div>
+
+                {/* Answer input */}
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    placeholder={teachDone ? "✅ 已完成" : "输入你的答案..."}
+                    disabled={teachDone || teachLoading}
+                    className="flex-1 rounded-xl border border-[var(--border)] bg-[var(--card)] px-4 py-2.5 text-[15px] outline-none transition-colors focus:border-[var(--primary)]/50 disabled:opacity-50"
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && !teachDone && !teachLoading && (e.target as HTMLInputElement).value.trim()) {
+                        const val = (e.target as HTMLInputElement).value.trim();
+                        (e.target as HTMLInputElement).value = "";
+                        submitTeachAnswer(val);
+                      }
+                    }}
+                  />
+                  {teachDone && (
+                    <button
+                      onClick={() => {
+                        setTeachSessionId(null);
+                        setTeachConversation([]);
+                        setTeachDone(false);
+                      }}
+                      className="shrink-0 rounded-xl bg-[var(--primary)] px-4 py-2.5 text-[14px] font-medium text-white"
+                    >
+                      返回聊天
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
             <div
               aria-hidden="true"
               className="shrink-0"

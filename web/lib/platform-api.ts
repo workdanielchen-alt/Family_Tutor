@@ -229,6 +229,90 @@ export async function fetchPendingQuizSessions(
   return apiGet(`/quiz/pending/${learnerId}`);
 }
 
+export async function fetchAllPendingQuizSessions(): Promise<{
+  sessions: PendingQuizSession[];
+  total_pending: number;
+}> {
+  return apiGet("/quiz/pending");
+}
+
+// ── Teach Session ─────────────────────────────────────────────
+
+export interface PendingTeachSession {
+  session_id: string;
+  source: "wechat" | "webui";
+  total_questions: number;
+  current_question: number;
+  first_question: string;
+  status: string;
+  created_at: number;
+  expires_at: number;
+}
+
+export interface TeachStartResponse {
+  ok: boolean;
+  teach_session_id?: string;
+  first_question?: string;
+  total_questions?: number;
+  source?: string;
+  current?: number;
+  error?: string;
+}
+
+export interface TeachContinueResponse {
+  ok: boolean;
+  reply?: string;
+  current?: number;
+  total_questions?: number;
+  done?: boolean;
+  error?: string;
+}
+
+export async function startTeach(params: {
+  file_base64?: string;
+  filename?: string;
+  ocr_text?: string;
+  learner_id?: string;
+  source_file?: string;
+  mode?: string;
+}): Promise<TeachStartResponse> {
+  return apiPost("/teach/start", params);
+}
+
+export async function continueTeach(params: {
+  teach_session_id: string;
+  message: string;
+  learner_id?: string;
+}): Promise<TeachContinueResponse> {
+  return apiPost("/teach/continue", params);
+}
+
+export async function fetchPendingTeach(
+  learnerId: string,
+): Promise<{ sessions: PendingTeachSession[]; total_pending: number }> {
+  return apiGet(`/teach/pending/${learnerId}`);
+}
+
+export async function fetchAllPendingTeach(): Promise<{
+  sessions: PendingTeachSession[];
+  total_pending: number;
+}> {
+  return apiGet("/teach/pending");
+}
+
+export async function fetchTeachSession(sessionId: string): Promise<{
+  ok: boolean;
+  session_id?: string;
+  source?: string;
+  status?: string;
+  first_question?: string;
+  total_questions?: number;
+  current_question?: number;
+  error?: string;
+}> {
+  return apiGet(`/teach/session/${sessionId}`);
+}
+
 // ── Practice / Exam / Report ────────────────────────────────
 
 export async function generatePractice(
