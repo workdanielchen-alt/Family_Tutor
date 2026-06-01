@@ -2,40 +2,40 @@ import http from "node:http";
 import https from "node:https";
 import { request as httpsRequest } from "node:https";
 
-const FRONTEND_PORT = 3783;
-const PROXY_PORT = 3782;
-const BACKEND_HOST = "127.0.0.1";
-const PLATFORM_PORT = 8100;
-const DEEPTUTOR_PORT = 8001;
+const FRONTEND_PORT = parseInt(process.env.PROXY_FRONTEND_PORT || "3783", 10);
+const PROXY_PORT = parseInt(process.env.PROXY_PORT || "3782", 10);
+const DEEPTUTOR_PORT = parseInt(process.env.DEEPTUTOR_PORT || "8001", 10);
+const PLATFORM_HOST = process.env.PLATFORM_HOST || "127.0.0.1";
+const PLATFORM_PORT = parseInt(process.env.PLATFORM_PORT || "8100", 10);
 
 // ── Routing rules ────────────────────────────────────────────
 function routeTarget(url) {
   if (url.startsWith("/api/platform") || url.startsWith("/api/platform/")) {
     const targetPath = url.replace(/^\/api\/platform(\/|$)/, "/api$1");
-    return { port: PLATFORM_PORT, path: targetPath };
+    return { host: PLATFORM_HOST, port: PLATFORM_PORT, path: targetPath };
   }
   if (url.startsWith("/api/v1/")) {
-    return { port: DEEPTUTOR_PORT, path: url };
+    return { host: "127.0.0.1", port: DEEPTUTOR_PORT, path: url };
   }
-  return { port: FRONTEND_PORT, path: url };
+  return { host: "127.0.0.1", port: FRONTEND_PORT, path: url };
 }
 
 // ── HTTP proxy ───────────────────────────────────────────────
-function proxyRequest(upstreamPort, req, res) {
+function proxyRequest(target, req, res) {
   const options = {
-    hostname: BACKEND_HOST,
-    port: upstreamPort,
+    hostname: target.host,
+    port: target.port,
     path: req.url,
     method: req.method,
-    headers: { ...req.headers, host: `${BACKEND_HOST}:${upstreamPort}` },
+    headers: { ...req.headers, host: `${target.host}:${target.port}` },
   };
 
   const proxy = http.request(options, (upstreamRes) => {
     // Rewrite Location header to proxy port
     const location = upstreamRes.headers.location;
-    if (location && location.includes(`localhost:${upstreamPort}`)) {
+    if (location && location.includes(`localhost:${target.port}`)) {
       upstreamRes.headers.location = location.replace(
-        `localhost:${upstreamPort}`,
+        `localhost:${target.port}`,
         `localhost:${PROXY_PORT}`,
       );
     }
@@ -55,7 +55,7 @@ function proxyRequest(upstreamPort, req, res) {
   });
 
   proxy.on("error", (err) => {
-    console.error(`Proxy error (-> :${upstreamPort}):`, err.message);
+    console.error(`Proxy error (-> ${target.host}:${target.port}):`, err.message);
     res.writeHead(502, { "Content-Type": "text/plain" });
     res.end(`Bad Gateway: ${err.message}`);
   });
@@ -67,14 +67,14 @@ function proxyRequest(upstreamPort, req, res) {
 const server = http.createServer((req, res) => {
   const target = routeTarget(req.url);
   req.url = target.path;
-  proxyRequest(target.port, req, res);
+  proxyRequest(target, req, res);
 });
 
 // ── WebSocket proxy ──────────────────────────────────────────
 server.on("upgrade", (req, socket, head) => {
   const target = routeTarget(req.url.replace(/^http:/, "ws:"));
   const proxy = http.request({
-    hostname: BACKEND_HOST,
+    hostname: target.host,
     port: target.port,
     path: target.path,
     method: "GET",
@@ -94,7 +94,7 @@ server.on("upgrade", (req, socket, head) => {
   });
 
   proxy.on("error", (err) => {
-    console.error(`WS proxy error (-> :${target.port}):`, err.message);
+    console.error(`WS proxy error (-> ${target.host}:${target.port}):`, err.message);
     socket.destroy();
   });
 
@@ -104,8 +104,8 @@ server.on("upgrade", (req, socket, head) => {
 // ── Start ────────────────────────────────────────────────────
 server.listen(PROXY_PORT, "0.0.0.0", () => {
   console.log(`Proxy listening on :${PROXY_PORT}`);
-  console.log(`  /api/platform/* → :${PLATFORM_PORT}/api/*`);
-  console.log(`  /api/v1/*       → :${DEEPTUTOR_PORT}/api/v1/*`);
-  console.log(`  /ws/*           → :${DEEPTUTOR_PORT}/ws/* (WebSocket)`);
-  console.log(`  everything else → :${FRONTEND_PORT} (Next.js)`);
+  console.log(`  /api/platform/* → ${PLATFORM_HOST}:${PLATFORM_PORT}/api/*`);
+  console.log(`  /api/v1/*       → 127.0.0.1:${DEEPTUTOR_PORT}/api/v1/*`);
+  console.log(`  /ws/*           → 127.0.0.1:${DEEPTUTOR_PORT}/ws/* (WebSocket)`);
+  console.log(`  everything else → 127.0.0.1:${FRONTEND_PORT} (Next.js)`);
 });

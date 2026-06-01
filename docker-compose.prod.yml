@@ -32,7 +32,7 @@ services:
   # Ollama — MiniCPM-v4.6 Q4_K_M (OCR/vision)
   # ============================================
   ollama:
-    image: ollama/ollama:latest
+    image: ollama/ollama:0.30.0-rc31
     container_name: ollama
     restart: unless-stopped
     ports:

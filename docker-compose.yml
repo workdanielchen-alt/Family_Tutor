@@ -38,7 +38,7 @@ services:
     environment:
       - PLATFORM_URL=http://platform:8100
       - PLATFORM_API_URL=http://platform:8100
-      - FRONTEND_PORT=3790
+      - FRONTEND_PORT=3782
     ports:
       - "${DEEPTUTOR_DOCKER_BACKEND_PORT:-8001}:${DEEPTUTOR_DOCKER_BACKEND_PORT:-8001}"
       - "${DEEPTUTOR_DOCKER_FRONTEND_PORT:-3782}:${DEEPTUTOR_DOCKER_FRONTEND_PORT:-3782}"
@@ -106,6 +106,7 @@ services:
       # Shared hermes_agent identity data (/opt/data/ inside hermes_agent → ./data/hermes → /data/hermes)
       - ./data/knowledge_bases:/data/knowledge_bases
       - ./data/hermes:/data/hermes
+      - ./data/quiz_sessions:/data/quiz_sessions
     depends_on:
       deeptutor:
         condition: service_started

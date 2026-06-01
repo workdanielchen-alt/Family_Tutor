@@ -42,15 +42,18 @@ import uvicorn
 from domains.curriculum import load as load_curriculum
 from domains.tutoring.mastery import (
     _load,
+    add_points,
     generate_daily_report,
     generate_parent_report,
     get_answer_history,
     get_due_reviews,
     get_mastery,
     get_monthly_stats,
+    get_motivation_info,
     get_weekly_stats,
     get_wrong_answers,
     schedule_review,
+    update_streak,
     update_mastery,
     weak_points,
 )
@@ -165,6 +168,43 @@ _last_question_text: dict[str, str] = {}
 # current teaching session.  Used as fallback completion detection when OCR
 # failed to detect total_questions (regex didn't match any numbered items).
 _session_answered_count: dict[str, int] = {}
+
+# Fatigue/attention management: tracks current teaching session start time.
+_session_start_time: dict[str, float] = {}
+# Learners who just resumed from a break — skip fatigue check for 1 turn.
+_just_resumed: set[str] = set()
+
+_FATIGUE_THRESHOLDS = {
+    "primary_low": {"questions": 5, "minutes": 15},
+    "primary_high": {"questions": 10, "minutes": 25},
+    "middle": {"questions": 15, "minutes": 35},
+}
+
+# Hint Ladder: per-question hint level (0-3) per learner.
+# Key format: "{learner_id}:{question_index}" → int (0-3).
+# 0=方向引导, 1=方法提示, 2=概念讲解, 3=完整解析.
+_hint_levels: dict[str, int] = {}
+
+
+def _hint_key(learner_id: str, question_idx: int) -> str:
+    return f"{learner_id}:{question_idx}"
+
+
+def _get_hint_level(learner_id: str, question_idx: int) -> int:
+    return _hint_levels.get(_hint_key(learner_id, question_idx), 0)
+
+
+def _advance_hint_level(learner_id: str, question_idx: int) -> None:
+    """Wrong answer → advance hint level (capped at 3)."""
+    key = _hint_key(learner_id, question_idx)
+    current = _hint_levels.get(key, 0)
+    if current < 3:
+        _hint_levels[key] = current + 1
+
+
+def _reset_hint_level(learner_id: str, question_idx: int) -> None:
+    """Correct answer or new question → reset hint level to 0."""
+    _hint_levels.pop(_hint_key(learner_id, question_idx), None)
 
 # Chinese-to-Arabic numeral mapping for question-number normalization.
 # DT's LLM sometimes outputs "第一题" instead of "第1题" — this table
@@ -1939,6 +1979,19 @@ def _fallback_placeholder(file_path: str, ext: str) -> dict:
     }
 
 
+def _infer_grade(content: str) -> str:
+    """从 OCR 文本推断年级标签。"""
+    if not content:
+        return ""
+    if any(kw in content for kw in ("一年级", "二年级", "三年级", "1年级", "2年级", "3年级", "小学一年级", "小学二年级", "小学三年级")):
+        return "primary_low"
+    if any(kw in content for kw in ("四年级", "五年级", "六年级", "4年级", "5年级", "6年级", "小学四年级", "小学五年级", "小学六年级")):
+        return "primary_high"
+    if any(kw in content for kw in ("七年级", "八年级", "九年级", "初一", "初二", "初三", "7年级", "8年级", "9年级", "初中")):
+        return "middle"
+    return ""
+
+
 async def _ingest_to_kb(
     provider,
     content: str,
@@ -1947,17 +2000,32 @@ async def _ingest_to_kb(
     learner_id: str,
     source: str,
     trace_id: str,
+    subject: str = "",
 ) -> None:
-    """异步将提取的文本内容入库平台 ChromaDB + DT LlamaIndex 向量索引."""
+    """异步将提取的文本内容入库平台 ChromaDB + DT LlamaIndex 向量索引.
+
+    v2: 增强 metadata，支持按 type/subject/grade 过滤检索。
+    入库时优先生成教学摘要（v3），失败时回退到原文本。
+    """
     if not content or not content.strip():
         return
+
+    # Detect subject & grade from content for metadata enrichment.
+    _detected_subject = subject or _detect_exam_subject(content[:2000])
+    _detected_grade = _infer_grade(content[:2000])
+
+    # v3: Generate teaching summary for pedagogical value.
+    # Async, best-effort — if it fails, fall back to raw OCR text.
+    _teaching_summary = await _generate_teaching_summary(content, _detected_subject, trace_id)
+    _indexed_content = _teaching_summary if _teaching_summary else content
+    _content_type = "teaching_summary" if _teaching_summary else "raw_ocr"
 
     # ── Step 1: 平台 ChromaDB (用内容 hash 做 ID, 同内容自动覆盖不重复) ──
     try:
         import hashlib
 
-        _content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
-        docs = _split_content_for_ingest(content, filename)
+        _content_hash = hashlib.sha256(_indexed_content.encode("utf-8")).hexdigest()[:16]
+        docs = _split_content_for_ingest(_indexed_content, filename)
         ids = [f"{_content_hash}_{i}" for i in range(len(docs))]
         metadatas = [
             {
@@ -1965,6 +2033,9 @@ async def _ingest_to_kb(
                 "learner_id": learner_id,
                 "source": source,
                 "trace_id": trace_id,
+                "type": _content_type,
+                "subject": _detected_subject,
+                "grade": _detected_grade,
             }
             for _ in docs
         ]
@@ -1976,11 +2047,14 @@ async def _ingest_to_kb(
             ids=ids,
         )
         logger.info(
-            "[%s] KB ingest: %d chunks -> %s (%d chars total)",
+            "[%s] KB ingest: %d chunks -> %s (%d chars) type=%s subject=%s grade=%s",
             trace_id,
             len(docs),
             kb_name,
-            len(content),
+            len(_indexed_content),
+            _content_type,
+            _detected_subject,
+            _detected_grade,
         )
     except Exception as exc:
         logger.warning("[%s] KB ingest error for %s: %s", trace_id, filename, exc)
@@ -2078,6 +2152,77 @@ def _split_content_for_ingest(content: str, filename: str, chunk_size: int = 500
         return final
 
     return chunks if chunks else [content]
+
+
+async def _generate_teaching_summary(
+    content: str,
+    subject: str,
+    trace_id: str,
+) -> str | None:
+    """用 LLM 将 OCR 题目文本转化为结构化教学摘要。
+
+    返回格式:
+        ## 【知识点】{name}
+        - **年级**：{grade}
+        - **概念**：{definition}
+        - **易错点**：{common_mistake}
+        - **教学提示**：{teaching_tip}
+
+    异步执行，失败返回 None，不影响主流程。
+    """
+    api_key = os.getenv("DEEPSEEK_API_KEY", "")
+    if not api_key or not content.strip():
+        return None
+
+    _prompt = f"""你是一个 K9 教学专家。以下是一道题目（OCR 提取的文本）。请完成以下任务：
+
+1. 提取题目涉及的主要知识点
+2. 生成结构化教学摘要
+
+规则：
+- 不要输出答案（不要写"正确答案是X"）
+- 用 K9 学生能理解的语言
+- 如果涉及多个知识点，只列主要知识点
+- 只输出教学摘要，不要额外说明
+
+输出格式：
+## 【知识点】{{知识点名称}}
+- **年级**：{{年级}}
+- **概念**：{{一句话定义}}
+- **易错点**：{{常见错误}}
+- **教学提示**：{{引导建议}}
+
+题目内容：
+{content[:2000]}
+"""
+    try:
+        payload = {
+            "model": os.getenv("LLM_MODEL", "deepseek-v4-flash"),
+            "messages": [
+                {"role": "system", "content": "你是 K9 教学专家，输出结构化教学摘要。"},
+                {"role": "user", "content": _prompt},
+            ],
+            "temperature": 0.3,
+            "max_tokens": 1024,
+        }
+        async with httpx.AsyncClient(timeout=15) as _c:
+            _resp = await _c.post(
+                "https://api.deepseek.com/v1/chat/completions",
+                json=payload,
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            if _resp.status_code == 200:
+                _summary = _resp.json()["choices"][0]["message"]["content"].strip()
+                if len(_summary) > 50:
+                    logger.info(
+                        "[%s] Teaching summary generated (%d chars) for subject=%s",
+                        trace_id, len(_summary), subject,
+                    )
+                    return _summary
+        return None
+    except Exception as exc:
+        logger.warning("[%s] Teaching summary generation failed: %s", trace_id, exc)
+        return None
 
 
 def _generate_trace_id() -> str:
@@ -3649,6 +3794,56 @@ _TEACHER_SOUL = """# Soul
 
 ---
 
+### 元认知引导指令
+
+出题后的引导问题优先使用以下三类（每次选一类，不要全部）：
+
+**类型 A — 知识点识别（推荐首次使用）**
+- "这道题考的是哪个知识点？"
+- "这种题型你在哪里见过？"
+- "解这道题需要用到什么公式或概念？"
+
+**类型 B — 解题计划（学生不确定时使用）**
+- "先说说你打算怎么解这道题？"
+- "解这道题的第一步应该做什么？"
+- "题目给了你哪些条件？还差什么条件？"
+
+**类型 C — 方法联想（与相关错题关联时使用）**
+- "还记得我们之前做类似题时用的方法吗？"
+- "这道题和 [关联知识点] 有什么联系？"
+
+使用规则：
+- 每次 FIRST_QUESTION 只选一类，轮流使用
+- 类型 C 只有 SOUL.md 中有"相关错题记录"时才使用
+- 如果学生已经回答了元认知问题 → 评判思路对错即可，不要追问
+- 如果学生说"不知道" → 换成更具体的问题，不要追问"为什么不知道"
+
+---
+
+### 提示阶梯指令（按 hint_level 执行）
+
+学生当前 hint_level 为 {hint_level}（0-3 共 4 级）。根据级别执行对应策略，**不要越级**。
+
+**Level 0 — 方向引导（默认）**
+- 问解题方向、概念理解、方法选择
+- "这道题考的是什么知识点？"
+- "想想看应该用什么方法？"
+
+**Level 1 — 方法提示（第 1 次答错后）**
+- 缩小范围，给出关键步骤提示
+- "注意：用某某概念来思考。先想第一步做什么？"
+
+**Level 2 — 概念讲解（第 2 次答错后）**
+- 回归基本概念 + 生活类比
+- 讲完概念后出一道更简单的基础变式题
+
+**Level 3 — 完整解析（第 3 次答错后）**
+- 直接展示完整解题过程，不需要再提问
+- 出一次同类变式题让学生试做
+- 如果学生仍不会，建议休息
+
+---
+
 ### [PHASE:EVALUATE_ANSWER] — 评判并推进
 
 你的角色：学生已回答，给出反馈 + 讲解 + 自动出下一题。
@@ -3809,17 +4004,20 @@ _curriculum_indexed: set[str] = set()  # track which subjects are indexed
 
 
 async def _ensure_curriculum_indexed(provider) -> None:
-    """Index curriculum chapters into ChromaDB (one-time per subject).
+    """Index individual knowledge points into ChromaDB (one-time per subject).
 
-    Each chapter becomes a document with its title, knowledge points, and
-    kp_ids embedded.  The "curriculum" collection is queried during teaching
-    to find which chapter best matches the current exam.
+    v2: KP-level indexing — each knowledge point is an independent document
+    with kp_id, importance, prerequisites, and description.  Enables precise
+    matching during teaching.
+
+    The "curriculum" collection is queried during teaching to find which
+    chapter / KP best matches the current exam.
     """
     # Skip if already indexed in this process lifetime.
     if _curriculum_indexed:
         return
 
-    # Check if ChromaDB already has curriculum docs (survives restarts).
+    # Check if ChromaDB already has KP-level curriculum docs.
     try:
         import chromadb
         from chromadb.config import Settings
@@ -3827,10 +4025,23 @@ async def _ensure_curriculum_indexed(provider) -> None:
             path="/data/chromadb",
             settings=Settings(anonymized_telemetry=False),
         )
-        if _c.get_or_create_collection(name="curriculum").count() > 0:
-            _curriculum_indexed.update(["math", "chemistry", "physics"])
-            logger.info("Curriculum already indexed in ChromaDB, skipping")
-            return
+        _coll = _c.get_or_create_collection(name="curriculum")
+        if _coll.count() > 0:
+            # Peek to see if we have KP-level (v2) or chapter-level (v1).
+            _sample = _coll.get(limit=1)
+            _metas = _sample.get("metadatas", []) if _sample else []
+            if _metas and _metas[0] and _metas[0].get("type") == "kp":
+                _curriculum_indexed.update(["math", "chemistry", "physics"])
+                logger.info("Curriculum already indexed (KP-level, v2), skipping")
+                return
+            # Old chapter-level index found: delete and re-index.
+            logger.info("Curriculum index is chapter-level (v1), re-indexing KP-level (v2)...")
+            try:
+                _coll.delete(where={"subject": {"$ne": ""}})  # delete all docs
+            except Exception:
+                # ChromaDB 1.5.x API compat: try alternative delete
+                _c.delete_collection("curriculum")
+                _coll = _c.get_or_create_collection(name="curriculum")
     except Exception:
         pass
 
@@ -3842,36 +4053,122 @@ async def _ensure_curriculum_indexed(provider) -> None:
             docs: list[str] = []
             metadatas: list[dict] = []
             ids: list[str] = []
+
             for grade in data.get("grades", []):
                 g_name = grade.get("name", "")
-                g_id = str(grade.get("id", ""))
                 for sem in grade.get("semesters", []):
                     s_name = sem.get("name", "")
-                    s_id = sem.get("id", "")
                     for ch in sem.get("chapters", []):
                         ch_title = ch.get("title", "")
                         ch_num = ch.get("number", "")
                         kps = ch.get("knowledge_points", [])
-                        kp_lines = [f"- {kp.get('name', '')}" for kp in kps]
-                        doc = (
-                            f"{data.get('title', subject)} / {g_name} / {s_name}\n"
-                            f"第{ch_num}章 {ch_title}\n"
-                            f"知识点：\n" + "\n".join(kp_lines)
-                        )
-                        docs.append(doc)
-                        metadatas.append({
-                            "subject": subject,
-                            "grade": g_name,
-                            "semester": s_name,
-                            "chapter": ch_title,
-                        })
-                        ch_id = f"{subject}/g{g_id}{s_id}/{ch.get('id', ch_num)}"
-                        ids.append(ch_id)
+                        for kp in kps:
+                            kp_id = kp.get("id", "")
+                            full_kp_id = f"{subject}/{ch.get('id', '')}/{kp_id}"
+                            prereqs = kp.get("prerequisites", [])
+                            prereq_str = ", ".join(prereqs) if prereqs else "无"
+
+                            doc = (
+                                f"## 知识点：{kp.get('name', '')}\n\n"
+                                f"{kp.get('description', '')}\n\n"
+                                f"**所属**：{g_name} {s_name} 第{ch_num}章 {ch_title}\n"
+                                f"**重要性**：{kp.get('importance', '基础')}\n"
+                                f"**前置知识**：{prereq_str}\n"
+                            )
+                            docs.append(doc)
+                            metadatas.append({
+                                "type": "kp",
+                                "subject": subject,
+                                "grade": g_name,
+                                "semester": s_name,
+                                "chapter": ch_title,
+                                "kp_id": full_kp_id,
+                                "kp_name": kp.get("name", ""),
+                                "importance": kp.get("importance", "基础"),
+                            })
+                            ids.append(f"kp/{full_kp_id}")
+
             if docs:
                 await provider.add_documents("curriculum", docs, metadatas, ids)
-                logger.info("Curriculum indexed: %s (%d chapters)", subject, len(docs))
+                logger.info("Curriculum indexed (KP-level): %s (%d KPs)", subject, len(docs))
         except Exception as exc:
             logger.warning("Curriculum indexing failed for %s: %s", subject, exc)
+
+
+def _check_fatigue(learner_id: str, grade_tag: str = "") -> int | None:
+    """检测当前会话是否达到疲劳阈值，返回已学习分钟数或 None。
+
+    Returns:
+        int (分钟数) — 超过阈值时返回
+        None — 未超过阈值（或刚恢复学习，跳过检测）
+    """
+    # Skip fatigue check for 1 turn after resume from break.
+    if learner_id in _just_resumed:
+        _just_resumed.discard(learner_id)
+        return None
+
+    _start = _session_start_time.get(learner_id)
+    if not _start:
+        return None
+
+    _grade = grade_tag or "primary_high"
+    _thresholds = _FATIGUE_THRESHOLDS.get(_grade, _FATIGUE_THRESHOLDS["primary_high"])
+
+    _elapsed_min = (time.time() - _start) / 60
+    _answered = _session_answered_count.get(learner_id, 0)
+
+    if _elapsed_min >= _thresholds["minutes"] or _answered >= _thresholds["questions"]:
+        return int(_elapsed_min)
+    return None
+
+
+async def _get_prerequisite_chain(
+    learner_id: str,
+    kp_id: str,
+    max_depth: int = 2,
+) -> list[dict]:
+    """从 curriculum 回溯先决知识链，返回符合条件的薄弱先决。
+
+    Returns:
+        [{kp_id, name, level, is_weak, depth}, ...]
+        sorted by depth ascending, limited to 5 items.
+    """
+    from domains.curriculum import find_knowledge_point
+
+    chain: list[dict] = []
+    visited: set[str] = set()
+    queue: list[tuple[str, int]] = [(kp_id, 0)]
+
+    while queue and len(chain) < 5:
+        current_kp, depth = queue.pop(0)
+        if current_kp in visited or depth > max_depth:
+            continue
+        visited.add(current_kp)
+
+        kp_data = find_knowledge_point(current_kp)
+        if not kp_data:
+            continue
+
+        # Check mastery for this KP (depth > 0 means it's a prerequisite).
+        _m = await asyncio.to_thread(get_mastery, learner_id, current_kp)
+        _level = _m.get("level", 0) if _m else 0
+
+        if depth > 0 and _level < 0.6:
+            chain.append({
+                "kp_id": current_kp,
+                "name": kp_data.get("name", current_kp.split("/")[-1]),
+                "level": _level,
+                "is_weak": _level < 0.6,
+                "depth": depth,
+            })
+
+        # Recurse into prerequisites (breadth-first).
+        for prereq in kp_data.get("prerequisites", []):
+            if prereq not in visited:
+                queue.append((prereq, depth + 1))
+
+    chain.sort(key=lambda x: (x["depth"], x["level"]))
+    return chain
 
 
 async def _build_teaching_persona(
@@ -3885,6 +4182,9 @@ async def _build_teaching_persona(
     skip HTTP PATCH if the persona hasn't changed from the previous build.
     """
     _persona = _TEACHER_EXPLAIN_SOUL if mode == "explain" else _TEACHER_SOUL
+    # Replace hint_level placeholder with current value (for Hint Ladder).
+    _hl = _get_hint_level(learner_id, _last_question_num.get(learner_id, 0))
+    _persona = _persona.replace("{hint_level}", str(_hl))
     _exam = context.strip()[:8000]
     _subject = _detect_exam_subject(context) if _exam else os.getenv("DOMAINS_SUBJECT", "math")
 
@@ -3956,43 +4256,69 @@ async def _build_teaching_persona(
             f"请完全专注于以下内容：\n\n{_exam}\n"
         )
 
-    # Inject the relevant curriculum chapter (not the whole syllabus).
-    # ChromaDB stores each chapter as a document with metadata {subject, grade}.
-    # Query with exam text to find the best-matching chapter for the current exam.
+    # Inject the relevant curriculum chapter / knowledge point.
+    # v2: KP-level index — query returns individual knowledge points.
     try:
         provider = await _get_provider()
         await _ensure_curriculum_indexed(provider)
-        _chapter_results = await provider.query("curriculum", [_exam], n_results=1)
+        _chapter_results = await provider.query("curriculum", [_exam], n_results=3)
         if _chapter_results:
             _ch = _chapter_results[0]
             _ch_content = (_ch.get("content") or "").strip()
             if _ch_content:
                 _persona += "\n\n### 相关课程章节\n" + _ch_content + "\n"
+
+            # If the result is KP-level, extract kp_id for possible KB cross-query.
+            _kp_meta = _ch.get("metadata", {})
+            if _kp_meta.get("type") == "kp":
+                _matched_kp_id = _kp_meta.get("kp_id", "")
+                if _matched_kp_id:
+                    _persona += f"<!-- kp_id:{_matched_kp_id} -->\n"
     except Exception:
         logger.debug("Curriculum chapter lookup failed, continuing")
 
     # Inject relevant knowledge from KB to supplement teaching.
-    # Query ChromaDB for content related to the exam topic, excluding the
-    # exam itself (skip results with high semantic similarity to context).
+    # v2: Use metadata filtering (subject + grade) instead of distance threshold.
+    # Priority: teaching_summary type first, then raw_ocr with matching subject.
     try:
         logger.debug("KB section ENTERED for %s", learner_id)
         provider = await _get_provider()
-        _kb_results = await provider.query("tutoring", [_exam], n_results=5)
+        _kb_results = await provider.query("tutoring", [_exam], n_results=10)
         _kb_found = []
         if _exam:
+            # Pass 1: prefer teaching_summary entries matching current subject.
             for _doc_item in _kb_results:
-                _dc = _doc_item.get("content", "").strip()[:200]
-                _dist = _doc_item.get("distance", 1.0)
+                _dc = _doc_item.get("content", "").strip()[:500]
+                _meta = _doc_item.get("metadata", {})
                 if not _dc:
                     continue
-                # Skip near-duplicates: distance < 0.6 means high semantic
-                # similarity to the current exam (ChromaDB L2, lower = more
-                # similar).  Prevents injecting exam content-with-answers.
-                if _dist < 0.6:
-                    continue
-                _kb_found.append(_dc)
-                if len(_kb_found) >= 3:
-                    break
+                if _meta.get("type") == "teaching_summary" and _meta.get("subject") == _subject:
+                    _kb_found.append(_dc)
+                    if len(_kb_found) >= 3:
+                        break
+            # Pass 2: fall back to raw_ocr with matching subject (no distance filter).
+            if not _kb_found:
+                for _doc_item in _kb_results:
+                    _dc = _doc_item.get("content", "").strip()[:200]
+                    _meta = _doc_item.get("metadata", {})
+                    if not _dc:
+                        continue
+                    if _meta.get("subject") == _subject and _meta.get("type") != "teaching_summary":
+                        _kb_found.append(_dc)
+                        if len(_kb_found) >= 3:
+                            break
+            # Pass 3: last resort — any content (skip near-duplicates by distance).
+            if not _kb_found:
+                for _doc_item in _kb_results:
+                    _dc = _doc_item.get("content", "").strip()[:200]
+                    _dist = _doc_item.get("distance", 1.0)
+                    if not _dc:
+                        continue
+                    if _dist < 0.6:
+                        continue
+                    _kb_found.append(_dc)
+                    if len(_kb_found) >= 3:
+                        break
         if _kb_found:
             _persona += (
                 "\n### 相关知识库参考\n以下是与当前教学内容相关的背景知识点，可用于辅助讲解：\n"
@@ -4064,6 +4390,78 @@ async def _build_teaching_persona(
                             _persona += f"- {_q}（知识点：{_kp}，学生回答：{_sa}，正确答案：{_ca}）\n"
     except Exception:
         logger.debug("Weak points lookup failed for %s, continuing", learner_id)
+
+    # ── Prerequisite backtracking: check if current weak KP has weak foundations ──
+    try:
+        _current_kp_id = _kp_names.get(learner_id, "")
+        if _current_kp_id and _current_kp_id.startswith(_subject + "/"):
+            _prereq_chain = await _get_prerequisite_chain(learner_id, _current_kp_id, max_depth=2)
+            if _prereq_chain:
+                _lines = [
+                    "\n### 先决知识检测\n"
+                    "学生在当前知识点上遇到困难，以下先决基础需要确认："
+                ]
+                for _p in _prereq_chain:
+                    _pct = int(_p["level"] * 100)
+                    _lines.append(
+                        f"- {_p['name']}（掌握度 {_pct}%）"
+                        f"{' ⚠️ 需要优先巩固' if _p['level'] < 0.4 else ' 💪 建议复习'}"
+                    )
+                _lines.append(
+                    "\n如果以上基础薄弱，请先引导学生巩固基础后再回到原题。"
+                )
+                _persona += "\n" + "\n".join(_lines) + "\n"
+    except Exception:
+        logger.debug("Prerequisite check failed for %s, continuing", learner_id)
+
+    # ── Fatigue/attention check — inject session duration info ──
+    try:
+        _elapsed = _check_fatigue(learner_id, _grade_tag)
+        if _elapsed:
+            _persona += (
+                f"\n### 注意力提示\n"
+                f"当前会话已持续 {_elapsed} 分钟，已完成 "
+                f"{_session_answered_count.get(learner_id, 0)} 道题。\n"
+                f"如果学生表现出疲劳迹象（回答变慢、频繁要求重读），主动建议休息。\n"
+            )
+    except Exception:
+        pass
+
+    # ── K9 Motivational info injection ──
+    try:
+        _mi = get_motivation_info(learner_id)
+        if _mi["points"] > 0 or _mi["streak_current"] > 0:
+            _motivation_lines = [
+                "\n## 激励信息（学生学习动力参考）",
+            ]
+            if _mi["streak_current"] > 0:
+                _motivation_lines.append(
+                    f"- 🔥 连续学习 {_mi['streak_current']} 天"
+                    f"（最长 {_mi['streak_longest']} 天）"
+                )
+            if _mi["level"] > 0:
+                _xp = _mi["xp_to_next"]
+                _motivation_lines.append(
+                    f"- ⭐ Lv.{_mi['level']}（还差 {_xp} 分升级）"
+                )
+            if _mi["weekly_accuracy"] > 0:
+                _trend = ""
+                if _mi["last_week_accuracy"] > 0:
+                    _diff = _mi["weekly_accuracy"] - _mi["last_week_accuracy"]
+                    if _diff > 0:
+                        _trend = f" ↑ 比上周进步 {_diff}%"
+                    elif _diff < 0:
+                        _trend = f" ↓ 比上周下降 {abs(_diff)}%"
+                _motivation_lines.append(
+                    f"- 📊 本周正确率 {_mi['weekly_accuracy']}%{_trend}"
+                )
+            if _mi["achievement_count"] > 0:
+                _motivation_lines.append(
+                    f"- 🏆 已获得 {_mi['achievement_count']} 个成就"
+                )
+            _persona += "\n" + "\n".join(_motivation_lines) + "\n"
+    except Exception:
+        pass
 
     return _persona
 
@@ -4452,6 +4850,53 @@ def _match_answers(student: str, correct: str) -> bool:
     c_clean = re.sub(r"[.。，,、\s单位个只条约根种]+$", "", c)
     if s_clean and c_clean and s_clean == c_clean:
         return True
+
+
+def _match_answers_semantic(student: str, correct: str) -> bool:
+    """Partial match detection — student has the right idea but not exact.
+
+    Returns True if the student's answer is semantically "close" to correct:
+    - Option prefix matches (选B vs B → option-level match)
+    - Partial number overlap (至少一半关键数字匹配)
+    - Key concept terms present but answer incomplete
+    """
+    s = student.strip().lower()
+    c = correct.strip().lower()
+    if not s or not c:
+        return False
+    if s == c:
+        return False  # exact match handled by _match_answers, not here
+
+    # Rule 1: Option prefix match (学生说"选B" vs 正确答案"B")
+    _opt_s = re.findall(r"^选?([a-dA-D])$|\(?([a-dA-D])\)?$", s)
+    _opt_c = re.findall(r"^选?([a-dA-D])$|\(?([a-dA-D])\)?$", c)
+    if _opt_s and _opt_c:
+        _s_letter = (_opt_s[0][0] or _opt_s[0][1]).upper()
+        _c_letter = (_opt_c[0][0] or _opt_c[0][1]).upper()
+        if _s_letter == _c_letter:
+            return True  # matched at option level
+
+    # Rule 2: Partial numeric overlap (≥50% of numbers match)
+    _s_nums = set(re.findall(r"\d+", s))
+    _c_nums = set(re.findall(r"\d+", c))
+    if _s_nums and _c_nums:
+        _overlap = len(_s_nums & _c_nums)
+        if _overlap >= len(_c_nums) * 0.5:
+            return True
+
+    # Rule 3: Key concept term overlap (学生答了相关术语但结论不对)
+    # Common K9 math/chem key terms
+    _key_terms = {
+        "加", "减", "乘", "除", "等于", "大", "小", "正", "负",
+        "数", "和", "差", "积", "商", "解", "方程", "分式",
+        "分子", "分母", "倒数", "绝对", "平方", "根",
+    }
+    _s_terms = {t for t in _key_terms if t in s}
+    _c_terms = {t for t in _key_terms if t in c}
+    if _s_terms and _c_terms and _s_terms == _c_terms:
+        return True
+
+    return False
 
     # Handle "B)" / "(B)" / "选B" / "选项B" formats
     paren_m = re.match(r"^[(\[【]?([A-Da-d])[)\]】]?$", s)
@@ -4873,6 +5318,16 @@ async def _tutor_chat_core(
         if len(_last_tutor_context) > _MAX_CACHED_CONTEXTS:
             _last_tutor_context.clear()
         _save_context_to_disk(learner_id)
+        # ── Fatigue: new session starts now ──
+        if learner_id not in _session_start_time:
+            _session_start_time[learner_id] = time.time()
+
+    # 1a. Fatigue check: "累了/休息" resets session timer.
+    _msg_lower = message.strip().lower()
+    if _msg_lower and any(kw in _msg_lower for kw in ("累了", "休息", "不学了", "聊会天")):
+        _session_start_time.pop(learner_id, None)
+        _session_answered_count[learner_id] = 0
+        _just_resumed.discard(learner_id)
 
     # 1b. Resume context: student paused and came back.
     #     message has content (resume signal), context is empty, but we have
@@ -4881,6 +5336,9 @@ async def _tutor_chat_core(
         _qnum = _last_question_num.get(learner_id, 0)
         context = _last_tutor_context[learner_id]
         logger.info("[%s] Resume detected for %s (q%d), context restored", trace_id, learner_id, _qnum)
+        # Restart session timer on resume, but mark as just resumed.
+        _session_start_time[learner_id] = time.time()
+        _just_resumed.add(learner_id)
 
     # 2. Update SOUL.md with current exam context.
     #    DT re-reads SOUL.md on every system prompt build, so this is the
@@ -4931,20 +5389,27 @@ async def _tutor_chat_core(
     if message.strip() and learner_id in _answer_keys:
         _correct = _answer_keys[learner_id]
         _student = message.strip()
-        _is_correct = _match_answers(_student, _correct)
+        # Ternary scoring: exact → 1.0, partial → 0.5, wrong → 0.0
+        if _match_answers(_student, _correct):
+            _score = 1.0
+        elif _match_answers_semantic(_student, _correct):
+            _score = 0.5
+        else:
+            _score = 0.0
         _mastery_eval = {
-            "is_correct": _is_correct,
+            "score": _score,
+            "is_correct": _score >= 1.0,
             "student_answer": _student,
             "correct_answer": _correct,
         }
         _eval_kp = _kp_names.get(learner_id, "")
         logger.info(
-            "[%s] Platform eval: learner=%s student=%s correct=%s is_correct=%s kp=%s",
+            "[%s] Platform eval: learner=%s student=%s correct=%s score=%s kp=%s",
             trace_id,
             learner_id,
             _student,
             _correct,
-            _is_correct,
+            _score,
             _eval_kp,
         )
 
@@ -5244,6 +5709,7 @@ async def _tutor_chat_core(
         #   2. DT's self-eval marker [ANSWER:correct|wrong:kp_id]
         #   3. Extract correct answer from DT's explanation text (fragile)
         _do_eval = False
+        _score = 0.0
         _is_correct = False
         _correct_answer = ""
         _eval_kp_used = _kp_names.get(learner_id, "")
@@ -5251,13 +5717,15 @@ async def _tutor_chat_core(
         if _mastery_eval is not None:
             # Path 1: Step 2b had a stored answer key — use it
             _do_eval = True
-            _is_correct = bool(_mastery_eval["is_correct"])
+            _score = float(_mastery_eval.get("score", 1.0 if _mastery_eval["is_correct"] else 0.0))
+            _is_correct = _score >= 1.0
             _correct_answer = str(_mastery_eval.get("correct_answer", ""))
             _eval_kp_used = _eval_kp or _eval_kp_used
         elif _dt_eval_result:
             # Path 2: DT evaluated itself via [ANSWER:correct|wrong:kp_id]
             _do_eval = True
             _is_correct = _dt_eval_result == "correct"
+            _score = 1.0 if _is_correct else 0.0
             _correct_answer = _dt_eval_result  # placeholder, actual answer unknown
             if _dt_eval_kp:
                 _eval_kp_used = _dt_eval_kp
@@ -5272,14 +5740,21 @@ async def _tutor_chat_core(
             _correct_answer = _extract_correct_answer(content)
             if _correct_answer:
                 _student = message.strip()
-                _is_correct = _match_answers(_student, _correct_answer)
+                # Ternary scoring for extracted answers too
+                if _match_answers(_student, _correct_answer):
+                    _score = 1.0
+                elif _match_answers_semantic(_student, _correct_answer):
+                    _score = 0.5
+                else:
+                    _score = 0.0
+                _is_correct = _score >= 1.0
                 _do_eval = True
                 logger.info(
-                    "[%s] Extracted eval: student=%s correct=%s is_correct=%s kp=%s",
+                    "[%s] Extracted eval: student=%s correct=%s score=%s kp=%s",
                     trace_id,
                     message.strip(),
                     _correct_answer,
-                    _is_correct,
+                    _score,
                     _eval_kp_used,
                 )
 
@@ -5289,7 +5764,7 @@ async def _tutor_chat_core(
                 update_mastery,
                 learner_id,
                 _eval_kp_used,
-                _is_correct,
+                _score,
                 question=_last_question_text.get(learner_id, ""),
                 user_answer=message.strip(),
                 correct_answer=_correct_answer,
@@ -5307,6 +5782,25 @@ async def _tutor_chat_core(
                 _is_correct,
             )
 
+            # ── Hint Ladder: advance or reset based on ternary score ──
+            _q_idx = _last_question_num.get(learner_id, 0)
+            if _score >= 1.0:
+                _reset_hint_level(learner_id, _q_idx)
+            elif _score < 0.5:
+                _advance_hint_level(learner_id, _q_idx)
+            # 0.5 <= score < 1.0: partial — leave hint level unchanged
+                # Level 3 abort: inject give-full-solution instruction.
+                if _get_hint_level(learner_id, _q_idx) >= 3:
+                    _phase_abort_note = (
+                        "\n\n【系统指令】该题学生已多次答错（hint_level=3），"
+                        "请直接给出完整解题过程和正确答案，不要再提问。"
+                    )
+                    payload += _phase_abort_note
+                    logger.info(
+                        "[%s] Hint level 3 reached for %s q%d, direct solution injected",
+                        trace_id, learner_id, _q_idx,
+                    )
+
             # Auto-trigger exam generation when weak points accumulate.
             # Skipped if learner is actively working on a regular exam (user-sent).
             # Only covers weak points matching the current exam subject.
@@ -5319,6 +5813,17 @@ async def _tutor_chat_core(
                     _subject_weaks = [w for w in _all_weaks if not _exam_subj or w["kp_id"].startswith(_exam_subj + "/")]
                     if len(_subject_weaks) >= 3:
                         asyncio.create_task(_auto_generate_exam(learner_id, trace_id, kp_filter=_exam_subj))
+            except Exception:
+                pass
+
+            # ── K9 Motivation: streak + points ──
+            try:
+                if _do_eval:
+                    await asyncio.to_thread(update_streak, learner_id)
+                    if _score >= 1.0:
+                        await asyncio.to_thread(add_points, learner_id, 10)
+                    elif _score >= 0.5:
+                        await asyncio.to_thread(add_points, learner_id, 5)
             except Exception:
                 pass
 
@@ -5868,6 +6373,18 @@ async def api_update_mastery(learner_id: str, req: dict):
 @app.get("/api/mastery/{learner_id}/report")
 def api_get_report(learner_id: str):
     return generate_parent_report(learner_id)
+
+
+@app.get("/api/mastery/{learner_id}/motivation")
+async def api_get_motivation(learner_id: str):
+    """获取激励信息 (连续学习天数/积分/等级/成就)."""
+    try:
+        info = await asyncio.to_thread(get_motivation_info, learner_id)
+        return {"ok": True, **info}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "streak_current": 0, "points": 0, "level": 1,
+                "streak_longest": 0, "xp_to_next": 100, "achievement_count": 0,
+                "weekly_accuracy": 0, "last_week_accuracy": 0}
 
 
 @app.post("/api/report/generate")

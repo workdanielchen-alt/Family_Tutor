@@ -73,6 +73,7 @@ services:
       - ./data/uploads:/data/uploads
       - ./data/sources:/data/sources
       - ./data/hermes:/data/hermes
+      - ./data/quiz_sessions:/data/quiz_sessions
       - /var/run/docker.sock:/var/run/docker.sock:ro
     environment:
       - DEEPTUTOR_ENV=development

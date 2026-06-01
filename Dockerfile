@@ -229,7 +229,19 @@ stdout_logfile=/dev/fd/1
 stdout_logfile_maxbytes=0
 stderr_logfile=/dev/fd/2
 stderr_logfile_maxbytes=0
-environment=NODE_ENV="production"
+environment=NODE_ENV="production",FRONTEND_PORT="3783"
+
+[program:proxy]
+command=/usr/local/bin/node /app/scripts/frontend-proxy.mjs
+directory=/app
+autostart=true
+autorestart=true
+startsecs=5
+stdout_logfile=/dev/fd/1
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/fd/2
+stderr_logfile_maxbytes=0
+environment=NODE_ENV="production",PLATFORM_HOST="platform",PLATFORM_PORT="8100",PROXY_FRONTEND_PORT="3783",PROXY_PORT="3782"
 EOF
 
 RUN sed -i 's/\r$//' /etc/supervisor/conf.d/deeptutor.conf
@@ -262,7 +274,7 @@ set -e
 
 # Get the backend port (default to 8001)
 BACKEND_PORT=${BACKEND_PORT:-8001}
-FRONTEND_PORT=${FRONTEND_PORT:-3782}
+FRONTEND_PORT=${FRONTEND_PORT:-3783}
 AUTH_ENABLED=${NEXT_PUBLIC_AUTH_ENABLED:-${AUTH_ENABLED:-false}}
 case "$(echo "$AUTH_ENABLED" | tr '[:upper:]' '[:lower:]')" in
     1|true|yes|on) AUTH_ENABLED=true ;;
@@ -356,7 +368,7 @@ PY
 )"
 
 export BACKEND_PORT=${BACKEND_PORT:-8001}
-export FRONTEND_PORT=${FRONTEND_PORT:-3782}
+export FRONTEND_PORT=${FRONTEND_PORT:-3783}
 
 echo "📌 Backend Port: ${BACKEND_PORT}"
 echo "📌 Frontend Port: ${FRONTEND_PORT}"
@@ -449,7 +461,7 @@ stderr_logfile_maxbytes=0
 environment=PYTHONPATH="/app:/tutor_platform",PYTHONUNBUFFERED="1"
 
 [program:frontend]
-command=/bin/bash -c "cd /app/web && node node_modules/next/dist/bin/next dev -H 0.0.0.0 -p ${FRONTEND_PORT:-3782}"
+command=/bin/bash -c "cd /app/web && node node_modules/next/dist/bin/next dev -H 0.0.0.0 -p ${FRONTEND_PORT:-3783}"
 directory=/app/web
 autostart=true
 autorestart=true
@@ -458,7 +470,19 @@ stdout_logfile=/dev/fd/1
 stdout_logfile_maxbytes=0
 stderr_logfile=/dev/fd/2
 stderr_logfile_maxbytes=0
-environment=NODE_ENV="development"
+environment=NODE_ENV="development",FRONTEND_PORT="3783"
+
+[program:proxy]
+command=/usr/local/bin/node /app/scripts/frontend-proxy.mjs
+directory=/app
+autostart=true
+autorestart=true
+startsecs=5
+stdout_logfile=/dev/fd/1
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/fd/2
+stderr_logfile_maxbytes=0
+environment=NODE_ENV="development",PLATFORM_HOST="platform",PLATFORM_PORT="8100",PROXY_FRONTEND_PORT="3783",PROXY_PORT="3782"
 EOF
 
 RUN sed -i 's/\r$//' /etc/supervisor/conf.d/deeptutor.conf

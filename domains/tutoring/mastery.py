@@ -88,31 +88,54 @@ def get_mastery_summary(learner_id: str) -> list[dict[str, Any]]:
 def update_mastery(
     learner_id: str,
     kp_id: str,
-    correct: bool,
+    correct: bool | float = True,
     question: str = "",
     user_answer: str = "",
     correct_answer: str = "",
 ) -> dict[str, Any]:
-    """Record a mastery update for a knowledge point."""
+    """Record a mastery update for a knowledge point.
+
+    ``correct`` accepts:
+    - ``True`` / ``1.0`` — completely correct
+    - ``0.5`` — partially correct (right idea, wrong execution)
+    - ``False`` / ``0.0`` — completely wrong
+
+    Backward compatible: old callers passing ``True``/``False`` still work.
+    """
     data = _load(learner_id)
     os.makedirs(MASTERY_DIR, exist_ok=True)
 
+    # Normalize score: bool → float.
+    if isinstance(correct, bool):
+        _score = 1.0 if correct else 0.0
+    else:
+        _score = max(0.0, min(1.0, float(correct)))
+
+    _is_correct_bool = _score >= 1.0
+    _is_partial = 0.0 < _score < 1.0
+    _is_wrong = _score < 0.5  # < 0.5 counts as wrong for wrong_answers
+
     if kp_id not in data["mastery"]:
-        data["mastery"][kp_id] = {"level": 0.0, "total": 0, "correct": 0}
+        data["mastery"][kp_id] = {"level": 0.0, "total": 0, "correct": 0, "partial": 0, "wrong": 0}
 
     kp = data["mastery"][kp_id]
     kp["total"] += 1
-    if correct:
+    if _is_correct_bool:
         kp["correct"] += 1
-    # Level = accuracy
-    kp["level"] = kp["correct"] / kp["total"] if kp["total"] > 0 else 0.0
+    elif _is_partial:
+        kp["partial"] = kp.get("partial", 0) + 1
+    else:
+        kp["wrong"] = kp.get("wrong", 0) + 1
+    # Weighted level: correct=1, partial=0.5, wrong=0
+    _weighted = (kp["correct"] * 1.0 + kp.get("partial", 0) * 0.5) / kp["total"] if kp["total"] > 0 else 0.0
+    kp["level"] = round(_weighted, 2)
 
     data["total_questions"] += 1
-    if correct:
+    if _is_correct_bool:
         data["correct_count"] += 1
 
-    # Track wrong answers
-    if not correct:
+    # Track wrong answers (only completely wrong answers, not partial).
+    if _is_wrong:
         data["wrong_answers"].append({
             "kp_id": kp_id,
             "question": question,
@@ -130,7 +153,8 @@ def update_mastery(
         "question": question,
         "user_answer": user_answer,
         "correct_answer": correct_answer,
-        "is_correct": correct,
+        "is_correct": _is_correct_bool,
+        "score": _score,
         "ts": time.time(),
     })
     if len(data["answer_history"]) > 200:
@@ -139,11 +163,13 @@ def update_mastery(
     # Daily stats
     today = date.today().isoformat()
     if today not in data["daily_stats"]:
-        data["daily_stats"][today] = {"total": 0, "correct": 0, "wrong": 0, "weak_points": []}
+        data["daily_stats"][today] = {"total": 0, "correct": 0, "wrong": 0, "partial": 0, "weak_points": []}
     ds = data["daily_stats"][today]
     ds["total"] += 1
-    if correct:
+    if _is_correct_bool:
         ds["correct"] += 1
+    elif _is_partial:
+        ds["partial"] = ds.get("partial", 0) + 1
     else:
         ds["wrong"] += 1
         if kp_id not in ds["weak_points"]:
@@ -287,6 +313,156 @@ def get_monthly_stats(learner_id: str) -> dict[str, Any]:
         "correct": correct,
         "wrong": wrong,
         "accuracy": round(correct / total, 2) if total > 0 else 0,
+    }
+
+
+# ── K9 Motivational System ─────────────────────────────────────
+
+
+def _today_str() -> str:
+    return date.today().isoformat()
+
+
+def _get_level(points: int) -> int:
+    """Return learning level: floor(sqrt(points/100)) + 1, capped at 100."""
+    return min(100, int((points / 100) ** 0.5) + 1) if points > 0 else 1
+
+
+def _get_xp_to_next(points: int) -> int:
+    """Return XP needed for next level."""
+    level = _get_level(points)
+    next_level_points = (level ** 2) * 100
+    return next_level_points - points
+
+
+_ACHIEVEMENT_DEFS: list[dict] = [
+    {"id": "first_answer",     "name": "第一次答题",     "condition": lambda d: d.get("total_questions", 0) >= 1,                "points": 10},
+    {"id": "ten_answers",      "name": "答题数破10",    "condition": lambda d: d.get("total_questions", 0) >= 10,              "points": 20},
+    {"id": "fifty_answers",    "name": "答题数破50",    "condition": lambda d: d.get("total_questions", 0) >= 50,              "points": 50},
+    {"id": "streak_3",         "name": "连续学习3天",   "condition": lambda d: d.get("streak", {}).get("current", 0) >= 3,     "points": 30},
+    {"id": "streak_7",         "name": "学习满一周",     "condition": lambda d: d.get("streak", {}).get("current", 0) >= 7,    "points": 50},
+    {"id": "weak_point_first", "name": "首次攻克薄弱点", "condition": lambda d: _check_weak_point_conquered(d),              "points": 40},
+    {"id": "perfect_session",  "name": "全对的一天",    "condition": lambda d: _check_perfect_session(d),                     "points": 30},
+    {"id": "mastery_90",       "name": "掌握度突破90%", "condition": lambda d: any(k["level"] >= 0.9 for k in d.get("mastery", {}).values()), "points": 50},
+    {"id": "five_days_week",   "name": "每周学习5天",   "condition": lambda d: _check_weekly_days(d, 5),                      "points": 60},
+]
+
+
+def _check_weak_point_conquered(data: dict) -> bool:
+    """Check if any weak point (< 0.6) has been conquered (>= 0.6)."""
+    for kp_id, kp in data.get("mastery", {}).items():
+        if kp.get("level", 0) >= 0.6 and kp.get("total", 0) >= 3:
+            return True
+    return False
+
+
+def _check_perfect_session(data: dict) -> bool:
+    """Check if today was a perfect session (all correct, >= 3 questions)."""
+    today = _today_str()
+    ds = data.get("daily_stats", {}).get(today, {})
+    total = ds.get("total", 0)
+    correct = ds.get("correct", 0)
+    return total >= 3 and correct == total
+
+
+def _check_weekly_days(data: dict, target: int) -> bool:
+    """Check if learner studied at least ``target`` days this week."""
+    today = date.today()
+    monday = today - timedelta(days=today.weekday())
+    days_count = 0
+    for i in range((today - monday).days + 1):
+        day_str = (monday + timedelta(days=i)).isoformat()
+        ds = data.get("daily_stats", {}).get(day_str, {})
+        if ds.get("total", 0) > 0:
+            days_count += 1
+    return days_count >= target
+
+
+def update_streak(learner_id: str) -> None:
+    """Update consecutive-study streak. Call after each teaching interaction."""
+    data = _load(learner_id)
+    today = _today_str()
+    streak = data.setdefault("streak", {})
+    last = streak.get("last_active", "")
+
+    if last == today:
+        _save(data)
+        return
+
+    if last == (date.today() - timedelta(days=1)).isoformat():
+        streak["current"] = streak.get("current", 0) + 1
+    elif last != today:
+        streak["current"] = 1
+
+    streak["longest"] = max(streak.get("longest", 0), streak["current"])
+    streak["last_active"] = today
+
+    data["points"] = data.get("points", 0) + 5
+    data["level"] = _get_level(data["points"])
+    _check_achievements(data)
+    _save(data)
+
+
+def add_points(learner_id: str, amount: int) -> None:
+    """Add learning points."""
+    data = _load(learner_id)
+    data["points"] = data.get("points", 0) + amount
+    data["level"] = _get_level(data["points"])
+    _check_achievements(data)
+    _save(data)
+
+
+def _check_achievements(data: dict) -> list[str]:
+    """Check and unlock achievements. Returns newly unlocked IDs."""
+    unlocked = data.setdefault("achievements", [])
+    unlocked_ids = {a["id"] for a in unlocked}
+    newly_unlocked: list[str] = []
+
+    for ach in _ACHIEVEMENT_DEFS:
+        if ach["id"] in unlocked_ids:
+            continue
+        try:
+            if ach["condition"](data):
+                unlocked.append({"id": ach["id"], "name": ach["name"], "unlocked_at": time.time()})
+                unlocked_ids.add(ach["id"])
+                newly_unlocked.append(ach["id"])
+                data["points"] = data.get("points", 0) + ach["points"]
+        except Exception:
+            continue
+
+    if newly_unlocked:
+        data["level"] = _get_level(data["points"])
+        logger.info("Achievements unlocked for %s: %s", data.get("learner_id"), newly_unlocked)
+    return newly_unlocked
+
+
+def get_motivation_info(learner_id: str) -> dict:
+    """Get motivational info for SOUL.md injection."""
+    data = _load(learner_id)
+    streak = data.get("streak", {})
+    points = data.get("points", 0)
+    level = _get_level(points)
+    achievements = data.get("achievements", [])
+
+    weekly = get_weekly_stats(learner_id)
+    last_week_accuracy = 0
+    if weekly and weekly.get("total", 0) > 0:
+        lw_date = (date.today() - timedelta(days=7)).isoformat()
+        lw_ds = data.get("daily_stats", {}).get(lw_date, {})
+        lw_total = lw_ds.get("total", 0)
+        lw_correct = lw_ds.get("correct", 0)
+        if lw_total > 0:
+            last_week_accuracy = round(lw_correct / lw_total * 100)
+
+    return {
+        "streak_current": streak.get("current", 0),
+        "streak_longest": streak.get("longest", 0),
+        "points": points,
+        "level": level,
+        "xp_to_next": _get_xp_to_next(points),
+        "achievement_count": len(achievements),
+        "weekly_accuracy": weekly.get("accuracy", 0) if weekly else 0,
+        "last_week_accuracy": last_week_accuracy,
     }
 
 

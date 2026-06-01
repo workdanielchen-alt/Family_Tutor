@@ -32,6 +32,10 @@ import {
   type AppLanguage,
 } from "@/context/app-shell-storage";
 
+export type UIMode = "standard" | "child";
+
+const UI_MODE_STORAGE_KEY = "deeptutor-ui-mode";
+
 interface AppShellContextValue {
   theme: Theme;
   setTheme: (theme: Theme) => void;
@@ -41,6 +45,8 @@ interface AppShellContextValue {
   setActiveSessionId: (sessionId: string | null) => void;
   sidebarCollapsed: boolean;
   setSidebarCollapsed: (collapsed: boolean) => void;
+  uiMode: UIMode;
+  setUiMode: (mode: UIMode) => void;
 }
 
 const AppShellContext = createContext<AppShellContextValue | null>(null);
@@ -56,12 +62,19 @@ export function AppShellProvider({ children }: { children: React.ReactNode }) {
   );
   // Always start expanded to match SSR; hydrate from localStorage after mount
   const [sidebarCollapsed, setSidebarCollapsedState] = useState<boolean>(false);
+  const [uiMode, setUiModeState] = useState<UIMode>("standard");
 
   useEffect(() => {
     // Hydrate client-only preferences after SSR-safe first render.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setLanguageState(readStoredLanguage());
     setSidebarCollapsedState(readStoredSidebarCollapsed());
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setUiModeState(
+      typeof window !== "undefined"
+        ? (localStorage.getItem(UI_MODE_STORAGE_KEY) as UIMode) || "standard"
+        : "standard"
+    );
   }, []);
 
   useEffect(() => {
@@ -134,6 +147,13 @@ export function AppShellProvider({ children }: { children: React.ReactNode }) {
     setSidebarCollapsedState(collapsed);
   }, []);
 
+  const setUiMode = useCallback((mode: UIMode) => {
+    if (typeof window !== "undefined") {
+      localStorage.setItem(UI_MODE_STORAGE_KEY, mode);
+    }
+    setUiModeState(mode);
+  }, []);
+
   const value = useMemo<AppShellContextValue>(
     () => ({
       theme,
@@ -144,6 +164,8 @@ export function AppShellProvider({ children }: { children: React.ReactNode }) {
       setActiveSessionId,
       sidebarCollapsed,
       setSidebarCollapsed,
+      uiMode,
+      setUiMode,
     }),
     [
       activeSessionId,
@@ -154,6 +176,8 @@ export function AppShellProvider({ children }: { children: React.ReactNode }) {
       setTheme,
       sidebarCollapsed,
       theme,
+      uiMode,
+      setUiMode,
     ],
   );
 

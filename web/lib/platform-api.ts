@@ -122,6 +122,32 @@ export async function fetchMonthlyStats(
 }
 
 
+export interface MotivationInfo {
+  streak_current: number;
+  streak_longest: number;
+  points: number;
+  level: number;
+  xp_to_next: number;
+  achievement_count: number;
+  weekly_accuracy: number;
+  last_week_accuracy: number;
+}
+
+export async function fetchMotivation(learnerId: string): Promise<MotivationInfo> {
+  const raw = await apiGet<any>(`/mastery/${learnerId}/motivation`);
+  return {
+    streak_current: raw.streak_current ?? 0,
+    streak_longest: raw.streak_longest ?? 0,
+    points: raw.points ?? 0,
+    level: raw.level ?? 1,
+    xp_to_next: raw.xp_to_next ?? 100,
+    achievement_count: raw.achievement_count ?? 0,
+    weekly_accuracy: raw.weekly_accuracy ?? 0,
+    last_week_accuracy: raw.last_week_accuracy ?? 0,
+  };
+}
+
+
 // ── Quiz Session (微信发卷→WEBUI答题) ──────────────────────
 
 export interface QuizSessionQuestion {
