@@ -108,13 +108,7 @@ import {
 import { downloadChatMarkdown } from "@/lib/chat-export";
 import type { SpaceMemoryFile } from "@/lib/space-items";
 import { fetchAllPendingQuizSessions, type PendingQuizSession } from "@/lib/platform-api";
-import {
-  startTeach,
-  continueTeach,
-  fetchAllPendingTeach,
-  fetchTeachSession,
-  type PendingTeachSession,
-} from "@/lib/platform-api";
+import { startTeach, continueTeach } from "@/lib/platform-api";
 import {
   selectedBooksToPayload,
   type SelectedBookReference,
@@ -312,7 +306,27 @@ export default function ChatPage() {
     newSession,
     loadSession,
     renameSessionTitle,
+    injectAssistantMessage,
   } = useUnifiedChat();
+
+  // ── 引导式教学：用 ref 避免渲染，纯作路由标记 ──
+  const teachSessionIdRef = useRef<string | null>(null);
+
+
+  // ── 待处理教学任务列表（仅用于空白页提示） ──
+  const [pendingTasks, setPendingTasks] = useState<
+    { session_id: string; source: "wechat" | "webui"; total_questions: number; current_question: number; first_question: string }[]
+  >([]);
+  const [showPendingTasks, setShowPendingTasks] = useState(false);
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch("/api/platform/teach/pending");
+        const data = await res.json();
+        if (data.ok) setPendingTasks(data.sessions ?? []);
+      } catch { /* ignore */ }
+    })();
+  }, []);
 
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBase[]>([]);
   const [llmOptions, setLLMOptions] = useState<LLMOption[]>([]);
@@ -624,70 +638,7 @@ export default function ChatPage() {
     return () => document.removeEventListener("visibilitychange", onVisible);
   }, [refreshPendingQuizzes]);
 
-  // ── Teach sessions (引导式教学) ───────────────────────────
-  const [pendingTeach, setPendingTeach] = useState<PendingTeachSession[]>([]);
-  const [teachSessionId, setTeachSessionId] = useState<string | null>(null);
-  const [teachConversation, setTeachConversation] = useState<
-    { role: "assistant" | "user"; content: string }[]
-  >([]);
-  const [teachLoading, setTeachLoading] = useState(false);
-  const [teachDone, setTeachDone] = useState(false);
-
-  const refreshPendingTeach = useCallback(async () => {
-    try {
-      const data = await fetchAllPendingTeach();
-      setPendingTeach(data.sessions ?? []);
-    } catch { /* ignore */ }
-  }, []);
-  useEffect(() => {
-    void refreshPendingTeach();
-    const onVisible = () => { if (document.visibilityState === "visible") void refreshPendingTeach(); };
-    document.addEventListener("visibilitychange", onVisible);
-    return () => document.removeEventListener("visibilitychange", onVisible);
-  }, [refreshPendingTeach]);
-
-  const startTeachSession = useCallback(async (sessionId: string) => {
-    try {
-      const data = await fetchTeachSession(sessionId);
-      if (!data.ok || !data.first_question) return;
-      setTeachSessionId(sessionId);
-      setTeachConversation([{ role: "assistant", content: data.first_question }]);
-      setTeachDone(false);
-    } catch { /* ignore */ }
-  }, []);
-
-  const submitTeachAnswer = useCallback(async (answer: string) => {
-    if (!teachSessionId || teachLoading) return;
-    setTeachLoading(true);
-    // 先追加用户答案到对话
-    setTeachConversation((prev) => [...prev, { role: "user", content: answer }]);
-    try {
-      const data = await continueTeach({
-        teach_session_id: teachSessionId,
-        message: answer,
-        learner_id: "default",
-      });
-      if (data.ok && data.reply) {
-        setTeachConversation((prev) => [...prev, { role: "assistant", content: data.reply! }]);
-        if (data.done) {
-          setTeachDone(true);
-        }
-      } else {
-        setTeachConversation((prev) => [
-          ...prev,
-          { role: "assistant", content: `⚠️ ${data.error || "提交失败"}` },
-        ]);
-      }
-    } catch {
-      setTeachConversation((prev) => [
-        ...prev,
-        { role: "assistant", content: "⚠️ 网络错误，请重试" },
-      ]);
-    }
-    setTeachLoading(false);
-  }, [teachSessionId, teachLoading]);
-
-  // Time-of-day greeting: seeded once on mount from the user's local clock so
+  // ── Time-of-day greeting: seeded once on mount from the user's local clock so
   // the heading stays stable while they're on the page. State (not useMemo)
   // because the random pick would otherwise mismatch SSR ↔ client hydration.
   const [welcomeGreeting, setWelcomeGreeting] = useState<string>(
@@ -1560,21 +1511,48 @@ export default function ChatPage() {
         (attachments.some((a) => a.type === "image")
           ? t("Please analyze the attached image(s).")
           : "");
-      if (attachments.length > 0 && !teachSessionId) {
+      // ── 进行中的教学 → REST /api/teach/continue ──
+      if (teachSessionIdRef.current) {
+        // 先显示用户消息（用 user role）
+        if (content) injectAssistantMessage(content, "user");
+        const data = await continueTeach({
+          teach_session_id: teachSessionIdRef.current,
+          message: content || t("Please continue."),
+          learner_id: "default",
+        }).catch(() => null);
+        if (data?.ok && data.reply) {
+          injectAssistantMessage(data.reply);
+          if (data.done) teachSessionIdRef.current = null;
+        }
+        return;
+      }
+
+      // ── 上传文件 → 触发教学 ──
+      if (attachments.length > 0) {
         const fileAttach = attachments[0];
         setAttachments([]);
-        try {
-          const data = await startTeach({
-            file_base64: fileAttach.base64,
-            filename: fileAttach.filename,
-            learner_id: "default",
-          });
-          if (data.ok && data.teach_session_id && data.first_question) {
-            setTeachSessionId(data.teach_session_id);
-            setTeachConversation([{ role: "assistant", content: data.first_question }]);
-            setTeachDone(false);
-          }
-        } catch { /* ignore */ }
+        const data = await startTeach({
+          file_base64: fileAttach.base64,
+          filename: fileAttach.filename,
+          learner_id: "default",
+        }).catch(() => null);
+        if (data?.ok && data.teach_session_id && data.first_question) {
+          teachSessionIdRef.current = data.teach_session_id;
+          injectAssistantMessage(data.first_question);
+        } else {
+          // fallback: 教学启动失败，改发普通消息
+          sendMessage(
+            content || t("Please analyze the attached file."),
+            extraAttachments,
+            config,
+            notebookReferencesPayload,
+            historyReferencesPayload,
+            { bookReferences: bookReferencesPayload },
+            questionNotebookReferencesPayload,
+            skillsPayload,
+            memoryPayload,
+          );
+        }
         return;
       }
 
@@ -1966,31 +1944,66 @@ export default function ChatPage() {
                   </div>
                 )}
 
-                {/* ── Pending teach tasks (引导式教学) ── */}
-                {pendingTeach.length > 0 && !teachSessionId && (
-                  <div className="mt-4 w-full max-w-md space-y-3">
-                    <p className="text-center text-[13px] font-medium text-[var(--muted-foreground)]">
-                      📚 待完成的教学任务
-                    </p>
-                    {pendingTeach.slice(0, 5).map((s) => (
-                      <button
-                        key={s.session_id}
-                        onClick={() => startTeachSession(s.session_id)}
-                        className="flex w-full items-center justify-between rounded-xl border border-[var(--border)]/60 bg-[var(--card)] px-4 py-3 text-left shadow-sm transition-all hover:border-[var(--primary)]/40 hover:bg-[var(--primary)]/[0.03]"
-                      >
-                        <div className="min-w-0 flex-1">
-                          <p className="truncate text-[14px] font-medium text-[var(--foreground)]">
+                {/* ── Pending teach tasks ── */}
+                {pendingTasks.length > 0 && !teachSessionIdRef.current && (
+                  <div className="mt-4 text-center">
+                    <button
+                      onClick={() => setShowPendingTasks(true)}
+                      className="text-[13px] text-[var(--muted-foreground)] underline underline-offset-2 decoration-dotted hover:text-[var(--foreground)]"
+                    >
+                      📚 你有 {pendingTasks.length} 份待完成的试卷
+                    </button>
+                  </div>
+                )}
+
+                {/* ── Pending teach flyout ── */}
+                {showPendingTasks && (
+                  <div
+                    className="fixed inset-0 z-50 flex items-center justify-center bg-black/30"
+                    onClick={() => setShowPendingTasks(false)}
+                  >
+                    <div
+                      className="w-80 max-h-64 overflow-y-auto rounded-xl bg-[var(--card)] p-4 shadow-xl"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <p className="mb-3 text-[14px] font-medium">待完成试卷</p>
+                      {pendingTasks.length === 0 && (
+                        <p className="text-[13px] text-[var(--muted-foreground)]">暂无</p>
+                      )}
+                      {pendingTasks.map((s) => (
+                        <button
+                          key={s.session_id}
+                          onClick={async () => {
+                            setShowPendingTasks(false);
+                            try {
+                              const res = await fetch(`/api/platform/teach/session/${s.session_id}`);
+                              const data = await res.json();
+                              if (data.ok && data.first_question) {
+                                teachSessionIdRef.current = s.session_id;
+                                // 先用 sendMessage 确保聊天会话存在
+                                if (!state.sessionId) newSession();
+                                // 再注入 assistant 消息到标准聊天
+                                injectAssistantMessage(data.first_question);
+                              }
+                            } catch { /* ignore */ }
+                          }}
+                          className="flex w-full items-center justify-between rounded-lg px-3 py-2 hover:bg-[var(--muted)]/50"
+                        >
+                          <span className="text-[13px]">
                             {s.source === "wechat" ? "👨‍👩‍👧 家长发来的" : "📄 已上传"}
-                          </p>
-                          <p className="text-[12px] text-[var(--muted-foreground)]">
-                            {s.current_question || 0}/{s.total_questions || "?"} 题
-                          </p>
-                        </div>
-                        <span className="ml-3 shrink-0 rounded-lg bg-[var(--primary)] px-3 py-1.5 text-[12px] font-medium text-white">
-                          开始教学
-                        </span>
+                          </span>
+                          <span className="text-[12px] text-[var(--muted-foreground)]">
+                            {s.current_question || 0}/{s.total_questions || "?"}
+                          </span>
+                        </button>
+                      ))}
+                      <button
+                        onClick={() => setShowPendingTasks(false)}
+                        className="mt-2 w-full text-center text-[12px] text-[var(--muted-foreground)]"
+                      >
+                        关闭
                       </button>
-                    ))}
+                    </div>
                   </div>
                 )}
               </div>
@@ -2038,6 +2051,7 @@ export default function ChatPage() {
                   onSwitchBranch={switchBranch}
                   onSubmitUserReply={submitUserReply}
                 />
+
                 <div ref={messagesEndRef} className="h-px w-full shrink-0" />
               </div>
             )}
@@ -2112,60 +2126,6 @@ export default function ChatPage() {
               prefillInputRef={prefillInputRef}
             />
 
-            {/* ── Teach Mode UI (引导式教学) ── */}
-            {teachSessionId && (
-              <div className="mx-auto w-full max-w-2xl border-t border-[var(--border)]/50 bg-[var(--background)] px-4 pb-4 pt-3">
-                {/* Teach conversation messages */}
-                <div className="mb-3 max-h-60 space-y-2 overflow-y-auto">
-                  {teachConversation.map((msg, i) => (
-                    <div
-                      key={i}
-                      className={`rounded-xl px-3 py-2 text-[15px] leading-relaxed ${
-                        msg.role === "user"
-                          ? "ml-8 bg-[var(--primary)]/[0.08] text-[var(--foreground)]"
-                          : "mr-8 bg-[var(--muted)]/50 text-[var(--foreground)]"
-                      }`}
-                    >
-                      <div className="whitespace-pre-wrap">{msg.content}</div>
-                    </div>
-                  ))}
-                  {teachLoading && (
-                    <div className="mr-8 animate-pulse rounded-xl bg-[var(--muted)]/50 px-3 py-2 text-[13px] text-[var(--muted-foreground)]">
-                      思考中...
-                    </div>
-                  )}
-                </div>
-
-                {/* Answer input */}
-                <div className="flex gap-2">
-                  <input
-                    type="text"
-                    placeholder={teachDone ? "✅ 已完成" : "输入你的答案..."}
-                    disabled={teachDone || teachLoading}
-                    className="flex-1 rounded-xl border border-[var(--border)] bg-[var(--card)] px-4 py-2.5 text-[15px] outline-none transition-colors focus:border-[var(--primary)]/50 disabled:opacity-50"
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" && !teachDone && !teachLoading && (e.target as HTMLInputElement).value.trim()) {
-                        const val = (e.target as HTMLInputElement).value.trim();
-                        (e.target as HTMLInputElement).value = "";
-                        submitTeachAnswer(val);
-                      }
-                    }}
-                  />
-                  {teachDone && (
-                    <button
-                      onClick={() => {
-                        setTeachSessionId(null);
-                        setTeachConversation([]);
-                        setTeachDone(false);
-                      }}
-                      className="shrink-0 rounded-xl bg-[var(--primary)] px-4 py-2.5 text-[14px] font-medium text-white"
-                    >
-                      返回聊天
-                    </button>
-                  )}
-                </div>
-              </div>
-            )}
             <div
               aria-hidden="true"
               className="shrink-0"

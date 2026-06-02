@@ -173,6 +173,7 @@ type Action =
       requestSnapshot?: MessageRequestSnapshot;
       parentMessageId?: number | null;
     }
+  | { type: "ADD_ASSISTANT_MSG"; key: string; content: string }
   | { type: "POP_LAST_ASSISTANT"; key: string }
   | { type: "RESTORE_ASSISTANT"; key: string; message: MessageItem }
   | { type: "STREAM_START"; key: string }
@@ -330,6 +331,31 @@ function reducer(state: ProviderState, action: Action): ProviderState {
                 ...(action.requestSnapshot
                   ? { requestSnapshot: action.requestSnapshot }
                   : {}),
+              },
+            ],
+            updatedAt: Date.now(),
+          },
+        },
+      };
+    }
+    case "ADD_ASSISTANT_MSG": {
+      const session =
+        state.sessions[action.key] ?? createSessionEntry(action.key);
+      return {
+        ...state,
+        selectedKey: action.key,
+        sessions: {
+          ...state.sessions,
+          [action.key]: {
+            ...session,
+            messages: [
+              ...session.messages,
+              {
+                id: -Date.now() - 1,
+                role: "assistant",
+                content: action.content,
+                capability: "",
+                parentMessageId: null,
               },
             ],
             updatedAt: Date.now(),
@@ -704,6 +730,13 @@ interface ChatContextValue {
     memoryReferences?: MemoryReferencePayload,
   ) => void;
   cancelStreamingTurn: () => void;
+  /** Inject an assistant message into the current session without triggering
+   *  a backend call. Used by the teach flow (引导式教学) to add REST API
+   *  responses as regular chat messages. */
+  /** Inject a message into the current session without triggering a backend
+   *  call. Used by the teach flow (引导式教学) to add REST API responses
+   *  as regular chat messages. Defaults to assistant role. */
+  injectAssistantMessage: (content: string, role?: "user" | "assistant") => void;
   /**
    * Deliver the user's reply for a turn that is paused on an
    * ``ask_user`` tool call. Sends the reply via the unified WS so the
@@ -1619,6 +1652,22 @@ export function UnifiedChatProvider({
     dispatch({ type: "SET_LANGUAGE", lang });
   }, []);
 
+  const injectAssistantMessage = useCallback((content: string, role: "user" | "assistant" = "assistant") => {
+    const currentState = stateRef.current;
+    let key = currentState.selectedKey;
+    if (!key) {
+      // 空白聊天页没有活跃 session 时，自动创建一个
+      draftCounterRef.current += 1;
+      key = `draft_${Date.now()}_${draftCounterRef.current}`;
+      dispatch({ type: "NEW_SESSION", key });
+    }
+    if (role === "user") {
+      dispatch({ type: "ADD_USER_MSG", key, content });
+    } else {
+      dispatch({ type: "ADD_ASSISTANT_MSG", key, content });
+    }
+  }, []);
+
   const renameSessionTitle = useCallback(async (title: string) => {
     const trimmed = title.trim();
     if (!trimmed) return;
@@ -1776,6 +1825,7 @@ export function UnifiedChatProvider({
       setLLMSelection,
       setLanguage,
       sendMessage,
+      injectAssistantMessage,
       cancelStreamingTurn,
       submitUserReply,
       regenerateLastMessage,
@@ -1797,6 +1847,7 @@ export function UnifiedChatProvider({
       setLLMSelection,
       setLanguage,
       sendMessage,
+      injectAssistantMessage,
       cancelStreamingTurn,
       submitUserReply,
       regenerateLastMessage,

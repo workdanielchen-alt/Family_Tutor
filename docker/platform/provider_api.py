@@ -1,4 +1,4 @@
-"""
+﻿"""
 platform/provider_api.py — Provider API (v7.0, 从 hermes_ingest 合并)
 
 改编自 docker/hermes_ingest/server.py:
@@ -5059,11 +5059,11 @@ async def _direct_deepseek_teach(
         _constraint += (
             "🔴 按试卷原本的题号顺序出题，保持试卷本身的章节和题号体系（如「一、1.」「二、1.」），不要重新编号。\n"
             "🔴 评判当前题后必须立即出下一道题，评判与下一题在一轮回复中完成。\n"
+            f"🔴 请用「第{_next_q}题」开头输出下一题。\n"
         )
         _answer_context = ""
-        if _prev_answer and _qnum > 0:
-            _answer_context = f"\n第{_qnum}题的正确答案是「{_prev_answer}」。请据此给出讲解。\n"
-        user_content = f"[PHASE:{phase}]{_constraint}\n{_answer_context}{message}"
+        # _answer_context 不注入，_prev_answer 指向上一题答案键，用户当前答的题号已通过「学生正在回答第X题」标明
+        user_content = f"[PHASE:{phase}] [学生正在回答第{_qnum}题] {_constraint}\n{message}"
         _exam_ctx = context.strip() or _last_tutor_context.get(learner_id, "")
         if _exam_ctx:
             user_content += f"\n\n# 当前试卷（下一题必须从此试卷中选取）\n{_exam_ctx[:6000]}"
@@ -5402,17 +5402,13 @@ async def _tutor_chat_core(
             "✅ 只输出一道题 + 讲解 + 一个引导问题。\n"
             "🔴 引导问题严禁直接问答案（如\"x等于多少？\"\"选哪个？\"\"结果是？\"）。\n"
             "✅ 引导问题应指向解题思路或概念理解，而非答案本身。\n"
+            f"🔴 请用「第{_next_q}题」开头输出下一题。\n"
             "🔴 必须在回复末尾添加 [ANSWER_KEY:X] 和 [KP_ID:学科/章/节] 标记。\n"
         )
         # Inject stored answer key so the LLM knows the correct answer.
         # The LLM should use this to provide accurate feedback, not to judge.
-        _answer_context = ""
-        if _prev_answer and _qnum > 0:
-            _answer_context = (
-                f"\n第{_qnum}题的正确答案是「{_prev_answer}」。"
-                "请据此给出讲解，然后出下一题。\n"
-            )
-        payload = f"[PHASE:{_phase}]{_constraint}\n{_answer_context}" + (message or context or "")
+        # 不注入 _prev_answer（指向上一题答案键），用户当前答的题号通过「学生正在回答第X题」标明
+        payload = f"[PHASE:{_phase}] [学生正在回答第{_qnum}题] {_constraint}\n" + (message or context or "")
         # Attach exam context so the LLM picks the next question from the
         # same paper rather than generating from its own knowledge.
         _exam_ctx = context.strip() or _last_tutor_context.get(learner_id, "")
@@ -8033,3 +8029,7 @@ def run_provider_api(port: int = 8100):
 if __name__ == "__main__":
     port = int(os.getenv("INGEST_PORT", "8100"))
     run_provider_api(port)
+
+
+
+

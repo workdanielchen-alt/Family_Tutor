@@ -238,17 +238,6 @@ export async function fetchAllPendingQuizSessions(): Promise<{
 
 // ── Teach Session ─────────────────────────────────────────────
 
-export interface PendingTeachSession {
-  session_id: string;
-  source: "wechat" | "webui";
-  total_questions: number;
-  current_question: number;
-  first_question: string;
-  status: string;
-  created_at: number;
-  expires_at: number;
-}
-
 export interface TeachStartResponse {
   ok: boolean;
   teach_session_id?: string;
@@ -285,32 +274,6 @@ export async function continueTeach(params: {
   learner_id?: string;
 }): Promise<TeachContinueResponse> {
   return apiPost("/teach/continue", params);
-}
-
-export async function fetchPendingTeach(
-  learnerId: string,
-): Promise<{ sessions: PendingTeachSession[]; total_pending: number }> {
-  return apiGet(`/teach/pending/${learnerId}`);
-}
-
-export async function fetchAllPendingTeach(): Promise<{
-  sessions: PendingTeachSession[];
-  total_pending: number;
-}> {
-  return apiGet("/teach/pending");
-}
-
-export async function fetchTeachSession(sessionId: string): Promise<{
-  ok: boolean;
-  session_id?: string;
-  source?: string;
-  status?: string;
-  first_question?: string;
-  total_questions?: number;
-  current_question?: number;
-  error?: string;
-}> {
-  return apiGet(`/teach/session/${sessionId}`);
 }
 
 // ── Practice / Exam / Report ────────────────────────────────
