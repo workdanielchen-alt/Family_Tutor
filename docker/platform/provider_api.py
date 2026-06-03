@@ -1075,6 +1075,61 @@ _TEXT_EXTENSIONS = frozenset(
 )
 
 
+def _spawn_unified_pipeline_bg(file_path: str, trace_id: str = "") -> None:
+    """Submit a file to the unified pipeline as a fire-and-forget background task.
+
+    The unified pipeline classifies the file, extracts text, and optionally
+    runs the structured exam pipeline — producing ``.txt`` and ``.exam.json``
+    sidecars alongside the original file.
+
+    This runs independently of the main request flow and never blocks the response.
+    """
+    try:
+        asyncio.create_task(_run_unified_pipeline_bg(file_path, trace_id))
+    except RuntimeError:
+        # No running event loop (e.g. sync context) — silently skip
+        pass
+
+
+async def _run_unified_pipeline_bg(file_path: str, trace_id: str) -> None:
+    """Background task: run unified pipeline on a file."""
+    # Temp files from API uploads may be cleaned up before this task runs
+    if not os.path.isfile(file_path):
+        return
+
+    from tutor_platform.rag.unified_pipeline import UnifiedDocumentPipeline
+
+    try:
+        llm_client = get_llm_client()
+        if not llm_client.supports_multimodal_images():
+            llm_client = None
+    except Exception:
+        llm_client = None
+
+    try:
+        result = await UnifiedDocumentPipeline.process(
+            file_path,
+            llm_client=llm_client,
+            enable_structured_exam=True,
+        )
+        if result.ok:
+            logger.info(
+                "[%s] Unified pipeline: %s → %s (%d sidecars)",
+                trace_id, result.doc_type.value, Path(file_path).name,
+                len(result.sidecar_paths),
+            )
+        else:
+            logger.warning(
+                "[%s] Unified pipeline failed for %s: %s",
+                trace_id, Path(file_path).name, result.error,
+            )
+    except Exception as exc:
+        logger.warning(
+            "[%s] Unified pipeline error for %s: %s",
+            trace_id, Path(file_path).name, exc,
+        )
+
+
 async def _handle_inbound_file(
     file_path: str,
     metadata: dict | None = None,
@@ -3085,6 +3140,9 @@ async def api_kb_ingest_file(
     finally:
         tmp.close()
 
+    # ── Submit to unified pipeline in background (non-blocking) ──
+    _spawn_unified_pipeline_bg(tmp_path, trace_id)
+
     try:
         result = await _handle_inbound_file(
             tmp_path,
@@ -3458,6 +3516,8 @@ async def api_process_file(request: Request):
             f.write(content)
         file_path_ref = dest
         source_url = f"/sources/{archive_name}"
+        # ── Submit to unified pipeline in background (non-blocking) ──
+        _spawn_unified_pipeline_bg(dest, trace_id)
     elif file_path:
         file_path_ref = file_path
         source_url = ""
@@ -3571,6 +3631,9 @@ async def api_ingest_file(
     dest = os.path.join(sources_dir, archive_name)
     with open(dest, "wb") as f:
         f.write(content)
+
+    # ── Submit to unified pipeline in background (non-blocking) ──
+    _spawn_unified_pipeline_bg(dest, trace_id)
 
     from tutor_platform.ingest_status import IngestStatusTracker
 
