@@ -337,3 +337,7 @@ web/test-results/
 test_ocr.png
 test_scan.png
 tmp_inspect_weixin.py
+
+# Reasonix agent tool data
+.codegraph/
+.reasonix/
