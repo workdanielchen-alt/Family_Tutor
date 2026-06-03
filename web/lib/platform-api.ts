@@ -34,6 +34,7 @@ export interface PracticeQuestion {
   correct_answer: string;
   explanation?: string;
   difficulty?: string;
+  kp_id?: string;
 }
 
 // ── HTTP helpers ─────────────────────────────────────────────
@@ -148,7 +149,56 @@ export async function fetchMotivation(learnerId: string): Promise<MotivationInfo
 }
 
 
-// ── Quiz Session (微信发卷→WEBUI答题) ──────────────────────
+// ── Due Reviews (Ebbinghaus) ────────────────────────────────
+
+export interface DueReview {
+  kp_id: string;
+  name?: string;
+  level: number;
+  due_date: string;
+  chapter_title?: string;
+  grade_name?: string;
+}
+
+export async function fetchDueReviews(
+  learnerId: string,
+): Promise<{ ok: boolean; reviews: DueReview[]; total: number }> {
+  return apiGet(`/mastery/${learnerId}/reviews`);
+}
+
+// ── Knowledge Graph ─────────────────────────────────────────
+
+export interface GraphNode {
+  id: string;
+  name: string;
+  chapter: string;
+  chapter_id: string;
+  grade_name: string;
+  importance: string;
+  level: number;
+  total: number;
+  correct: number;
+}
+
+export interface GraphEdge {
+  source: string;
+  target: string;
+}
+
+export async function fetchKnowledgeGraph(
+  subject = "math",
+  learnerId = "default",
+): Promise<{
+  ok: boolean;
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+  total_nodes: number;
+  total_edges: number;
+}> {
+  return apiGet(`/knowledge/graph?subject=${subject}&learner_id=${learnerId}`);
+}
+
+// ── Quiz Session ────────────────────────────────────────────
 
 export interface QuizSessionQuestion {
   question_id: string;
@@ -282,11 +332,13 @@ export async function generatePractice(
   learnerId: string,
   kpId: string,
   count = 3,
-): Promise<{ questions: PracticeQuestion[] }> {
+  timeLimit = 0,
+): Promise<{ questions: PracticeQuestion[]; time_limit: number }> {
   return apiPost("/practice/generate", {
     learner_id: learnerId,
     kp_id: kpId,
     count,
+    time_limit: timeLimit,
   });
 }
 
@@ -303,6 +355,7 @@ export interface ExamQuestion {
 
 export async function generateExam(
   learnerId: string,
+  timeLimit = 0,
 ): Promise<{
   ok: boolean;
   exam_text: string;
@@ -310,9 +363,11 @@ export async function generateExam(
   kp_covered: string[];
   total: number;
   questions: ExamQuestion[];
+  time_limit: number;
 }> {
   return apiPost("/practice/exam", {
     learner_id: learnerId,
+    time_limit: timeLimit,
   });
 }
 
@@ -323,6 +378,126 @@ export async function generateReport(
   return apiPostText("/report/generate", {
     learner_id: learnerId,
     type,
+  });
+}
+
+// ── Exam Topics (中考专题) ──────────────────────────────────
+
+export interface ExamTopic {
+  id: string;
+  title: string;
+  description: string;
+  kp_list: string[];
+}
+
+export async function fetchExamTopics(
+  subject = "math",
+): Promise<{ ok: boolean; topics: ExamTopic[]; subject: string }> {
+  return apiGet(`/practice/exam-topics?subject=${subject}`);
+}
+
+export async function generateExamTopic(
+  learnerId: string,
+  examTopicId: string,
+  subject = "math",
+  count = 8,
+): Promise<{
+  ok: boolean;
+  questions: PracticeQuestion[];
+  title: string;
+  total: number;
+}> {
+  return apiPost("/practice/exam-topic", {
+    learner_id: learnerId,
+    exam_topic_id: examTopicId,
+    subject,
+    count,
+  });
+}
+
+// ── Quiz Sync ───────────────────────────────────────────────
+
+export async function syncQuizResults(
+  learnerId: string,
+  answers: Array<{
+    kp_id: string;
+    is_correct: boolean;
+    question: string;
+    user_answer: string;
+    correct_answer?: string;
+  }>,
+): Promise<{ ok: boolean; synced: number; errors: number }> {
+  return apiPost("/quiz/sync", {
+    learner_id: learnerId,
+    answers,
+  });
+}
+
+// ── Practice Review & Summary ──────────────────────────────
+
+export interface PracticeAnswer {
+  question: string;
+  student_answer: string;
+  correct_answer: string;
+  is_correct: boolean;
+  kp_id: string;
+}
+
+// ── Practice Teach (DT native teaching via TeachSession) ──
+
+export async function fetchPracticeTeach(
+  learnerId: string,
+  contextText: string,
+  topicName: string,
+): Promise<{
+  ok: boolean;
+  teach_session_id?: string;
+  first_question?: string;
+  total_questions?: number;
+  error?: string;
+}> {
+  return apiPost("/practice/teach", {
+    learner_id: learnerId,
+    context_text: contextText,
+    topic_name: topicName,
+  });
+}
+
+// ── Practice Review & Summary (batch: used on exercise completion) ──
+
+export async function fetchPracticeReview(
+  learnerId: string,
+  wrongAnswers: Array<{
+    question: string;
+    options?: Record<string, string>;
+    student_answer: string;
+    correct_answer: string;
+    kp_id: string;
+  }>,
+): Promise<{ ok: boolean; review_text: string }> {
+  return apiPost("/practice/review", {
+    learner_id: learnerId,
+    wrong_answers: wrongAnswers,
+  });
+}
+
+export interface PracticeSummary {
+  ok: boolean;
+  total: number;
+  correct: number;
+  score_pct: number;
+  weak_kps: Array<{ kp_id: string; name: string; accuracy: number }>;
+  assessment: string;
+  mastery_updated: number;
+}
+
+export async function fetchPracticeSummary(
+  learnerId: string,
+  answers: PracticeAnswer[],
+): Promise<PracticeSummary> {
+  return apiPost("/practice/summary", {
+    learner_id: learnerId,
+    answers,
   });
 }
 

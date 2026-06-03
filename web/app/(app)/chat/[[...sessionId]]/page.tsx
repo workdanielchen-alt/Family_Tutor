@@ -939,6 +939,14 @@ export default function ChatPage() {
     if (initialLoadRef.current) return;
     initialLoadRef.current = true;
     if (sessionIdParam) {
+      try {
+        const savedTeach = localStorage.getItem("teach_" + sessionIdParam);
+        if (savedTeach) teachSessionIdRef.current = savedTeach;
+      } catch (_) {}
+      try {
+        const prevTeach = localStorage.getItem("teach_" + sessionIdParam);
+        if (prevTeach) teachSessionIdRef.current = prevTeach;
+      } catch (_) {}
       void loadSession(sessionIdParam).catch(() => {
         router.replace("/chat", { scroll: false });
       });
@@ -973,6 +981,10 @@ export default function ChatPage() {
     prevSessionIdParam.current = sessionIdParam;
     if (sessionIdParam) {
       if (sessionIdParam === state.sessionId) return;
+      try {
+        const savedTeach = localStorage.getItem("teach_" + sessionIdParam);
+        if (savedTeach) teachSessionIdRef.current = savedTeach;
+      } catch (_) {}
       void loadSession(sessionIdParam).catch(() => {
         router.replace("/chat", { scroll: false });
       });

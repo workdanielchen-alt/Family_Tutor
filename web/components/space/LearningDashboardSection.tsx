@@ -14,6 +14,9 @@ import {
   Sparkles,
   X,
   ClipboardList,
+  Flame,
+  Trophy,
+  Zap,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import SpaceSectionHeader from "@/components/space/SpaceSectionHeader";
@@ -33,7 +36,9 @@ import {
   type WeakPoint,
   type WrongAnswer,
   type PeriodStats,
+  type MotivationInfo,
 } from "@/lib/platform-api";
+import { fetchMotivation } from "@/lib/platform-api";
 import dynamic from "next/dynamic";
 import type { QuizQuestion } from "@/lib/quiz-types";
 import { QuizFollowupProvider } from "@/context/QuizFollowupContext";
@@ -467,6 +472,7 @@ export default function LearningDashboardSection() {
   const [weakPoints, setWeakPoints] = useState<WeakPoint[]>([]);
   const [wrongAnswers, setWrongAnswers] = useState<WrongAnswer[]>([]);
   const [weeklyStats, setWeeklyStats] = useState<PeriodStats | null>(null);
+  const [motivation, setMotivation] = useState<MotivationInfo | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -525,16 +531,18 @@ export default function LearningDashboardSection() {
     setLoading(true);
     setError(null);
     try {
-      const [sum, weak, wrong, weekly] = await Promise.all([
+      const [sum, weak, wrong, weekly, motiv] = await Promise.all([
         fetchMasterySummary(learnerId),
         fetchWeakPoints(learnerId),
         fetchWrongAnswers(learnerId, undefined, 10),
         fetchWeeklyStats(learnerId),
+        fetchMotivation(learnerId),
       ]);
       setSummary(sum);
       setWeakPoints(weak);
       setWrongAnswers(wrong);
       setWeeklyStats(weekly);
+      setMotivation(motiv);
     } catch (err) {
       setError(err instanceof Error ? err.message : "加载失败");
     } finally {
@@ -719,6 +727,29 @@ export default function LearningDashboardSection() {
         </div>
       ) : (
         <div className="space-y-6">
+          {/* Streak & XP */}
+          {motivation && (
+            <div className="rounded-2xl bg-gradient-to-br from-orange-500 to-red-500 p-5 text-white shadow-lg mb-5">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-sm opacity-80">学习激励</p>
+                  <p className="text-2xl font-bold mt-1">坚持 {motivation.streak_current ?? 0} 天</p>
+                </div>
+                <div className="flex items-center gap-3">
+                  <div className="rounded-xl bg-white/20 px-3 py-2 text-center">
+                    <Flame className="mx-auto h-5 w-5" />
+                    <p className="text-lg font-bold">{motivation.streak_current ?? 0}</p>
+                    <p className="text-[10px] opacity-70">连续天数</p>
+                  </div>
+                  <div className="rounded-xl bg-white/20 px-3 py-2 text-center">
+                    <Trophy className="mx-auto h-5 w-5" />
+                    <p className="text-lg font-bold">{motivation.level ?? 1}</p>
+                    <p className="text-[10px] opacity-70">等级</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
           {/* ── Overview Cards ── */}
           <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
             <StatCard
