@@ -5223,6 +5223,96 @@ async def _direct_llm_teach(
         return None
 
 
+async def _fast_teach(
+    learner_id: str, message: str, context: str, mode: str, trace_id: str,
+) -> dict:
+    """快速教学——无 SOUL.md/ChromaDB，延迟 2-4s。"""
+    import re
+    api_key = os.getenv("DEEPSEEK_API_KEY", "")
+    if not api_key:
+        return {"ok": False, "error": "DEEPSEEK_API_KEY not set"}
+    llm_url = "https://api.deepseek.com/v1/chat/completions"
+    llm_model = os.getenv("LLM_MODEL", "deepseek-v4-flash")
+    _first = bool(context.strip() and not message.strip())
+
+    # 简洁稳定的 system prompt（太长的模板会导致 LLM 返回空）
+    if _first:
+        _last_question_num[learner_id] = 1
+        _session_answered_count[learner_id] = 0
+        system = (
+            "你是一位中小学教师，用 Socratic 方式引导学生。从试卷选第1道未做题输出。\n"
+            "严格只输出试卷中已有的选项，不要添加多余选项。\n"
+            "每行之间空一行：\n\n"
+            "第N题\n\n题目\n\nA. xxx\n\nB. xxx\n\n引导问题\n\n"
+            "[ANSWER_KEY:X] [KP_ID:学科/知识点]\n"
+        )
+        user = context[:4000]
+    else:
+        _qnum = _last_question_num.get(learner_id, 0)
+        _next_q = _qnum + 1
+        _ctx = (_last_tutor_context.get(learner_id, "")).strip()
+        system = "你是一位中小学教师。学生答完题，给1句评价，然后出下一题。"
+        user = f"学生刚答完第{_qnum}题，回答：{message[:800]}\n"
+        if _ctx:
+            user += f"\n请从以下试卷中找「第{_next_q}题」输出：\n{_ctx[:3000]}"
+        user += f"\n\n请严格输出「第{_next_q}题」，不要出其他题号。"
+
+    # Save context for follow-up turns
+    if context.strip():
+        _last_tutor_context[learner_id] = context
+        _last_question_num[learner_id] = 0
+
+    # LLM call with retry
+    last_err = ""
+    for _attempt in range(2):
+        try:
+            async with httpx.AsyncClient(timeout=25) as client:
+                resp = await client.post(llm_url, json={
+                    "model": llm_model,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    "temperature": 0.7 if _attempt == 0 else 1.0,
+                    "max_tokens": 1024,
+                }, headers={"Authorization": f"Bearer {api_key}"})
+                if resp.status_code != 200:
+                    last_err = f"LLM HTTP {resp.status_code}"
+                    continue
+                content = resp.json()["choices"][0]["message"]["content"]
+                content = content.replace("\r", "").strip()
+                # 后处理：确保每行之间有空行分隔（HTML 渲染需要双换行）
+                lines = content.split("\n")
+                out = []
+                for line in lines:
+                    stripped = line.strip()
+                    if not stripped:
+                        out.append("")
+                        continue
+                    # 确保每个选项行之间有空行分隔
+                    if out and out[-1] != "" and (
+                        stripped[0] in "ABCD" and len(stripped) > 1 and stripped[1] in ". )"
+                    ):
+                        out.append("")
+                    elif out and out[-1] != "" and stripped.startswith("第") and "题" in stripped:
+                        out.append("")
+                    out.append(stripped)
+                content = "\n".join(out)
+                if not content or len(content) < 10:
+                    last_err = f"Empty LLM response ({len(content)} chars)"
+                    continue
+                _qn_m = re.search(r"第\s*(\d+)\s*[题/]", content)
+                if _qn_m:
+                    _last_question_num[learner_id] = int(_qn_m.group(1))
+                    _session_answered_count[learner_id] = (
+                        _session_answered_count.get(learner_id, 0) + 1)
+                return {"ok": True, "content": content.strip()}
+        except Exception as exc:
+            last_err = str(exc)
+
+    logger.error("[%s] _fast_teach failed after retries: %s", trace_id, last_err)
+    return {"ok": False, "error": last_err}
+
 async def _tutor_chat_core(
     message: str,
     learner_id: str,
@@ -5230,6 +5320,7 @@ async def _tutor_chat_core(
     mode: str,
     trace_id: str,
     total_questions: int = 0,
+    fast: bool = False,
 ) -> dict:
     """tutor_chat 核心逻辑 — 供 HTTP endpoint 和内部直接调用共用.
 
@@ -5252,6 +5343,10 @@ async def _tutor_chat_core(
     if learner_id == "default":
         logger.warning("[%s] tutor_chat called with default learner_id", trace_id)
 
+
+    # ── Fast path: skip SOUL.md/ChromaDB/persona for child_practice ──
+    if fast:
+        return await _fast_teach(learner_id, message, context, mode, trace_id)
     # Per-learner serialization is handled by HA's _running_teachings guard
     # in weixin.py, which prevents concurrent _run_teaching_flow calls for
     # the same learner.  Platform-side lock (via _get_learner_lock) would
@@ -6321,6 +6416,28 @@ def api_get_report(learner_id: str):
     return generate_parent_report(learner_id)
 
 
+@app.get("/api/mastery/{learner_id}/reviews")
+async def api_get_due_reviews(learner_id: str):
+    """获取到期复习知识点列表 (Ebbinghaus 间隔重复)."""
+    try:
+        from domains.tutoring.mastery import get_due_reviews
+        from domains.curriculum import find_knowledge_point
+        reviews = await asyncio.to_thread(get_due_reviews, learner_id)
+        enriched = []
+        for r in reviews:
+            kp_info = find_knowledge_point(r["kp_id"])
+            entry = {**r}
+            if kp_info:
+                entry["name"] = kp_info.get("name", "")
+                entry["chapter_title"] = kp_info.get("chapter_title", "")
+                entry["grade_name"] = kp_info.get("grade_name", "")
+            enriched.append(entry)
+        return {"ok": True, "reviews": enriched, "total": len(enriched)}
+    except Exception as e:
+        logger.warning("Failed to get due reviews for %s: %s", learner_id, e)
+        return {"ok": False, "error": str(e), "reviews": [], "total": 0}
+
+
 @app.get("/api/mastery/{learner_id}/motivation")
 async def api_get_motivation(learner_id: str):
     """获取激励信息 (连续学习天数/积分/等级/成就)."""
@@ -6331,6 +6448,22 @@ async def api_get_motivation(learner_id: str):
         return {"ok": False, "error": str(e), "streak_current": 0, "points": 0, "level": 1,
                 "streak_longest": 0, "xp_to_next": 100, "achievement_count": 0,
                 "weekly_accuracy": 0, "last_week_accuracy": 0}
+
+
+@app.post("/api/quiz/sync")
+async def api_quiz_sync(request: Request):
+    """批量同步测验结果到掌握度追踪。"""
+    from tutor_platform.quiz_sync import sync_quiz_to_mastery
+    trace_id = _extract_trace_id(request)
+    body = await request.json()
+    learner_id = body.get("learner_id", "default")
+    answers = body.get("answers", [])
+    if not answers:
+        return {"ok": False, "error": "answers list is required"}
+    result = await asyncio.to_thread(sync_quiz_to_mastery, learner_id, answers)
+    result["ok"] = result["errors"] == 0 or result["synced"] > 0
+    result["trace_id"] = trace_id
+    return result
 
 
 @app.post("/api/report/generate")
@@ -6403,6 +6536,58 @@ async def api_report_push(request: Request):
     }
 
 
+@app.get("/api/knowledge/graph")
+def api_get_knowledge_graph(subject: str = "math", learner_id: str = "default"):
+    """获取知识点图谱数据."""
+    try:
+        from domains.curriculum import load as _lc
+        data = _lc(subject=subject)
+        if not data:
+            return {"ok": False, "error": "Not found", "nodes": [], "edges": []}
+        from domains.tutoring.mastery import _load as _lm
+        mastery = _lm(learner_id).get("mastery", {})
+        nodes, edges, node_ids = [], [], set()
+        for grade in data.get("grades", []):
+            for sem in grade.get("semesters", []):
+                for ch in sem.get("chapters", []):
+                    for kp in ch.get("knowledge_points", []):
+                        from domains.curriculum import get_kp_id
+                        kp_id = get_kp_id(domain=data.get("domain", subject),
+                            grade=str(grade.get("id", "")),
+                            semester=sem.get("id", ""),
+                            chapter=ch.get("id", ""), kp=kp.get("id", ""))
+                        if kp_id in node_ids:
+                            continue
+                        node_ids.add(kp_id)
+                        m = mastery.get(kp_id, {"level": 0.0, "total": 0, "correct": 0})
+                        nodes.append({"id": kp_id, "name": kp.get("name", ""),
+                            "chapter": ch.get("title", ""),
+                            "chapter_id": ch.get("number", ""),
+                            "grade_name": grade.get("name", ""),
+                            "importance": kp.get("importance", ""),
+                            "level": round(m.get("level", 0.0), 2),
+                            "total": m.get("total", 0), "correct": m.get("correct", 0)})
+                        for prereq in kp.get("prerequisites", []):
+                            edges.append({"source": prereq, "target": kp_id})
+        return {"ok": True, "subject": subject, "nodes": nodes, "edges": edges,
+            "total_nodes": len(nodes), "total_edges": len(edges)}
+    except Exception as e:
+        logger.warning("Failed to get knowledge graph: %s", e)
+        return {"ok": False, "error": str(e), "nodes": [], "edges": []}
+
+
+@app.get("/api/practice/exam-topics")
+def api_get_exam_topics(subject: str = "math"):
+    """获取中考专题列表."""
+    try:
+        from domains.curriculum import get_exam_topics
+        topics = get_exam_topics(subject=subject)
+        return {"ok": True, "topics": topics, "subject": subject}
+    except Exception as e:
+        logger.warning("Failed to get exam topics: %s", e)
+        return {"ok": False, "error": str(e), "topics": [], "subject": subject}
+
+
 @app.post("/api/practice/generate")
 async def api_generate_practice(request: Request):
     """根据错题生成针对性练习题.
@@ -6415,6 +6600,7 @@ async def api_generate_practice(request: Request):
     learner_id = body.get("learner_id", "default")
     kp_id = body.get("kp_id", "")
     count = max(1, min(int(body.get("count", 3)), 10))
+    time_limit = body.get("time_limit", 0)
 
     # 1. Get wrong answers as context
     wrong_answers = get_wrong_answers(learner_id, kp_id=kp_id, limit=5)
@@ -6526,6 +6712,7 @@ async def api_generate_practice(request: Request):
                 "kp_id": kp_id,
                 "questions": qs,
                 "total": len(qs),
+                "time_limit": time_limit,
                 "trace_id": trace_id,
             }
     except httpx.TimeoutException:
@@ -6759,6 +6946,43 @@ async def _generate_exam_paper(
         return {"ok": False, "error": str(e)}
 
 
+@app.post("/api/practice/teach")
+async def api_practice_teach(request: Request):
+    """将知识点练习接入 DT 原生引导式教学引擎."""
+    trace_id = _extract_trace_id(request)
+    body = await request.json()
+    learner_id = body.get("learner_id", "default")
+    context_text = body.get("context_text", "")
+    topic_name = body.get("topic_name", "知识点练习")
+    if not context_text.strip():
+        return {"ok": False, "error": "context_text is required"}
+    teach_context = context_text.strip()
+    store = get_teach_store()
+    session = store.create(learner_id=learner_id, source="child_practice",
+        ocr_text=teach_context, source_file=topic_name)
+    try:
+        result = await _tutor_chat_core(message="", learner_id=learner_id,
+            context=teach_context, mode="guide", trace_id=trace_id, fast=True)
+        reply = result.get("content", "") if result.get("ok") else ""
+        if reply:
+            import re
+            reply = re.sub(r"[─━═⎯]{2,}", "", reply)
+            reply = re.sub(r"\n{3,}", "\n\n", reply)
+            session.first_question = reply
+            store.mark_active(session.session_id)
+            _tq_m = re.search(r"(?:共|/)\s*(\d+)\s*题", reply)
+            session.total_questions = int(_tq_m.group(1)) if _tq_m else _detect_total_questions(teach_context)
+            session.current_question = 1
+            store.save(session)
+            return {"ok": True, "teach_session_id": session.session_id,
+                "first_question": reply, "total_questions": session.total_questions,
+                "source": "child_practice", "current": 1}
+        return {"ok": False, "error": "教学引擎未返回内容"}
+    except Exception as exc:
+        logger.error("[%s] practice/teach failed: %s", trace_id, exc)
+        return {"ok": False, "error": f"教学启动失败: {exc}"}
+
+
 @app.post("/api/practice/exam")
 async def api_generate_exam(request: Request):
     """根据学情自动生成强化训练试卷。
@@ -6772,9 +6996,10 @@ async def api_generate_exam(request: Request):
     learner_id = body.get("learner_id", "default")
     kp_id = body.get("kp_id", "")
     count = max(5, min(int(body.get("count", 10)), 30))
-
+    time_limit = body.get("time_limit", 0)
     result = await _generate_exam_paper(learner_id, trace_id, kp_id, count)
     result["trace_id"] = trace_id
+    result["time_limit"] = time_limit
     return result
 
 
@@ -7817,6 +8042,8 @@ async def api_teach_start(request: Request):
     else:
         _source = "wechat"
 
+    dt_session_id = str(body.get("dt_session_id", "")).strip()
+
     if not ocr_text:
         return {"ok": False, "error": "OCR 文本为空，无法开始教学"}
 
@@ -7827,6 +8054,7 @@ async def api_teach_start(request: Request):
         source=_source,
         ocr_text=ocr_text,
         source_file=source_file,
+        dt_session_id=dt_session_id,
     )
 
     try:
@@ -7839,6 +8067,10 @@ async def api_teach_start(request: Request):
             trace_id=trace_id,
         )
         reply = result.get("content", "") if result.get("ok") else ""
+        # Save context under isolated key if bound to DT session
+        if dt_session_id:
+            _isolated_key = f"{learner_id}:{dt_session_id}"
+            _last_tutor_context[_isolated_key] = _last_tutor_context.get(learner_id, "")
         if reply:
             # 缓存第一题到 session
             session.first_question = reply
@@ -7895,16 +8127,45 @@ async def api_teach_continue(request: Request):
         return {"ok": False, "error": "教学链接已过期"}
 
     try:
+        # Context isolation: swap in the session-bound context
+        _saved_ctx = None
+        if session.dt_session_id:
+            _ctx_key = f"{learner_id}:{session.dt_session_id}"
+            _saved_ctx = _last_tutor_context.get(learner_id, None)
+            _last_tutor_context[learner_id] = _last_tutor_context.pop(_ctx_key, "")
+        _msg = message.strip()
+        if session.source in ("child_practice", "webui"):
+            _msg = "【排版：自然分段，不用分隔线，选项各占一行】\n" + _msg
         result = await _tutor_chat_core(
-            message=message,
+            message=_msg,
             learner_id=learner_id,
             context="",      # follow-up turn：_last_tutor_context 自动恢复
             mode="guide",
             trace_id=trace_id,
+            fast=(session.source == "child_practice"),
         )
         reply = result.get("content", "") if result.get("ok") else ""
         if not reply:
             return {"ok": False, "error": "教学引擎未返回内容"}
+
+        # WebUI源清理格式
+        if session.source in ("child_practice", "webui"):
+            for sep in ("──", "─", "━", "═", "⎯"):
+                reply = reply.replace(sep, "")
+            # 普通化 \r → \n，确保 HTML 渲染正确
+            reply = reply.replace("\r", "")
+            # 双换行：每行之间确保有空行（HTML 需要 \n\n 才能断行）
+            rlines = reply.split("\n")
+            rlines2 = []
+            for rl in rlines:
+                s = rl.strip()
+                if not s:
+                    rlines2.append("")
+                    continue
+                if rlines2 and rlines2[-1] != "" and s[0] in "ABCD" and len(s) > 1 and s[1] in ". )":
+                    rlines2.append("")
+                rlines2.append(s)
+            reply = "\n".join(rlines2)
 
         # 更新进度
         import re
@@ -7917,12 +8178,22 @@ async def api_teach_continue(request: Request):
 
         # 检测是否完成
         _done = False
-        if "已完成全部" in reply or "全部完成" in reply or "所有题目" in reply:
+        _done = False
+        if ("已完成全部" in reply or "全部完成" in reply or "所有题目" in reply
+            or "最后一题" in reply
+            or "练习结束" in reply):
             _done = True
+        elif session.total_questions > 0 and session.current_question >= session.total_questions:
+            _done = True
+        if _done:
             store.mark_completed(teach_session_id)
         else:
             store.save(session)
 
+        if session.dt_session_id and _saved_ctx is not None:
+            _last_tutor_context[f"{learner_id}:{session.dt_session_id}"] = _last_tutor_context.pop(learner_id, "")
+            if _saved_ctx:
+                _last_tutor_context[learner_id] = _saved_ctx
         return {
             "ok": True,
             "reply": reply,
@@ -7932,6 +8203,10 @@ async def api_teach_continue(request: Request):
         }
     except Exception as exc:
         logger.error("[%s] /api/teach/continue failed: %s", trace_id, exc)
+        if session.dt_session_id and _saved_ctx:
+            _last_tutor_context[f"{learner_id}:{session.dt_session_id}"] = _last_tutor_context.pop(learner_id, "")
+            if _saved_ctx:
+                _last_tutor_context[learner_id] = _saved_ctx
         return {"ok": False, "error": f"教学交互失败: {exc}"}
 
 
@@ -7940,6 +8215,7 @@ async def api_teach_pending_all():
     """获取所有学习者的待教学任务列表。"""
     store = get_teach_store()
     sessions = store.get_all_pending(limit=50)
+    sessions = [s for s in sessions if s.source != "child_practice"]
     return {
         "ok": True,
         "sessions": [
