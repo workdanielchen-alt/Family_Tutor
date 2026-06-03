@@ -26,6 +26,12 @@ class PipelineConfig:
     ocr_retry_delay: float = 5.0
     meaningful_text_threshold: int = 50
 
+    # ── Structured exam pipeline ──────────────────────────────────
+    exam_structuring_enabled: bool = True
+    exam_ocr_dpi: int = 300
+    exam_max_concurrent_blocks: int = 3
+    exam_save_figures: bool = True
+
     _ENV_PREFIX: ClassVar[str] = "RAG_PIPELINE_"
 
     # Scalar type dispatch for env-var parsing — (type, default)

@@ -66,6 +66,7 @@ class RagDocumentPipeline:
 
         ctx.augmented_paths = list(ctx.original_paths)
         await cls._stage_ocr_scanned_pdfs(ctx)
+        await cls._stage_structured_exam(ctx)
 
         # Structured summary log
         logger.info(ctx.summary())
@@ -395,3 +396,182 @@ class RagDocumentPipeline:
             return False
         finally:
             doc.close()
+
+    # ── Stage: Structured exam paper pipeline ─────────────────────
+
+    @classmethod
+    async def _stage_structured_exam(cls, ctx: ProcessingContext) -> None:
+        """Run structured exam paper pipeline on scanned PDFs.
+
+        This is an augmentation stage — it does NOT replace the existing
+        OCR pipeline. It adds structured JSON sidecars alongside the
+        ``.ocr.txt`` sidecars, enabling downstream systems to consume
+        exam papers as structured data (questions, figures, metadata).
+
+        Enabled via ``RAG_PIPELINE_EXAM_STRUCTURING_ENABLED=true`` (default).
+        """
+        config = cls.get_config()
+        if not config.exam_structuring_enabled:
+            return
+
+        pdf_paths = [p for p in ctx.augmented_paths if p.suffix.lower() == ".pdf"]
+        if not pdf_paths:
+            return
+
+        from tutor_platform.rag.layout_engine import PaperLayoutEngine
+        from tutor_platform.rag.block_ocr import BlockOCREngine
+        from tutor_platform.rag.exam_structurer import ExamStructurer
+
+        llm_client = get_llm_client()
+        if not llm_client.supports_multimodal_images():
+            logger.info("Structured exam skipped: LLM does not support multimodal")
+            return
+
+        if fitz is None:
+            logger.info("Structured exam skipped: pymupdf not installed")
+            return
+
+        for pdf_path in pdf_paths:
+            sidecar = pdf_path.with_name(pdf_path.stem + ".ocr.txt")
+            # Only process scanned PDFs that went through OCR
+            if not sidecar.exists():
+                continue
+
+            try:
+                await cls._structure_single_exam(
+                    pdf_path, config, llm_client, ctx,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Structured exam failed for %s: %s", pdf_path.name, exc,
+                )
+
+    @classmethod
+    async def _structure_single_exam(
+        cls,
+        pdf_path: Path,
+        config: "PipelineConfig",
+        llm_client,
+        ctx: ProcessingContext,
+    ) -> None:
+        """Run layout → block OCR → structuring on a single PDF."""
+        from tutor_platform.rag.layout_engine import PaperLayoutEngine
+        from tutor_platform.rag.block_ocr import BlockOCREngine
+        from tutor_platform.rag.exam_structurer import ExamStructurer
+
+        logger.info("Structured exam pipeline: %s", pdf_path.name)
+
+        # Phase 1: Layout analysis (no LLM)
+        layout = PaperLayoutEngine.process(pdf_path)
+
+        # Check if this looks like an exam (multi-page, scanned, has figures)
+        total_image_blocks = sum(
+            len([b for b in p.blocks if b.type == "image"])
+            for p in layout.pages
+        )
+        if total_image_blocks == 0 and not any(p.is_scanned for p in layout.pages):
+            logger.info("Skipping %s: all text-layer, no figures", pdf_path.name)
+            return
+
+        logger.info(
+            "%s: %d pages, %d image blocks, is_scanned=%s",
+            pdf_path.name,
+            layout.total_pages,
+            total_image_blocks,
+            any(p.is_scanned for p in layout.pages),
+        )
+
+        # Phase 2: Block-level OCR (MiniCPM)
+        ocr_engine = BlockOCREngine(llm_client, pdf_path)
+        try:
+            page_contents = await ocr_engine.process_all_pages(
+                layout, save_figures=config.exam_save_figures,
+            )
+            ocr_blocks = sum(len(pc) for pc in page_contents)
+            failed_blocks = sum(
+                1 for pc in page_contents for bc in pc if bc.error
+            )
+            logger.info(
+                "Block OCR: %d blocks, %d failed", ocr_blocks, failed_blocks,
+            )
+        finally:
+            ocr_engine.close()
+
+        # Phase 3: Structure into exam paper
+        exam = ExamStructurer.structure(
+            layout.pages, page_contents, file_hash=layout.file_hash,
+        )
+        logger.info(
+            "Structured: %s — subject=%s grade=%s type=%s questions=%d",
+            pdf_path.name,
+            exam.metadata.subject,
+            exam.metadata.grade,
+            exam.metadata.exam_type,
+            len(exam.questions),
+        )
+
+        # Phase 4: Write structured JSON sidecar
+        cls._write_exam_sidecar(pdf_path, exam, ctx)
+
+    @classmethod
+    def _write_exam_sidecar(
+        cls,
+        pdf_path: Path,
+        exam: "ExamPaper",
+        ctx: ProcessingContext,
+    ) -> None:
+        """Write structured exam JSON sidecar alongside the OCR text."""
+        import json as json_mod
+
+        serialized = {
+            "paper_id": exam.paper_id,
+            "raw_file_hash": exam.raw_file_hash,
+            "total_pages": exam.total_pages,
+            "metadata": {
+                "subject": exam.metadata.subject,
+                "grade": exam.metadata.grade,
+                "exam_type": exam.metadata.exam_type,
+                "year": exam.metadata.year,
+                "total_score": exam.metadata.total_score,
+                "duration_minutes": exam.metadata.duration_minutes,
+            },
+            "questions": [
+                {
+                    "question_id": q.question_id,
+                    "index": q.index,
+                    "type": q.type,
+                    "content": q.content,
+                    "options": q.options,
+                    "answer": q.answer,
+                    "score": q.score,
+                    "page_num": q.page_num,
+                    "figures": [
+                        {
+                            "figure_id": f.figure_id,
+                            "page_num": f.page_num,
+                            "block_id": f.block_id,
+                            "bbox": list(f.bbox),
+                            "description": f.description,
+                        }
+                        for f in q.figures
+                    ],
+                }
+                for q in exam.questions
+            ],
+        }
+
+        json_path = pdf_path.with_name(pdf_path.stem + ".exam.json")
+        tmp_path = json_path.with_name(json_path.name + ".tmp")
+        try:
+            tmp_path.write_text(
+                json_mod.dumps(serialized, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            os.replace(str(tmp_path), str(json_path))
+        except OSError as exc:
+            logger.error("Failed to write exam JSON for %s: %s", pdf_path.name, exc)
+            return
+
+        ctx.augmented_paths.append(json_path)
+        ctx.record_sidecar(pdf_path, json_path)
+        logger.info("Structured exam JSON: %s", json_path.name)

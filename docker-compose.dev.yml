@@ -48,6 +48,7 @@ services:
     environment:
       - DEEPTUTOR_ENV=development
       - BACKEND_RELOAD=true
+      - PYTHONPATH=/app:/:/domains:/tutor_platform
     networks:
       - deeptutor-network
 
