@@ -1,6 +1,6 @@
 # DeepTutor 统一文档处理架构
 
-> 版本: 1.0 | 最后更新: 2026-06-04
+> 版本: 1.1 | 最后更新: 2026-06-04
 
 ## 目录
 
@@ -11,8 +11,10 @@
 5. [试卷结构化专属管线 (Phase 1-4)](#5-试卷结构化专属管线)
 6. [集成点 — 三个 API 端点](#6-集成点--三个-api-端点)
 7. [输出产物规范](#7-输出产物规范)
-8. [配置项参考](#8-配置项参考)
-9. [模块文件清单](#9-模块文件清单)
+8. [并发安全与稳定性](#8-并发安全与稳定性)
+9. [OpenCV 图像预处理管线](#9-opencv-图像预处理管线)
+10. [配置项参考](#10-配置项参考)
+11. [模块文件清单](#11-模块文件清单)
 
 ---
 
@@ -32,17 +34,19 @@
                          └──────────┬───────────┘
                                     │
                                     ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                  UnifiedDocumentPipeline.process(path)            │
-│                                                                  │
-│  ┌──────────┐    ┌──────────────┐    ┌─────────────────────┐    │
-│  │ classify │ →  │   extract    │ →  │ structurize (可选)   │    │
-│  │ 11 种类型 │    │ per-type     │    │ 仅 exam_pdf 触发     │    │
-│  └──────────┘    └──────┬───────┘    └──────────┬──────────┘    │
-│                         │                       │               │
-│                         ▼                       ▼               │
-│                    .txt sidecar           .exam.json sidecar     │
-└──────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│  _spawn_unified_pipeline_bg(file_path)                              │
+│  ├─ 去重检测 (SHA-256)                                              │
+│  ├─ 全局 Semaphore(2) 并发控制                                      │
+│  └─ asyncio.create_task() → 不阻塞主请求                            │
+│                                                                     │
+│  _run_unified_pipeline_bg (max 600s)                                │
+│  └─ UnifiedDocumentPipeline.process(path)                           │
+│     ├─ classify → 11 DocTypes                                       │
+│     ├─ extract → per-type (OCR 带 OpenCV 预处理 + 120s timeout)     │
+│     ├─ structurize → .exam.json (仅 exam_pdf)                       │
+│     └─ .txt + .exam.json sidecars                                   │
+└─────────────────────────────────────────────────────────────────────┘
                                     │
                     ┌───────────────┼───────────────┐
                     ▼               ▼               ▼
@@ -50,7 +54,7 @@
               ChromaDB         LlamaIndex        sidecars
 ```
 
-**核心设计原则**：所有入口共享同一套分类→提取→结构化逻辑，通过 fire-and-forget 后台任务触发，不阻塞主请求。
+**核心设计原则**：所有入口共享同一套分类→提取→结构化逻辑，通过 fire-and-forget 后台任务触发，全局并发控制 + 超时保护，不阻塞主请求。
 
 ---
 
@@ -90,13 +94,14 @@ result = await UnifiedDocumentPipeline.process(
 # result.sidecar_paths  → [".txt", ".exam.json"]
 # result.content_text  → 提取的纯文本
 # result.doc_type      → DocType enum
+# result.stats          → {file_type, extraction_chars, sidecars, ocr_called, ...}
 ```
 
 **处理流程**:
 
 1. `classify_file(path)` — 根据扩展名 + 内容嗅探返回 DocType
-2. `_extract_*()` — 按类型调用对应提取器
-3. `_write_sidecar(path, content, ".txt")` — 写出纯文本 sidecar
+2. `_extract_*()` — 按类型调用对应提取器（图片/扫描 PDF 路径带 OpenCV 预处理）
+3. `_write_sidecar(path, content, ".txt")` — 原子写出纯文本 sidecar
 4. `_run_exam_pipeline()` — 仅当 `doc_type == exam_pdf` 且 `llm_client` 非空时触发 Phase 1-4
 
 ---
@@ -106,18 +111,24 @@ result = await UnifiedDocumentPipeline.process(
 ### 4.1 纯文本文件 (TEXT)
 
 ```
-.txt/.md/.py/...  →  多编码读取 (utf-8 → gbk → latin-1)  →  .txt
+.txt/.md/.py/...  →  多编码读取 (utf-8 → gbk → latin-1, run_in_executor 异步)
+                  →  .txt
 ```
 
-无 OCR，纯 I/O。
+无 OCR，纯 I/O，`run_in_executor` 避免阻塞事件循环。
 
 ### 4.2 图片文件 (IMAGE)
 
 ```
-.jpg/.png/...  →  base64 编码  →  MiniCPM-V OCR (Ollama)  →  .txt
+.jpg/.png/...
+  →  OpenCV 预处理 (见 §9):
+       降采样(max 1800px) → 灰度化 → 降噪+CLAHE → 倾斜校正 → 二值化
+  →  base64 编码
+  →  MiniCPM-V OCR (Ollama, timeout=120s)
+  →  .txt
 ```
 
-需要 `llm_client`，prompt: "Transcribe all text from this image."
+需要 `llm_client`。OpenCV 不可用时安全降级为原始字节直送 MiniCPM。
 
 ### 4.3 文字层 PDF (TEXT_PDF)
 
@@ -130,11 +141,14 @@ result = await UnifiedDocumentPipeline.process(
 ### 4.4 扫描 PDF (SCANNED_PDF)
 
 ```
-.pdf  →  fitz.open()  →  page.get_pixmap(dpi=200)  →  PNG
-     →  base64  →  MiniCPM-V OCR (逐页)  →  拼接  →  .txt
+.pdf  →  fitz.open()
+  →  每页并发 asyncio.gather:
+       page.get_pixmap(dpi=200) → PNG → OpenCV 预处理(同 §4.2) → base64
+       → MiniCPM-V OCR (timeout=120s)
+  →  拼接  →  .txt
 ```
 
-逐页 OCR，需要 `llm_client`。有文字层的页直接走 TEXT_PDF 路径。
+页级并发 OCR（10 页 ≈ 40s vs 原顺序 300s），需要 `llm_client`。
 
 ### 4.5 考试 PDF (EXAM_PDF)
 
@@ -148,10 +162,10 @@ result = await UnifiedDocumentPipeline.process(
 
 **新格式 (docx/xlsx/pptx)**:
 ```
-.docx  →  python-docx 快速提取
-.xlsx  →  openpyxl 快速提取
-.pptx  →  python-pptx 快速提取
-       →  失败则降级到 markitdown
+.docx  →  python-docx 快速提取 (run_in_executor 异步)
+.xlsx  →  openpyxl 快速提取 (run_in_executor 异步)
+.pptx  →  python-pptx 快速提取 (run_in_executor 异步)
+       →  失败则降级到 markitdown (run_in_executor 异步)
        →  提取内嵌图片 (ZIP-based)
        →  .txt
 ```
@@ -159,11 +173,13 @@ result = await UnifiedDocumentPipeline.process(
 **旧格式 (doc/ppt/xls) + 其他**:
 ```
 .doc/.ppt/.xls/.odt/.rtf
-       →  markitdown 提取 (优先)
+       →  markitdown 提取 (优先, run_in_executor 异步)
        →  旧格式降级: antiword / catppt
        →  OLE 内嵌图片扫描
        →  .txt
 ```
+
+> **异步化**: Office 提取中的同步 I/O（`python-docx` / `openpyxl` / `markitdown`）全部通过 `loop.run_in_executor(None, ...)` 移至线程池执行，不阻塞事件循环。
 
 **markitdown OCR layer** (>= 0.1.5):
 ```
@@ -293,28 +309,27 @@ ExamPaper → JSON 序列化 → .exam.json sidecar
 ### 函数定义
 
 ```python
-# provider_api.py:1078
+# provider_api.py
 def _spawn_unified_pipeline_bg(file_path: str, trace_id: str = "") -> None:
-    """Submit file to unified pipeline as fire-and-forget background task."""
-
-# provider_api.py:1100
-async def _run_unified_pipeline_bg(file_path: str, trace_id: str) -> None:
-    """Actual background task: import → classify → extract → structurize."""
+    """Submit file to unified pipeline as fire-and-forget background task.
+    Deduplicates by SHA-256, respects global semaphore."""
 ```
 
 ### 调用点
 
 | 端点 | 行号 | 调用时机 | 文件位置 | 触发场景 |
 |------|------|---------|---------|---------|
-| `POST /api/ingest/file` | 3700 | 文件写入 SOURCES_DIR 后 | `_spawn_unified_pipeline_bg(dest, trace_id)` | MCP 工具上传 |
-| `POST /api/process/file` | 3584 | 文件写入 SOURCES_DIR 后 | `_spawn_unified_pipeline_bg(dest, trace_id)` | WeChat 文件上传 |
-| `POST /api/kb/ingest-file` | 3208 | temp 文件准备好后 | `_spawn_unified_pipeline_bg(tmp_path, trace_id)` | Web UI KB 同步 |
+| `POST /api/ingest/file` | ~3700 | 文件写入 SOURCES_DIR 后 | `_spawn_unified_pipeline_bg(dest, trace_id)` | MCP 工具上传 |
+| `POST /api/process/file` | ~3584 | 文件写入 SOURCES_DIR 后 | `_spawn_unified_pipeline_bg(dest, trace_id)` | WeChat 文件上传 |
+| `POST /api/kb/ingest-file` | ~3208 | temp 文件准备好后 | `_spawn_unified_pipeline_bg(tmp_path, trace_id)` | Web UI KB 同步 |
 
 ### 设计要点
 
 - **fire-and-forget**: `asyncio.create_task()` — 不阻塞主 HTTP 响应
-- **容错**: 若文件已被删除（temp 文件清理），`_run_unified_pipeline_bg` 静默返回
-- **平台容器零依赖**: `tutor_platform/rag/__init__.py` 使用 `__getattr__` 延迟加载，避免在 platform 容器中触发 deeptutor 导入
+- **SHA-256 去重**: 相同文件哈希不重复提交后台任务
+- **全局并发控制**: `asyncio.Semaphore(2)` 限制同时运行的后台任务数（见 §8）
+- **容错**: 若文件已被删除（temp 文件清理），后台任务静默返回
+- **平台容器零依赖**: `tutor_platform/rag/__init__.py` 使用 `__getattr__` 延迟加载
 
 ---
 
@@ -330,7 +345,127 @@ async def _run_unified_pipeline_bg(file_path: str, trace_id: str) -> None:
 
 ---
 
-## 8. 配置项参考
+## 8. 并发安全与稳定性
+
+### 8.1 全局并发控制
+
+```
+                         _UNIFIED_PIPELINE_SEMAPHORE (max=2)
+
+  请求A ──→ spawn() ──→ 获取 Semaphore ✓ ──→ 运行 pipeline ──→ 释放
+  请求B ──→ spawn() ──→ 获取 Semaphore ✓ ──→ 运行 pipeline ──→ 释放
+  请求C ──→ spawn() ──→ 等待 Semaphore... ──→ (请求B完成)→ ✓ ──→ 运行
+```
+
+**机制**: `asyncio.Semaphore(RAG_PIPELINE_MAX_CONCURRENT_TASKS)` 全局限制同时运行的后台任务数。
+
+**为什么需要**：`fire-and-forget` 不等于 `fire-unlimited`。N 个并发文件上传各 spawn 一个后台任务，每个任务内部又扇出 M 个 MiniCPM 调用——不做限制会导致后端过载（Ollama OOM / 超时雪崩）。
+
+### 8.2 任务超时保护
+
+| 层级 | 超时 | 说明 |
+|------|------|------|
+| 后台任务整体 | 600s (`RAG_PIPELINE_TASK_TIMEOUT_S`) | 超时后 `asyncio.wait_for` 取消任务，释放 Semaphore |
+| 单次 LLM 调用 | 120s | 每个 `llm_client.complete()` 包裹 `asyncio.wait_for(..., timeout=120)` |
+| 块级 OCR | 120s/block | BlockOCREngine 继承统一管线的 120s 限制 |
+
+**为什么需要**: 卡住的 Ollama 调用会永久占用 Semaphore 槽位，导致所有后续请求排队直到 OOM。
+
+### 8.3 扫描 PDF 页级并发
+
+```
+旧: for page in pages:  ← 顺序, 10页=300s
+    ocr(page)
+
+新: asyncio.gather(     ← 并发, 10页≈40s
+    *[ocr_page(i) for i in range(n)])
+```
+
+每页渲染 → OpenCV 预处理 → base64 → MiniCPM OCR（每页独立，无依赖关系）。
+
+### 8.4 Office 提取异步化
+
+所有同步 I/O 调用移至线程池：
+
+```python
+# 旧: 同步阻塞事件循环
+text = _extract_docx_fast(path)
+
+# 新: 线程池执行
+loop = asyncio.get_running_loop()
+text = await loop.run_in_executor(None, _extract_docx_fast, path)
+```
+
+适用: `python-docx`, `openpyxl`, `python-pptx`, `markitdown`, 文本文件解码。
+
+### 8.5 任务去重
+
+```
+_spawn_unified_pipeline_bg()
+  └─ SHA-256(file) → _UNIFIED_PIPELINE_STATUS
+     ├─ 已存在且 status=="running" → skip (去重)
+     └─ 不存在 → create_task() + 记录 "queued"
+```
+
+### 8.6 结果追踪 API
+
+```
+GET /api/pipeline/status?file_hash=<sha256>
+
+→ {"ok": true, "found": true, "status": "done", "doc_type": "text_pdf",
+     "sidecars": [...], "elapsed_s": 2.3}
+
+GET /api/pipeline/status
+
+→ {"ok": true, "total_tracked": 3,
+     "by_status": {"queued": 0, "running": 1, "done": 2, "failed": 0},
+     "pipeline_semaphore": {"max": 2, "locked": true}}
+```
+
+---
+
+## 9. OpenCV 图像预处理管线
+
+所有图片 OCR 路径（§4.2 图片文件 + §4.4 扫描 PDF 每页）统一经过 6 步预处理：
+
+```
+原始图片 bytes
+  │
+  ├─ 1. 降采样 (max 1800px)
+  │      MiniCPM-V 最佳输入 1.8M 像素，超限等比缩放
+  │      cv2.resize(..., INTER_AREA)
+  │
+  ├─ 2. 灰度化
+  │      cv2.COLOR_BGR2GRAY
+  │      去除颜色通道噪声
+  │
+  ├─ 3. 降噪 + CLAHE
+  │      高对比度图片 (std > 40, 如手机截图) → 跳过，节省 40-60% CPU
+  │      低对比度 → cv2.fastNlMeansDenoising + CLAHE(clipLimit=2.0, 8×8)
+  │
+  ├─ 4. 倾斜校正 (deskew)
+  │      cv2.minAreaRect 检测文字方向角
+  │      倾斜 > 0.3° → cv2.warpAffine 旋转校正
+  │
+  ├─ 5. 自适应二值化
+  │      cv2.adaptiveThreshold(ADAPTIVE_THRESH_GAUSSIAN_C, 11, 2)
+  │      黑白二值 → OCR 引擎最优输入
+  │
+  └─ 6. JPEG 编码输出
+         quality=95, 返回 bytes
+```
+
+**实现位置**: `tutor_platform/rag/unified_pipeline.py::_opencv_preprocess_image()`
+
+**应用路径**:
+- `_extract_image_text()` — 图片文件 OCR
+- `_extract_scanned_pdf_text()` — 扫描 PDF 每页渲染后
+
+**降级策略**: OpenCV 不可用时直接返回原始字节，MiniCPM 仍可处理原始图片。
+
+---
+
+## 10. 配置项参考
 
 ### RAG Pipeline 配置 (`RAG_PIPELINE_*`)
 
@@ -343,6 +478,8 @@ async def _run_unified_pipeline_bg(file_path: str, trace_id: str) -> None:
 | `RAG_PIPELINE_EXAM_OCR_DPI` | `300` | 块级 OCR 渲染 DPI |
 | `RAG_PIPELINE_EXAM_MAX_CONCURRENT_BLOCKS` | `3` | 同页并发块数 |
 | `RAG_PIPELINE_EXAM_SAVE_FIGURES` | `true` | 输出中保存图形 PNG |
+| **`RAG_PIPELINE_MAX_CONCURRENT_TASKS`** | **`2`** | **全局并发后台任务数 (§8.1)** |
+| **`RAG_PIPELINE_TASK_TIMEOUT_S`** | **`600`** | **单任务超时秒数 (§8.2)** |
 
 ### 模型配置
 
@@ -357,41 +494,46 @@ markitdown >= 0.1.5 内置 OCR layer (`MarkItDown(llm_client=...)`)，当前版�
 
 ---
 
-## 9. 模块文件清单
+## 11. 模块文件清单
 
-### 新增文件 (本次迭代)
+### 新增文件
 
 | 文件 | 行数 | 职责 |
 |------|------|------|
-| `tutor_platform/rag/unified_pipeline.py` | 575 | 统一入口：分类 → 提取 → 结构化 → sidecar |
+| `tutor_platform/rag/unified_pipeline.py` | ~800 | 统一入口：分类 → 提取(含 OpenCV) → 结构化 → sidecar |
 | `tutor_platform/rag/layout_engine.py` | 270 | Phase 1：PyMuPDF 布局分析，零 LLM |
 | `tutor_platform/rag/block_ocr.py` | 370 | Phase 2：块级 OCR + 图形描述，MiniCPM 分级 prompt |
 | `tutor_platform/rag/exam_structurer.py` | 290 | Phase 3：块→题语义组装，纯规则 |
 | `tutor_platform/rag/__init__.py` | 30 | 延迟加载，platform 容器零 deeptutor 依赖 |
 
-### 修改文件 (本次迭代)
+### 修改文件
 
 | 文件 | 改动 | 行数变化 |
 |------|------|---------|
-| `docker/platform/provider_api.py` | 添加 `_spawn_unified_pipeline_bg` + `_run_unified_pipeline_bg`；3 个 API 端点接入；markitdown OCR layer 适配器 | +150 |
-| `tutor_platform/rag/pipeline.py` | 添加 `_stage_structured_exam` + `_structure_single_exam` + `_write_exam_sidecar` | +180 |
-| `tutor_platform/rag/config.py` | 添加 4 个 `RAG_PIPELINE_EXAM_*` 配置项 | +5 |
-| `docker-compose.dev.yml` | PYTHONPATH 修复 (platform 容器) | +1 |
+| `docker/platform/provider_api.py` | 全局 Semaphore + 超时 + 状态追踪 + pipeline/status API + markitdown OCR | +200 |
+| `tutor_platform/rag/pipeline.py` | `_stage_structured_exam` + `_structure_single_exam` + `_write_exam_sidecar` | +180 |
+| `tutor_platform/rag/config.py` | 添加 `RAG_PIPELINE_EXAM_*` + `RAG_PIPELINE_MAX_CONCURRENT_*` 配置项 | +5 |
+| `docker-compose.dev.yml` | PYTHONPATH 修复 | +1 |
 | `tests/test_pipeline.py` | 更新测试预期适配 `.exam.json` sidecar | +2/-14 |
 
 ### 依赖关系
 
 ```
 unified_pipeline.py
-  ├── layout_engine.py       (Phase 1, 独立模块)
-  ├── block_ocr.py           (Phase 2, 依赖 layout_engine 类型)
-  ├── exam_structurer.py     (Phase 3, 依赖 block_ocr + layout_engine 类型)
-  └── pipeline.py            (Phase 4 集成入口)
+  ├── _opencv_preprocess_image()  (OpenCV 6步预处理, 独立函数)
+  ├── layout_engine.py             (Phase 1, 独立模块)
+  ├── block_ocr.py                 (Phase 2, 依赖 layout_engine 类型)
+  ├── exam_structurer.py           (Phase 3, 依赖 block_ocr + layout_engine 类型)
+  └── pipeline.py                  (Phase 4 集成入口)
 
 provider_api.py
   └── _spawn_unified_pipeline_bg()
-      └── UnifiedDocumentPipeline.process()
-          └── 以上全部
+      ├── SHA-256 去重
+      ├── Semaphore(2) 并发控制
+      └── _run_unified_pipeline_bg()
+          ├── asyncio.wait_for(600s)
+          └── UnifiedDocumentPipeline.process()
+              └── 以上全部
 ```
 
 ### 第三方依赖
@@ -399,9 +541,10 @@ provider_api.py
 | 库 | 版本 | 用途 |
 |----|------|------|
 | PyMuPDF (fitz) | >= 1.26.0 | PDF 文本提取、页渲染、布局分析、矢量分析 |
+| OpenCV (cv2) | - | 图片降采样、灰度化、降噪、CLAHE、倾斜校正、二值化 |
 | markitdown | 0.1.6 | Office 文档提取 + 内嵌 OCR (>= 0.1.5) |
-| python-docx | - | .docx 快速提取 |
-| openpyxl | - | .xlsx 快速提取 |
-| python-pptx | - | .pptx 快速提取 |
+| python-docx | - | .docx 快速提取 (run_in_executor 异步) |
+| openpyxl | - | .xlsx 快速提取 (run_in_executor 异步) |
+| python-pptx | - | .pptx 快速提取 (run_in_executor 异步) |
 | olefile | - | .doc/.ppt/.xls OLE 图像扫描 |
 | ollama (MiniCPM-V) | 4.6 | 块级 OCR + 图形描述 + 图表识别 |
