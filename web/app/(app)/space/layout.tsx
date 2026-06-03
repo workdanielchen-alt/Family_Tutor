@@ -1,3 +1,6 @@
+"use client";
+
+import { usePathname } from "next/navigation";
 import SpaceMiniNav from "@/components/space/SpaceMiniNav";
 
 export default function SpaceLayout({
@@ -5,6 +8,14 @@ export default function SpaceLayout({
 }: Readonly<{
   children: React.ReactNode;
 }>) {
+  const pathname = usePathname();
+
+  // /space (dashboard) in child mode: skip SpaceMiniNav — bottom tabs handle navigation.
+  // Sub-pages (/space/wrong-answers, etc.) use the sidebar in standard workspace mode.
+  if (pathname === "/space") {
+    return <>{children}</>;
+  }
+
   return (
     <div className="flex h-full overflow-hidden">
       <SpaceMiniNav />

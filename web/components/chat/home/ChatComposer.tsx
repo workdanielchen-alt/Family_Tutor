@@ -44,6 +44,7 @@ type SpaceSelectionCounts = {
   questionBank: number;
   skills: number;
   memory: number;
+  wrongAnswers: number;
 };
 import { SpaceContextChips } from "./ChatMessages";
 import { ComposerInput, type ComposerInputHandle } from "./ComposerInput";
@@ -331,6 +332,7 @@ export default memo(function ChatComposer({
     ),
     notebooks: selectedNotebookRecords.length,
     questionBank: selectedQuestionEntries.length,
+    wrongAnswers: 0,
     skills: skillsCount,
     memory: selectedMemoryFiles.length,
   };

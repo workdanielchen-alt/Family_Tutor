@@ -2,31 +2,53 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Home, BarChart3, PenLine, User } from "lucide-react";
+import { LayoutDashboard, PenLine, User } from "lucide-react";
+import dynamic from "next/dynamic";
 import WorkspaceSidebar from "@/components/sidebar/WorkspaceSidebar";
 import UtilitySidebar from "@/components/sidebar/UtilitySidebar";
 import { UnifiedChatProvider } from "@/context/UnifiedChatContext";
 
+const AchievementToast = dynamic(
+  () => import("@/components/child/AchievementToast"),
+  { ssr: false },
+);
+
 const WORKSPACE_PATHS = ["/", "/chat", "/agents", "/book", "/playground"];
-const CHILD_PATHS = ["/home", "/progress", "/practice", "/me"];
 
 const CHILD_TABS = [
-  { key: "home", href: "/home", icon: Home, label: "学习" },
-  { key: "progress", href: "/progress", icon: BarChart3, label: "进度" },
+  { key: "dashboard", href: "/space", icon: LayoutDashboard, label: "仪表盘" },
   { key: "quiz", href: "/practice", icon: PenLine, label: "练习" },
   { key: "me", href: "/me", icon: User, label: "我的" },
 ];
 
 function AppLayoutInner({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
-  const isChild = CHILD_PATHS.some((p) => pathname === p || pathname.startsWith(p + "/"));
-  const isWorkspace = WORKSPACE_PATHS.some((p) => pathname === p || pathname.startsWith(p + "/"));
+  const isChild =
+    pathname === "/space" ||
+    pathname === "/practice" || pathname.startsWith("/practice/") ||
+    pathname === "/me" || pathname.startsWith("/me/");
+  const isWorkspace = WORKSPACE_PATHS.some(
+    (p) => pathname === p || pathname.startsWith(p + "/"),
+  );
 
   // Child mode: bottom tab bar
   if (isChild) {
-    const activeTab = CHILD_TABS.find((t) => pathname.startsWith(t.href)) || CHILD_TABS[0];
+    const activeTab =
+      CHILD_TABS.find((t) => pathname.startsWith(t.href)) || CHILD_TABS[0];
     return (
       <div className="flex h-screen flex-col bg-[var(--background)]">
+        <AchievementToast />
+        <header className="flex items-center justify-between px-4 py-2 border-b border-[var(--border)]/40">
+          <span className="text-sm font-semibold text-[var(--foreground)]">
+            {activeTab.label}
+          </span>
+          <Link
+            href="/chat"
+            className="text-xs text-[var(--muted-foreground)] hover:text-[var(--foreground)] transition-colors"
+          >
+            ← 返回工作台
+          </Link>
+        </header>
         <main className="flex-1 overflow-y-auto px-4 py-4 pb-20">
           <div className="mx-auto max-w-2xl">{children}</div>
         </main>
@@ -39,11 +61,17 @@ function AppLayoutInner({ children }: { children: React.ReactNode }) {
                   key={tab.key}
                   href={tab.href}
                   className={`flex flex-col items-center gap-0.5 rounded-xl px-5 py-2 transition-colors min-h-[52px] min-w-[64px] justify-center ${
-                    isActive ? "text-[var(--primary)]" : "text-[var(--muted-foreground)] hover:text-[var(--foreground)]"
+                    isActive
+                      ? "text-[var(--primary)]"
+                      : "text-[var(--muted-foreground)] hover:text-[var(--foreground)]"
                   }`}
                 >
                   <tab.icon size={28} strokeWidth={isActive ? 2.5 : 1.8} />
-                  <span className={`text-[14px] font-medium ${isActive ? "font-semibold" : ""}`}>{tab.label}</span>
+                  <span
+                    className={`text-[14px] font-medium ${isActive ? "font-semibold" : ""}`}
+                  >
+                    {tab.label}
+                  </span>
                 </Link>
               );
             })}

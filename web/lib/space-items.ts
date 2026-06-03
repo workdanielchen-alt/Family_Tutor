@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  AlertCircle,
   BarChart3,
   ClipboardList,
   History,
@@ -14,6 +15,7 @@ export type SpaceItemKey =
   | "chat_history"
   | "notebooks"
   | "question_bank"
+  | "wrong_answers"
   | "skills";
 
 export type SpaceMemoryFile = "summary" | "profile";
@@ -55,6 +57,13 @@ export const SPACE_ITEMS: SpaceItem[] = [
     label: "Question Bank",
     description: "Review and organize quiz questions across sessions.",
     icon: ClipboardList,
+  },
+  {
+    key: "wrong_answers",
+    href: "/space/wrong-answers",
+    label: "Wrong Answers",
+    description: "Review mistakes grouped by knowledge point with practice generation.",
+    icon: AlertCircle,
   },
   {
     key: "skills",

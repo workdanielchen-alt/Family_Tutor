@@ -10,6 +10,7 @@ type SelectableSpaceKey =
   | "books"
   | "notebooks"
   | "question_bank"
+  | "wrong_answers"
   | "skills"
   | "memory";
 
@@ -18,6 +19,7 @@ export interface ChatSpaceSelectionCounts {
   books: number;
   notebooks: number;
   questionBank: number;
+  wrongAnswers: number;
   skills: number;
   memory: number;
 }
@@ -33,6 +35,7 @@ const ITEM_ORDER: SelectableSpaceKey[] = [
   "books",
   "notebooks",
   "question_bank",
+  "wrong_answers",
   "skills",
   "memory",
 ];
@@ -50,6 +53,8 @@ function countFor(
       return counts.notebooks;
     case "question_bank":
       return counts.questionBank;
+    case "wrong_answers":
+      return counts.wrongAnswers;
     case "skills":
       return counts.skills;
     case "memory":

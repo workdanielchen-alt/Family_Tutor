@@ -207,6 +207,7 @@ export const ComposerInput = memo(
           | "books"
           | "notebooks"
           | "question_bank"
+          | "wrong_answers"
           | "skills"
           | "memory",
       ) => {
@@ -218,6 +219,7 @@ export const ComposerInput = memo(
         else if (key === "question_bank") onSelectQuestionBankPicker();
         else if (key === "skills") onSelectSkillsPicker();
         else if (key === "memory") onSelectMemoryPicker();
+        // "wrong_answers" intentionally not handled — no picker yet
       },
       [
         clearTrailingMention,
