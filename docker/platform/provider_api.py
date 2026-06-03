@@ -1808,6 +1808,7 @@ async def _describe_diagram(file_path: str, trace_id: str) -> str:
 
 
 _MD_INSTANCE: MarkItDown | None = None
+_MD_WITH_OCR: MarkItDown | None = None
 
 
 def _get_markitdown() -> MarkItDown:
@@ -1815,6 +1816,69 @@ def _get_markitdown() -> MarkItDown:
     if _MD_INSTANCE is None:
         _MD_INSTANCE = MarkItDown()
     return _MD_INSTANCE
+
+
+def _get_markitdown_with_ocr() -> MarkItDown:
+    """Get a MarkItDown instance with OCR layer enabled for embedded images.
+
+    markitdown >= 0.1.5 supports an OCR service layer (#1541) that
+    can describe/caption embedded images in documents using an LLM.
+    We reuse the same Ollama MiniCPM-V endpoint used by `_describe_diagram`.
+    """
+    global _MD_WITH_OCR
+    if _MD_WITH_OCR is None:
+        # Use the same Ollama endpoint as _describe_diagram
+        try:
+            _MD_WITH_OCR = MarkItDown(
+                llm_client=_create_markitdown_llm_client(),
+                llm_model=os.getenv("OLLAMA_MODEL", "minicpm-v"),
+            )
+        except Exception:
+            logger.warning("Failed to create MarkItDown OCR instance, falling back to basic")
+            _MD_WITH_OCR = _get_markitdown()
+    return _MD_WITH_OCR
+
+
+def _create_markitdown_llm_client():
+    """Create a simple LLM client compatible with markitdown's OCR layer API."""
+    import requests as _requests
+
+    class _OllamaMarkItDownClient:
+        """Thin adapter for markitdown's LLM client protocol → Ollama API."""
+
+        def __init__(self):
+            self.ollama_url = os.getenv("OLLAMA_URL", "http://ollama:11434")
+
+        def complete(self, prompt: str, **kwargs) -> str:
+            """Call Ollama /api/chat with an image for markitdown OCR."""
+            images = kwargs.get("images", [])
+            payload = {
+                "model": os.getenv("OLLAMA_MODEL", "minicpm-v"),
+                "messages": [{
+                    "role": "user",
+                    "content": prompt,
+                    **({"images": images} if images else {}),
+                }],
+                "stream": False,
+                "options": {"temperature": 0},
+            }
+            try:
+                resp = _requests.post(
+                    f"{self.ollama_url}/api/chat",
+                    json=payload,
+                    timeout=60,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return data.get("message", {}).get("content", "")
+            except Exception as ex:
+                logger.debug("markitdown LLM call failed: %s", ex)
+            return ""
+
+        def is_multimodal(self) -> bool:
+            return True
+
+    return _OllamaMarkItDownClient()
 
 
 def _extract_with_markitdown(file_path: str) -> str:
@@ -1977,9 +2041,9 @@ async def _ocr_office_images(file_path: str, ext: str, trace_id: str) -> str:
                 all_images.append(img)
 
     if not all_images:
-        # Old OLE-based .doc: try scanning streams for image signatures
+        # Old OLE-based .doc/.ppt/.pps/.xls: try scanning streams for image signatures
         # Timebox the OLE scan at 20s to avoid blocking the request.
-        if ext in {".doc", ".ppt", ".pps"}:
+        if ext in {".doc", ".ppt", ".pps", ".xls"}:
             try:
                 loop = asyncio.get_running_loop()
                 ole_images = await asyncio.wait_for(

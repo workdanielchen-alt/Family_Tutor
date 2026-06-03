@@ -342,20 +342,34 @@ class UnifiedDocumentPipeline:
     def _extract_office_text(cls, path: Path, stats: dict) -> str | None:
         """Extract text from Office documents via markitdown or python-docx/openpyxl/pptx."""
         ext = path.suffix.lower()
+        text: str | None = None
 
         # Try python-docx/openpyxl/python-pptx first (faster, no LLM)
         if ext == ".docx":
             text = _extract_docx_fast(path)
-            if text: return text
         elif ext == ".xlsx":
             text = _extract_xlsx_fast(path)
-            if text: return text
         elif ext == ".pptx":
             text = _extract_pptx_fast(path)
-            if text: return text
+        else:
+            # Fall back to markitdown for all others (including .doc, .ppt, .xls)
+            text = _extract_markitdown(path)
 
-        # Fall back to markitdown
-        return _extract_markitdown(path)
+        # If fast extraction failed, try markitdown
+        if not text:
+            text = _extract_markitdown(path)
+
+        # Also try specialized fallbacks for old Office formats
+        if not text and ext in (".doc", ".ppt", ".pps", ".xls", ".odt", ".rtf"):
+            text = _extract_markitdown(path, use_ocr=True)
+
+        # Extract and describe embedded images from the document
+        if text:
+            img_descriptions = _extract_office_images(path, ext)
+            if img_descriptions:
+                text = text + "\n\n" + img_descriptions
+
+        return text
 
     @classmethod
     def _extract_text_file(cls, path: Path, stats: dict) -> str | None:
@@ -542,18 +556,149 @@ def _extract_pptx_fast(path: Path) -> str:
         return ""
 
 
-def _extract_markitdown(path: Path) -> str:
+def _extract_markitdown(path: Path, use_ocr: bool = False) -> str:
     """Extract text via Microsoft markitdown."""
     try:
         from markitdown import MarkItDown
     except ImportError:
         return ""
     try:
-        md = MarkItDown()
+        if use_ocr:
+            md = _get_markitdown_with_ocr_standalone()
+        else:
+            md = MarkItDown()
         result = md.convert(str(path))
         return result.text_content if result else ""
     except Exception:
         return ""
+
+
+def _get_markitdown_with_ocr_standalone() -> "MarkItDown":
+    """Get MarkItDown with OCR layer enabled (standalone, uses env config)."""
+    import os as _os
+
+    try:
+        from markitdown import MarkItDown
+
+        class _SimpleMDLLM:
+            def is_multimodal(self) -> bool:
+                return True
+
+            def complete(self, prompt: str, **kwargs) -> str:
+                import requests
+                url = _os.getenv("OLLAMA_HOST", "http://ollama:11434")
+                images = kwargs.get("images", [])
+                payload = {
+                    "model": _os.getenv("OLLAMA_MODEL", "minicpm-v"),
+                    "messages": [{
+                        "role": "user",
+                        "content": prompt,
+                        **({"images": images} if images else {}),
+                    }],
+                    "stream": False,
+                    "options": {"temperature": 0},
+                }
+                try:
+                    resp = requests.post(f"{url}/api/chat", json=payload, timeout=60)
+                    if resp.status_code == 200:
+                        return resp.json().get("message", {}).get("content", "")
+                except Exception:
+                    pass
+                return ""
+
+        return MarkItDown(llm_client=_SimpleMDLLM(), llm_model="minicpm-v")
+    except Exception:
+        from markitdown import MarkItDown
+        return MarkItDown()
+
+
+# ── Office embedded image extraction ─────────────────────────────
+
+def _extract_office_images(path: Path, ext: str) -> str | None:
+    """Extract embedded images from Office docs (ZIP-based + OLE-based).
+
+    Returns a concatenated description of all found images, or None if
+    no images were found.
+    """
+    import os as _os
+    all_images: list[bytes] = []
+    seen: set[int] = set()
+
+    # ZIP-based Office formats (docx, pptx, xlsx)
+    media_prefixes = {
+        ".docx": ["word/media/"], ".docm": ["word/media/"],
+        ".pptx": ["ppt/media/"], ".pptm": ["ppt/media/"], ".ppsx": ["ppt/media/"],
+        ".xlsx": ["xl/media/"],
+    }.get(ext, [])
+
+    for prefix in media_prefixes:
+        all_images.extend(_extract_zip_images_from_path(path, prefix))
+
+    # OLE-based old Office formats (.doc, .ppt, .xls)
+    if ext in {".doc", ".ppt", ".pps", ".xls"}:
+        all_images.extend(_extract_ole_images_from_path(path, seen))
+
+    if not all_images:
+        return None
+
+    # Build a description section — no MiniCPM OCR needed here,
+    # just note the images exist and their sizes for context
+    lines = ["\n[文档内嵌图片]"]
+    for i, img in enumerate(all_images[:8]):
+        img_type = "PNG" if img[:4] == b"\x89PNG" else "JPEG" if img[:2] == b"\xff\xd8" else "Image"
+        lines.append(f"- 图片{i+1}: {len(img)//1024}KB {img_type}")
+    return "\n".join(lines)
+
+
+def _extract_zip_images_from_path(file_path: Path, media_prefix: str) -> list[bytes]:
+    """Extract image blobs from a ZIP-based Office document."""
+    import zipfile, os as _os
+    images: list[bytes] = []
+    try:
+        with zipfile.ZipFile(str(file_path)) as z:
+            for name in z.namelist():
+                ext_lower = _os.path.splitext(name)[1].lower()
+                if name.startswith(media_prefix) and ext_lower in {
+                    ".png", ".jpg", ".jpeg", ".gif", ".bmp",
+                }:
+                    data = z.read(name)
+                    if len(data) > 500:
+                        images.append(data)
+    except (zipfile.BadZipFile, FileNotFoundError):
+        pass
+    return images
+
+
+def _extract_ole_images_from_path(file_path: Path, seen: set[int]) -> list[bytes]:
+    """Extract image blobs from an OLE-based Office document (.doc/.ppt/.xls)."""
+    images: list[bytes] = []
+    try:
+        import olefile
+    except ImportError:
+        return images
+    try:
+        ole = olefile.OleFileIO(str(file_path))
+        for s in ole.listdir():
+            try:
+                data = ole.openstream(s).read()
+                h = hash(data)
+                if h in seen:
+                    continue
+                sig = data[:8]
+                if (
+                    sig[:2] == b"\xff\xd8"
+                    or sig[:4] == b"\x89PNG"
+                    or sig[:2] == b"BM"
+                    or sig[:4] == b"GIF8"
+                ):
+                    seen.add(h)
+                    images.append(data)
+            except Exception:
+                continue
+        ole.close()
+    except Exception:
+        pass
+    return images
 
 
 def _to_base64(data: bytes) -> str:
