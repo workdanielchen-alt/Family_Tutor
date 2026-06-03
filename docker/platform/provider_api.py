@@ -3247,10 +3247,13 @@ async def api_kb_ingest_file(
     learner_id: str = Form("web"),
     request: Request = None,
 ):
-    """Web UI 上传文件后同步到平台 ChromaDB。
+    """Web UI 上传文件后同步到平台 ChromaDB + DT LlamaIndex。
 
     由 web UI 的 knowledge-api.ts 在 DT LlamaIndex 上传成功后调用。
-    提取文本并只写平台 ChromaDB (DT 那边已经写过了，不重复写)。
+
+    对于扫描 PDF（DT 那边索引的文本为空或极少），OCR 出正文后必须
+    写回 DT LlamaIndex，否则知识库搜索永远找不到这份文档。
+    文本层 PDF 只写 ChromaDB（DT 已有完整文本，不重复）。
     """
     trace_id = _extract_trace_id(request) if request else _generate_trace_id()
     raw = await file.read()
@@ -3285,40 +3288,60 @@ async def api_kb_ingest_file(
         if not extracted:
             return {"ok": False, "error": "No extractable content", "trace_id": trace_id}
 
-        # ── 只写平台 ChromaDB（DT 已在 web UI 上传流程中写入过） ──
-        provider = await _get_provider()
-        import hashlib
+        route = result.get("route", "")
+        # 判断是否扫描 PDF：如果是 OCR 路径产出正文，说明 DT 没有文本层索引
+        # → 必须双写回 DT LlamaIndex
+        needs_dt_sync = route in ("ocr", "document_extract")
 
-        _content_hash = hashlib.sha256(extracted.encode("utf-8")).hexdigest()[:16]
-        docs = _split_content_for_ingest(extracted, file.filename or "unknown")
-        ids = [f"{_content_hash}_{i}" for i in range(len(docs))]
-        metadatas = [
-            {
-                "filename": file.filename or "",
-                "learner_id": learner_id,
-                "source": "web_ui",
-                "trace_id": trace_id,
-            }
-            for _ in docs
-        ]
-        await provider.add_documents(
-            kb_name=kb_name,
-            documents=docs,
-            metadatas=metadatas,
-            ids=ids,
-        )
-        logger.info(
-            "[%s] Web UI KB ingest: %d chunks -> %s",
-            trace_id,
-            len(docs),
-            kb_name,
-        )
+        if needs_dt_sync:
+            # 双写：ChromaDB + DT LlamaIndex（与 WeChat/MCP 路径一致）
+            provider = await _get_provider()
+            await _ingest_to_kb(
+                provider=provider,
+                content=extracted,
+                kb_name=kb_name,
+                filename=file.filename or "unknown",
+                learner_id=learner_id,
+                source="web_ui",
+                trace_id=trace_id,
+            )
+            logger.info(
+                "[%s] Web UI KB ingest (dual-write): %d chars -> %s + DT",
+                trace_id, len(extracted), kb_name,
+            )
+        else:
+            # 文本层 PDF：DT 已有文本，只补写 ChromaDB
+            provider = await _get_provider()
+            import hashlib
+
+            _content_hash = hashlib.sha256(extracted.encode("utf-8")).hexdigest()[:16]
+            docs = _split_content_for_ingest(extracted, file.filename or "unknown")
+            ids = [f"{_content_hash}_{i}" for i in range(len(docs))]
+            metadatas = [
+                {
+                    "filename": file.filename or "",
+                    "learner_id": learner_id,
+                    "source": "web_ui",
+                    "trace_id": trace_id,
+                }
+                for _ in docs
+            ]
+            await provider.add_documents(
+                kb_name=kb_name,
+                documents=docs,
+                metadatas=metadatas,
+                ids=ids,
+            )
+            logger.info(
+                "[%s] Web UI KB ingest (ChromaDB only): %d chunks -> %s",
+                trace_id, len(docs), kb_name,
+            )
         return {
             "ok": True,
             "trace_id": trace_id,
-            "chunks": len(docs),
             "content_len": len(extracted),
             "route": result.get("route", ""),
+            "dt_synced": needs_dt_sync,
         }
     except Exception as e:
         logger.warning("[%s] KB ingest-file error: %s", trace_id, e)
