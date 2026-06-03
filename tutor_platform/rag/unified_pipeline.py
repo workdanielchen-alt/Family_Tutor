@@ -303,7 +303,8 @@ class UnifiedDocumentPipeline:
         async def _ocr_page(i: int) -> tuple[int, str]:
             page = doc[i]
             pix = page.get_pixmap(dpi=200)
-            img_b64 = _to_base64(pix.tobytes("png"))
+            processed = _opencv_preprocess_image(pix.tobytes("png"))
+            img_b64 = _to_base64(processed)
             try:
                 result = await asyncio.wait_for(
                     llm_client.complete(
@@ -337,21 +338,24 @@ class UnifiedDocumentPipeline:
     async def _extract_image_text(
         cls, path: Path, llm_client, stats: dict,
     ) -> str | None:
-        """OCR an image file."""
+        """OCR an image file with OpenCV preprocessing."""
         if llm_client is None:
             return ""
-        img_b64 = _to_base64(path.read_bytes())
+        raw_bytes = path.read_bytes()
+        processed = _opencv_preprocess_image(raw_bytes)
+        img_b64 = _to_base64(processed)
         try:
             result = await asyncio.wait_for(
                 llm_client.complete(
                     "Transcribe all text from this image. Return only the text.",
                     image_data=img_b64,
-                    image_mime_type=_guess_mime(path),
+                    image_mime_type="image/jpeg",
                     image_filename=path.name,
                 ),
                 timeout=120,
             )
             stats["ocr_called"] = 1
+            stats["ocr_preprocessed"] = 1
             return result.strip()
         except asyncio.TimeoutError:
             logger.warning("OCR image %s timed out after 120s", path.name)
@@ -730,6 +734,76 @@ def _to_base64(data: bytes) -> str:
     """Encode bytes to base64 string."""
     import base64
     return base64.b64encode(data).decode("ascii")
+
+
+# ── OpenCV image preprocessing (mirrors provider_api) ────────────
+
+def _opencv_preprocess_image(image_bytes: bytes) -> bytes:
+    """Preprocess image for OCR: downscale → grayscale → denoise → CLAHE → deskew → threshold.
+
+    Mirrors ``_opencv_preprocess_image`` from ``docker/platform/provider_api.py``.
+    When OpenCV is unavailable the raw bytes are returned unchanged.
+    """
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return image_bytes
+
+    nparr = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if img is None:
+        return image_bytes
+
+    try:
+        # 1. Downscale: cap longest side at 1800px (MiniCPM-V 1.8M pixel limit)
+        _MAX_DIM = 1800
+        h, w = img.shape[:2]
+        if max(h, w) > _MAX_DIM:
+            scale = _MAX_DIM / max(h, w)
+            img = cv2.resize(img, (int(w * scale), int(h * scale)),
+                             interpolation=cv2.INTER_AREA)
+
+        # 2. Grayscale
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        # 3. Denoise only noisy images (clean screenshots skip the expensive step)
+        _is_clean = gray.std() > 40
+        if _is_clean:
+            enhanced = gray
+        else:
+            denoised = cv2.fastNlMeansDenoising(gray)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            enhanced = clahe.apply(denoised)
+
+        # 4. Deskew: detect text angle and rotate
+        coords = np.column_stack(np.where(enhanced < 128))
+        if len(coords) > 10:
+            angle = cv2.minAreaRect(coords)[-1]
+            if angle < -45:
+                angle = 90 + angle
+            if abs(angle) > 0.3:
+                h, w = enhanced.shape
+                center = (w // 2, h // 2)
+                M = cv2.getRotationMatrix2D(center, angle, 1.0)
+                enhanced = cv2.warpAffine(
+                    enhanced, M, (w, h),
+                    flags=cv2.INTER_CUBIC,
+                    borderMode=cv2.BORDER_REPLICATE,
+                )
+
+        # 5. Adaptive threshold (binarize)
+        binary = cv2.adaptiveThreshold(
+            enhanced, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            11, 2,
+        )
+
+        _, buffer = cv2.imencode(".jpg", binary, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        return buffer.tobytes()
+    except Exception:
+        return image_bytes
 
 
 def _guess_mime(path: Path) -> str:
