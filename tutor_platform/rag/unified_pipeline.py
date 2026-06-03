@@ -211,11 +211,15 @@ class UnifiedDocumentPipeline:
                 DocType.OFFICE_DOCX, DocType.OFFICE_XLSX, DocType.OFFICE_PPTX,
                 DocType.OFFICE_OLD, DocType.OFFICE_OTHER,
             ):
-                content_text = cls._extract_office_text(path, stats)
+                content_text = await cls._extract_office_text(path, stats)
             elif doc_type == DocType.TEXT:
-                content_text = cls._extract_text_file(path, stats)
+                content_text = await asyncio.get_running_loop().run_in_executor(
+                    None, cls._extract_text_file, path, stats,
+                )
             else:
-                content_text = cls._extract_unknown(path, stats)
+                content_text = await asyncio.get_running_loop().run_in_executor(
+                    None, cls._extract_unknown, path, stats,
+                )
 
             stats["extraction_chars"] = len(content_text) if content_text else 0
         except Exception as exc:
@@ -287,35 +291,47 @@ class UnifiedDocumentPipeline:
     async def _extract_scanned_pdf_text(
         cls, path: Path, llm_client, stats: dict,
     ) -> str:
-        """OCR a scanned PDF using the multimodal LLM."""
+        """OCR a scanned PDF using the multimodal LLM — pages run concurrently."""
         try:
             import fitz
         except ImportError:
             return ""
 
         doc = fitz.open(path)
-        try:
-            pages_text: list[str] = []
-            for i in range(len(doc)):
-                page = doc[i]
-                pix = page.get_pixmap(dpi=200)
-                img_b64 = _to_base64(pix.tobytes("png"))
+        pages_text: list[str] = [""] * len(doc)
 
-                try:
-                    result = await llm_client.complete(
+        async def _ocr_page(i: int) -> tuple[int, str]:
+            page = doc[i]
+            pix = page.get_pixmap(dpi=200)
+            img_b64 = _to_base64(pix.tobytes("png"))
+            try:
+                result = await asyncio.wait_for(
+                    llm_client.complete(
                         "Transcribe all text from this document page. Return only the text.",
                         image_data=img_b64,
                         image_mime_type="image/png",
                         image_filename=f"{path.name}:page{i+1}",
-                    )
-                    pages_text.append(result.strip())
-                except Exception as exc:
-                    logger.warning("OCR page %d of %s failed: %s", i + 1, path.name, exc)
+                    ),
+                    timeout=120,
+                )
+                return i, result.strip()
+            except asyncio.TimeoutError:
+                logger.warning("OCR page %d of %s timed out after 120s", i + 1, path.name)
+                return i, ""
+            except Exception as exc:
+                logger.warning("OCR page %d of %s failed: %s", i + 1, path.name, exc)
+                return i, ""
 
-            stats["ocr_pages"] = len(pages_text)
-            return "\n\n".join(pages_text)
+        try:
+            tasks = [_ocr_page(i) for i in range(len(doc))]
+            results = await asyncio.gather(*tasks)
+            for idx, text in results:
+                pages_text[idx] = text
         finally:
             doc.close()
+
+        stats["ocr_pages"] = sum(1 for t in pages_text if t)
+        return "\n\n".join(pages_text)
 
     @classmethod
     async def _extract_image_text(
@@ -326,46 +342,55 @@ class UnifiedDocumentPipeline:
             return ""
         img_b64 = _to_base64(path.read_bytes())
         try:
-            result = await llm_client.complete(
-                "Transcribe all text from this image. Return only the text.",
-                image_data=img_b64,
-                image_mime_type=_guess_mime(path),
-                image_filename=path.name,
+            result = await asyncio.wait_for(
+                llm_client.complete(
+                    "Transcribe all text from this image. Return only the text.",
+                    image_data=img_b64,
+                    image_mime_type=_guess_mime(path),
+                    image_filename=path.name,
+                ),
+                timeout=120,
             )
             stats["ocr_called"] = 1
             return result.strip()
+        except asyncio.TimeoutError:
+            logger.warning("OCR image %s timed out after 120s", path.name)
+            return ""
         except Exception as exc:
             logger.warning("OCR image %s failed: %s", path.name, exc)
             return ""
 
     @classmethod
-    def _extract_office_text(cls, path: Path, stats: dict) -> str | None:
-        """Extract text from Office documents via markitdown or python-docx/openpyxl/pptx."""
+    async def _extract_office_text(cls, path: Path, stats: dict) -> str | None:
+        """Extract text from Office documents — sync I/O runs in a thread pool."""
+        loop = asyncio.get_running_loop()
         ext = path.suffix.lower()
-        text: str | None = None
+
+        async def _run_sync(fn, *args):
+            return await loop.run_in_executor(None, fn, *args)
 
         # Try python-docx/openpyxl/python-pptx first (faster, no LLM)
+        text: str | None = None
         if ext == ".docx":
-            text = _extract_docx_fast(path)
+            text = await _run_sync(_extract_docx_fast, path)
         elif ext == ".xlsx":
-            text = _extract_xlsx_fast(path)
+            text = await _run_sync(_extract_xlsx_fast, path)
         elif ext == ".pptx":
-            text = _extract_pptx_fast(path)
+            text = await _run_sync(_extract_pptx_fast, path)
         else:
-            # Fall back to markitdown for all others (including .doc, .ppt, .xls)
-            text = _extract_markitdown(path)
+            text = await _run_sync(_extract_markitdown, path)
 
         # If fast extraction failed, try markitdown
         if not text:
-            text = _extract_markitdown(path)
+            text = await _run_sync(_extract_markitdown, path)
 
         # Also try specialized fallbacks for old Office formats
         if not text and ext in (".doc", ".ppt", ".pps", ".xls", ".odt", ".rtf"):
-            text = _extract_markitdown(path, use_ocr=True)
+            text = await _run_sync(_extract_markitdown, path, True)
 
         # Extract and describe embedded images from the document
         if text:
-            img_descriptions = _extract_office_images(path, ext)
+            img_descriptions = await _run_sync(_extract_office_images, path, ext)
             if img_descriptions:
                 text = text + "\n\n" + img_descriptions
 

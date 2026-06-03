@@ -124,6 +124,28 @@ _FILE_PROCESS_CACHE: dict[str, tuple[float, dict]] = {}
 _FILE_CACHE_MAX = 100
 _FILE_CACHE_TTL_S = 1800  # 30 min
 
+# ── Unified pipeline concurrency control ──
+# "fire-and-forget" doesn't mean "fire unlimited."  Without a global gate,
+# N concurrent file uploads each spawn a pipeline task that internally fans
+# out to M MiniCPM calls — the backend melts.  The semaphore limits the
+# total number of pipeline tasks that can run at once, regardless of
+# entry point.
+_UNIFIED_PIPELINE_SEMAPHORE = asyncio.Semaphore(
+    int(os.getenv("RAG_PIPELINE_MAX_CONCURRENT_TASKS", "2"))
+)
+
+# Pipeline task timeout (seconds).  A stuck LLM call would otherwise
+# hold a semaphore slot forever.  After this timeout the task is
+# cancelled and the slot is released.
+_UNIFIED_PIPELINE_TIMEOUT_S = float(
+    os.getenv("RAG_PIPELINE_TASK_TIMEOUT_S", "600")
+)
+
+# ── Pipeline result tracking (in-memory) ──
+# Keys: file_hash → {"status": "running"|"done"|"failed", "result": ...}
+_UNIFIED_PIPELINE_STATUS: dict[str, dict] = {}
+_UNIFIED_PIPELINE_STATUS_MAX = 500  # LRU cap
+
 
 def _hash_file(file_path: str) -> str:
     """Return SHA-256 hex digest of file contents."""
@@ -1083,51 +1105,93 @@ def _spawn_unified_pipeline_bg(file_path: str, trace_id: str = "") -> None:
     sidecars alongside the original file.
 
     This runs independently of the main request flow and never blocks the response.
+    Concurrency is gated by ``_UNIFIED_PIPELINE_SEMAPHORE`` so we never
+    flood the LLM backend with parallel tasks.
     """
-    try:
-        asyncio.create_task(_run_unified_pipeline_bg(file_path, trace_id))
-    except RuntimeError:
-        # No running event loop (e.g. sync context) — silently skip
-        pass
-
-
-async def _run_unified_pipeline_bg(file_path: str, trace_id: str) -> None:
-    """Background task: run unified pipeline on a file."""
-    # Temp files from API uploads may be cleaned up before this task runs
     if not os.path.isfile(file_path):
+        return
+    fhash = _hash_file(file_path)
+    # Avoid duplicate submissions (same file already queued or running)
+    if fhash in _UNIFIED_PIPELINE_STATUS and _UNIFIED_PIPELINE_STATUS[fhash].get("status") == "running":
+        logger.debug("[%s] Unified pipeline already running for %s, skipping duplicate",
+                     trace_id, Path(file_path).name)
+        return
+    _UNIFIED_PIPELINE_STATUS[fhash] = {"status": "queued", "trace_id": trace_id}
+    try:
+        asyncio.create_task(_run_unified_pipeline_bg(file_path, trace_id, fhash))
+    except RuntimeError:
+        _UNIFIED_PIPELINE_STATUS.pop(fhash, None)
+
+
+async def _run_unified_pipeline_bg(file_path: str, trace_id: str, fhash: str) -> None:
+    """Background task: run unified pipeline on a file (with concurrency gate + timeout)."""
+    if not os.path.isfile(file_path):
+        _UNIFIED_PIPELINE_STATUS.pop(fhash, None)
         return
 
     from tutor_platform.rag.unified_pipeline import UnifiedDocumentPipeline
 
-    try:
-        llm_client = get_llm_client()
-        if not llm_client.supports_multimodal_images():
-            llm_client = None
-    except Exception:
-        llm_client = None
+    start_ts = time.time()
+    _UNIFIED_PIPELINE_STATUS[fhash] = {"status": "running", "trace_id": trace_id, "file": file_path}
 
     try:
-        result = await UnifiedDocumentPipeline.process(
-            file_path,
-            llm_client=llm_client,
-            enable_structured_exam=True,
-        )
+        async with _UNIFIED_PIPELINE_SEMAPHORE:
+            # Re-check file existence after acquiring semaphore (may have been cleaned)
+            if not os.path.isfile(file_path):
+                _UNIFIED_PIPELINE_STATUS[fhash] = {"status": "failed", "error": "file cleaned before processing"}
+                return
+
+            try:
+                llm_client = get_llm_client()
+                if not llm_client.supports_multimodal_images():
+                    llm_client = None
+            except Exception:
+                llm_client = None
+
+            async def _run():
+                return await UnifiedDocumentPipeline.process(
+                    file_path,
+                    llm_client=llm_client,
+                    enable_structured_exam=True,
+                )
+
+            result = await asyncio.wait_for(_run(), timeout=_UNIFIED_PIPELINE_TIMEOUT_S)
+
+        elapsed = time.time() - start_ts
         if result.ok:
             logger.info(
-                "[%s] Unified pipeline: %s → %s (%d sidecars)",
+                "[%s] Unified pipeline: %s → %s (%d sidecars, %.1fs)",
                 trace_id, result.doc_type.value, Path(file_path).name,
-                len(result.sidecar_paths),
+                len(result.sidecar_paths), elapsed,
             )
+            _UNIFIED_PIPELINE_STATUS[fhash] = {
+                "status": "done", "trace_id": trace_id,
+                "doc_type": result.doc_type.value,
+                "sidecars": result.sidecar_paths, "elapsed_s": round(elapsed, 1),
+            }
         else:
             logger.warning(
                 "[%s] Unified pipeline failed for %s: %s",
                 trace_id, Path(file_path).name, result.error,
             )
+            _UNIFIED_PIPELINE_STATUS[fhash] = {
+                "status": "failed", "trace_id": trace_id, "error": result.error,
+            }
+    except asyncio.TimeoutError:
+        elapsed = time.time() - start_ts
+        logger.warning("[%s] Unified pipeline timeout after %.0fs for %s", trace_id, elapsed, Path(file_path).name)
+        _UNIFIED_PIPELINE_STATUS[fhash] = {
+            "status": "failed", "trace_id": trace_id,
+            "error": f"timeout after {_UNIFIED_PIPELINE_TIMEOUT_S}s",
+        }
     except Exception as exc:
-        logger.warning(
-            "[%s] Unified pipeline error for %s: %s",
-            trace_id, Path(file_path).name, exc,
-        )
+        logger.warning("[%s] Unified pipeline error for %s: %s", trace_id, Path(file_path).name, exc)
+        _UNIFIED_PIPELINE_STATUS[fhash] = {"status": "failed", "trace_id": trace_id, "error": str(exc)}
+
+    # LRU eviction
+    if len(_UNIFIED_PIPELINE_STATUS) > _UNIFIED_PIPELINE_STATUS_MAX:
+        while len(_UNIFIED_PIPELINE_STATUS) > _UNIFIED_PIPELINE_STATUS_MAX // 2:
+            _UNIFIED_PIPELINE_STATUS.pop(next(iter(_UNIFIED_PIPELINE_STATUS)))
 
 
 async def _handle_inbound_file(
@@ -8081,6 +8145,37 @@ async def health():
         except Exception:
             pass
     return response
+
+
+@app.get("/api/pipeline/status")
+async def pipeline_status(file_hash: str = ""):
+    """Query unified pipeline task status by file SHA-256 hash.
+
+    Returns the status of a background pipeline task: ``queued``, ``running``,
+    ``done``, or ``failed``.  If ``file_hash`` is omitted, returns a summary
+    of all tracked tasks.
+    """
+    if file_hash:
+        entry = _UNIFIED_PIPELINE_STATUS.get(file_hash)
+        if entry is None:
+            return {"ok": True, "found": False}
+        return {"ok": True, "found": True, "file_hash": file_hash, **entry}
+
+    # Summary: count by status
+    counts = {"queued": 0, "running": 0, "done": 0, "failed": 0}
+    for entry in _UNIFIED_PIPELINE_STATUS.values():
+        st = entry.get("status", "unknown")
+        if st in counts:
+            counts[st] += 1
+    return {
+        "ok": True,
+        "total_tracked": len(_UNIFIED_PIPELINE_STATUS),
+        "by_status": counts,
+        "pipeline_semaphore": {
+            "max": int(os.getenv("RAG_PIPELINE_MAX_CONCURRENT_TASKS", "2")),
+            "locked": _UNIFIED_PIPELINE_SEMAPHORE.locked(),
+        },
+    }
 
 
 @app.get("/api/device/mdns/status")
