@@ -1,6 +1,6 @@
 # DeepTutor 统一文档处理架构
 
-> 版本: 1.1 | 最后更新: 2026-06-04
+> 版本: 1.2 | 最后更新: 2026-06-04
 
 ## 目录
 
@@ -10,6 +10,7 @@
 4. [各类型文档处理路径](#4-各类型文档处理路径)
 5. [试卷结构化专属管线 (Phase 1-4)](#5-试卷结构化专属管线)
 6. [集成点 — 三个 API 端点](#6-集成点--三个-api-端点)
+   - [6.1 KB 同步双写决策](#61-kb-同步双写决策)
 7. [输出产物规范](#7-输出产物规范)
 8. [并发安全与稳定性](#8-并发安全与稳定性)
 9. [OpenCV 图像预处理管线](#9-opencv-图像预处理管线)
@@ -55,6 +56,26 @@
 ```
 
 **核心设计原则**：所有入口共享同一套分类→提取→结构化逻辑，通过 fire-and-forget 后台任务触发，全局并发控制 + 超时保护，不阻塞主请求。
+
+### 扫描 PDF 入库完整链路
+
+```
+Web UI 上传 scanned.pdf
+  │
+  ├─→ [Deeptutor] LlamaIndex 索引
+  │      fitz.get_text() → 空 (无文本层) → 向量为 0
+  │
+  └─→ [Platform] POST /api/kb/ingest-file (fire-and-forget)
+         ├─ _handle_inbound_file()
+         │   └─ fitz → 无文本 → markitdown → 仍空 → 识别为扫描 PDF
+         │   └─ get_pixmap(dpi=300) → OpenCV 预处理 → MiniCPM OCR
+         │
+         ├─ route == "document_extract" → **双写**
+         │   └─ _ingest_to_kb(content, kb_name)
+         │       ├─ ① ChromaDB: 教学摘要 embedding → /data/chromadb
+         │       └─ ② DT LlamaIndex: .txt → POST /api/v1/knowledge/{kb}/upload
+         │
+         └─ _spawn_unified_pipeline_bg() → .txt + .exam.json sidecar
 
 ---
 
@@ -322,6 +343,39 @@ def _spawn_unified_pipeline_bg(file_path: str, trace_id: str = "") -> None:
 | `POST /api/ingest/file` | ~3700 | 文件写入 SOURCES_DIR 后 | `_spawn_unified_pipeline_bg(dest, trace_id)` | MCP 工具上传 |
 | `POST /api/process/file` | ~3584 | 文件写入 SOURCES_DIR 后 | `_spawn_unified_pipeline_bg(dest, trace_id)` | WeChat 文件上传 |
 | `POST /api/kb/ingest-file` | ~3208 | temp 文件准备好后 | `_spawn_unified_pipeline_bg(tmp_path, trace_id)` | Web UI KB 同步 |
+
+### 6.1 KB 同步双写决策
+
+`POST /api/kb/ingest-file` 是 KB 扫描 PDF 入库的关键路径。它根据文件 OCR 路由决定写策略：
+
+```
+Web UI KB 上传 scanned.pdf
+  └─→ Deeptutor 侧 (LlamaIndex): fitz 提取文字 → 空 (扫描版无文本层)
+       → LlamaIndex 索引的是空向量 🔴
+
+前端 fire-and-forget ──→ POST /api/kb/ingest-file
+  └─→ _handle_inbound_file() → OCR 出正文
+       │
+       ├─ route == "ocr" / "document_extract"
+       │    → _ingest_to_kb() 双写:
+       │       ① ChromaDB (平台向量库)
+       │       ② DT LlamaIndex (创建 .txt → upload API 回写)
+       │
+       └─ route == "text" (文字层 PDF, DT 已有完整文本)
+            → 仅写 ChromaDB (不重复写 DT)
+```
+
+| 路由 | 文件类型 | ChromaDB | DT LlamaIndex | 说明 |
+|------|---------|----------|--------------|------|
+| `ocr` | 图片文件 | ✅ | ✅ 双写 | OCR 出正文，DT 没有 |
+| `document_extract` | 扫描 PDF / Office | ✅ | ✅ 双写 | OCR/markitdown 出正文，DT 没有 |
+| `text` | 文字层 PDF / 纯文本 | ✅ | ❌ 不写 | DT 已有完整文本层索引 |
+| `ocr_fallback` | OCR 部分失败 | ❌ | ❌ | 质量不足不入库 |
+
+**`_ingest_to_kb()` 双写流程**（`provider_api.py:2180`）:
+1. 生成教学摘要（v3, best-effort）
+2. 分块后写入平台 ChromaDB（`provider.add_documents()`）
+3. 创建临时 `.txt` → 通过 `POST /api/v1/knowledge/{kb}/upload` 回写 DT LlamaIndex
 
 ### 设计要点
 
