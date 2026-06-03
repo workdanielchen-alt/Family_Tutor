@@ -38,6 +38,7 @@ class TeachSession:
     total_questions: int     # 估算总题数
     current_question: int    # 当前进度（0 = 未开始）
     first_question: str      # 缓存的第一题文本
+    dt_session_id: str = ""  # 绑定的 DT 聊天 session ID
     created_at: float = 0.0
     expires_at: float = 0.0
     completed_at: Optional[float] = None
@@ -81,6 +82,7 @@ class TeachSessionStore:
         source_file: str = "",
         total_questions: int = 0,
         first_question: str = "",
+        dt_session_id: str = "",
     ) -> TeachSession:
         """创建新的教学会话。"""
         now = time.time()
@@ -94,6 +96,7 @@ class TeachSessionStore:
             total_questions=total_questions,
             current_question=0,
             first_question=first_question,
+            dt_session_id=dt_session_id,
             created_at=now,
             expires_at=now + SESSION_TTL_HOURS * 3600,
         )
