@@ -59,9 +59,6 @@ def extract_pdf_text(
 
             kwargs["use_ocr"] = True
             kwargs["ocr_function"] = get_minicpm_ocr_function(trace_id=ocr_trace_id)
-            # pymupdf4llm's auto-detection may skip pages with no text-like features.
-            # When the caller explicitly enabled OCR (e.g. scanned PDF with empty
-            # text layer), force OCR on all pages so MiniCPM-V processes every page.
             kwargs["force_ocr"] = True
         else:
             kwargs["use_ocr"] = False
