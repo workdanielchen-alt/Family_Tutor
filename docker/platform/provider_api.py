@@ -1519,9 +1519,10 @@ async def _pdf_manual_ocr_fallback(file_path: str, trace_id: str, kb_name: str =
         if _chroma_kb and any(pages_text[i] for i in range(batch_start, min(batch_start + BATCH, num_pages))):
             try:
                 _batch_indices = [i for i in range(batch_start, min(batch_start + BATCH, num_pages)) if pages_text[i]]
+                # Use deterministic IDs: filename+page_number → same ID every run → ChromaDB auto-upsert, never duplicates
                 import hashlib as _hl
-                _chunk_hash = _hl.sha256(str(_batch_indices).encode()).hexdigest()[:12]
-                _ids = [f"{_chunk_hash}_p{i}" for i in _batch_indices]
+                _fp = (filename or Path(file_path).name).encode("utf-8")
+                _ids = [f"{_hl.sha256(_fp + str(i).encode()).hexdigest()[:16]}_p{i}" for i in _batch_indices]
                 _md = [{"filename": filename, "kb_name": kb_name, "source": "ocr_batch", "page_number": i} for i in _batch_indices]
                 _docs = [pages_text[i] for i in _batch_indices]
                 from tutor_platform.unified_provider import get_provider_instance
@@ -1531,6 +1532,40 @@ async def _pdf_manual_ocr_fallback(file_path: str, trace_id: str, kb_name: str =
                             trace_id, batch_start + 1, min(batch_start + BATCH, num_pages), len(_docs))
             except Exception as _e:
                 logger.warning("[%s] Incremental write failed (non-fatal): %s", trace_id, _e)
+
+    # ── Retry failed pages once (ollama 500 / timeout under load) ──
+    _failed = [i for i in range(num_pages) if not pages_text[i]]
+    if _failed:
+        logger.info("[%s] Retrying %d failed pages...", trace_id, len(_failed))
+        for idx in _failed:
+            try:
+                page_obj = doc[idx]
+                pix = page_obj.get_pixmap(dpi=200)
+                processed = preprocess_image_bytes(pix.tobytes("png"))
+                page_text = await _ocr_image_bytes(processed, trace_id)
+                if page_text and page_text.strip():
+                    pages_text[idx] = f"--- Page {idx + 1} ---\n{page_text.strip()}"
+                    logger.info("[%s] Retry page %d OK", trace_id, idx + 1)
+                else:
+                    logger.warning("[%s] Retry page %d still empty", trace_id, idx + 1)
+                await asyncio.sleep(1)  # brief backoff
+            except Exception as exc:
+                logger.warning("[%s] Retry page %d failed: %s", trace_id, idx + 1, exc)
+        # Save retried pages
+        _retried = [i for i in _failed if pages_text[i]]
+        if _retried and _chroma_kb:
+            try:
+                import hashlib as _hl
+                _fp = (filename or Path(file_path).name).encode("utf-8")
+                _ids = [f"{_hl.sha256(_fp + str(i).encode()).hexdigest()[:16]}_r_p{i}" for i in _retried]
+                _md = [{"filename": filename, "kb_name": kb_name, "source": "ocr_retry", "page_number": i} for i in _retried]
+                _docs = [pages_text[i] for i in _retried]
+                from tutor_platform.unified_provider import get_provider_instance
+                _p = get_provider_instance()
+                await _p.add_documents(kb_name=_chroma_kb, documents=_docs, metadatas=_md, ids=_ids)
+                logger.info("[%s] Saved %d retried pages to ChromaDB", trace_id, len(_retried))
+            except Exception as _e:
+                logger.warning("[%s] Retry save failed (non-fatal): %s", trace_id, _e)
 
     doc.close()
 
