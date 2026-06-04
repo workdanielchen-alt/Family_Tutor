@@ -516,7 +516,7 @@ class _TTLock:
 _llm_lock = _TTLock(ttl=120)
 
 # OCR 并发控制: 最多 2 个并发 OCR 请求, 防止 NPU OOM.
-_ocr_semaphore = asyncio.Semaphore(2)
+_ocr_semaphore = asyncio.Semaphore(1)  # Single-request MiniCPM-V CPU inference avoids timeouts
 
 # OCR warm-once: 首次图片请求时 warm, 后续跳过 (模型加载后常驻).
 # 持久化到文件, 容器重启后跳过 warm (模型在 rkllama 容器中常驻).
