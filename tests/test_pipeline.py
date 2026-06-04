@@ -73,7 +73,7 @@ def mixed_pdf(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def existing_sidecar_pdf(tmp_path: Path) -> Path:
-    """A scanned PDF that already has a ``.ocr.txt`` sidecar."""
+    """A scanned PDF that already has a ``.ocr.md`` sidecar."""
     import fitz
     path = tmp_path / "existing.pdf"
     doc = fitz.open()
@@ -81,7 +81,7 @@ def existing_sidecar_pdf(tmp_path: Path) -> Path:
     doc.save(str(path))
     doc.close()
     # Pre-create sidecar
-    sidecar = path.with_name(path.stem + ".ocr.txt")
+    sidecar = path.with_name(path.stem + ".ocr.md")
     sidecar.write_text("Existing OCR content.", encoding="utf-8")
     return path
 
@@ -145,10 +145,10 @@ class TestProcess:
     async def test_scanned_pdf_creates_sidecar(self, scanned_pdf, mock_llm_client):
         with patch("tutor_platform.rag.pipeline.get_llm_client", return_value=mock_llm_client):
             result = await run_pipeline([str(scanned_pdf)])
-        # pipeline creates .ocr.txt + possibly .exam.json sidecars
+        # pipeline creates .ocr.md + possibly .exam.json sidecars
         assert len(result) >= 2
         assert result[0] == str(scanned_pdf)
-        sidecar_path = next((p for p in result if p.endswith(".ocr.txt")), None)
+        sidecar_path = next((p for p in result if p.endswith(".ocr.md")), None)
         assert sidecar_path is not None
         assert os.path.isfile(sidecar_path)
         content = Path(sidecar_path).read_text(encoding="utf-8")
@@ -163,7 +163,7 @@ class TestProcess:
         # mixed.pdf has 4 pages: text, blank, text, blank → 2 pages should be OCR'd
         assert len(result) >= 2
         assert result[0] == str(mixed_pdf)
-        sidecar = next((p for p in result if p.endswith(".ocr.txt")), None)
+        sidecar = next((p for p in result if p.endswith(".ocr.md")), None)
         assert sidecar is not None
         assert mock_llm_client.complete.await_count == 2  # 2 pages without text
         content = Path(sidecar).read_text(encoding="utf-8")
@@ -177,12 +177,12 @@ class TestProcess:
             # First run — creates sidecars
             result1 = await run_pipeline([str(existing_sidecar_pdf)])
             assert len(result1) >= 2
-            assert any(p.endswith(".ocr.txt") for p in result1)
+            assert any(p.endswith(".ocr.md") for p in result1)
             # Second run — pipeline re-OCRs but dedup removes the duplicate
             result2 = await run_pipeline(result1)
             assert len(result2) >= 2
             assert result2[0] == str(existing_sidecar_pdf)
-            assert any(p.endswith(".ocr.txt") for p in result2)
+            assert any(p.endswith(".ocr.md") for p in result2)
 
     @pytest.mark.asyncio
     async def test_config_disabled_skips_ocr(self, scanned_pdf, mock_llm_client):
@@ -207,7 +207,7 @@ class TestProcess:
         # Even with failure, sidecars are created (with empty text for failed pages)
         assert len(result) >= 2
         assert result[0] == str(scanned_pdf)
-        assert any(p.endswith(".ocr.txt") for p in result)
+        assert any(p.endswith(".ocr.md") for p in result)
 
     @pytest.mark.asyncio
     async def test_fake_pdf_read_as_text(self, fake_pdf_text):
@@ -216,9 +216,9 @@ class TestProcess:
             mock_client = mock_get.return_value
             mock_client.supports_multimodal_images.return_value = True
             result = await run_pipeline([str(fake_pdf_text)])
-        # Fake .pdf replaced by .ocr.txt sidecar
+        # Fake .pdf replaced by .ocr.md sidecar
         assert len(result) == 1
-        assert result[0].endswith(".ocr.txt")
+        assert result[0].endswith(".ocr.md")
         assert os.path.isfile(result[0])
         content = Path(result[0]).read_text(encoding="utf-8")
         assert "WeChat gateway" in content
@@ -247,10 +247,10 @@ class TestProcessingContext:
 
     def test_sidecar_recording(self):
         ctx = ProcessingContext()
-        ctx.record_sidecar(Path("a.pdf"), Path("a.ocr.txt"))
+        ctx.record_sidecar(Path("a.pdf"), Path("a.ocr.md"))
         assert ctx.stats["sidecars_created"] == 1
         assert Path("a.pdf") in ctx.sidecars
-        assert ctx.sidecars[Path("a.pdf")] == [Path("a.ocr.txt")]
+        assert ctx.sidecars[Path("a.pdf")] == [Path("a.ocr.md")]
 
 
 class TestPipelineConfig:

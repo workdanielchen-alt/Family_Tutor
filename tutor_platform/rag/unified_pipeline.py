@@ -21,6 +21,18 @@ from typing import TYPE_CHECKING
 
 logger = logging.getLogger(__name__)
 
+from tutor_platform.rag.extractors import (
+    extract_docx_text,
+    extract_markitdown,
+    extract_pdf_text,
+    extract_pptx_text,
+    extract_text,
+    extract_text_file,
+    extract_xlsx_text,
+    has_pdf_text_layer,
+)
+from tutor_platform.tools.preprocess import preprocess_image_bytes
+
 if TYPE_CHECKING:
     from deeptutor.services.llm.client import LLMClient
 
@@ -207,18 +219,10 @@ class UnifiedDocumentPipeline:
                 content_text = await cls._extract_pdf_text(path, doc_type, llm_client, stats)
             elif doc_type == DocType.IMAGE:
                 content_text = await cls._extract_image_text(path, llm_client, stats)
-            elif doc_type in (
-                DocType.OFFICE_DOCX, DocType.OFFICE_XLSX, DocType.OFFICE_PPTX,
-                DocType.OFFICE_OLD, DocType.OFFICE_OTHER,
-            ):
-                content_text = await cls._extract_office_text(path, stats)
-            elif doc_type == DocType.TEXT:
-                content_text = await asyncio.get_running_loop().run_in_executor(
-                    None, cls._extract_text_file, path, stats,
-                )
             else:
+                # All other types: unified dispatch via extractors.py
                 content_text = await asyncio.get_running_loop().run_in_executor(
-                    None, cls._extract_unknown, path, stats,
+                    None, extract_text, path,
                 )
 
             stats["extraction_chars"] = len(content_text) if content_text else 0
@@ -235,11 +239,11 @@ class UnifiedDocumentPipeline:
                 content_text="", stats=stats,
             )
 
-        # 3. Write plain-text sidecar
-        txt_path = cls._write_sidecar(path, content_text, suffix=".txt")
-        if txt_path:
-            sidecar_paths.append(txt_path)
-            stats["sidecars"].append(".txt")
+        # 3. Write markdown sidecar
+        md_path = cls._write_sidecar(path, content_text, suffix=".md")
+        if md_path:
+            sidecar_paths.append(md_path)
+            stats["sidecars"].append(".md")
 
         # 4. Structured exam pipeline (Phase 1-4) for exam PDFs
         if enable_structured_exam and doc_type == DocType.EXAM_PDF and llm_client:
@@ -270,69 +274,18 @@ class UnifiedDocumentPipeline:
     async def _extract_pdf_text(
         cls, path: Path, doc_type: DocType, llm_client, stats: dict,
     ) -> str | None:
-        """Extract text from any PDF type."""
-        # For text-layer PDFs, use pymupdf directly
-        if doc_type == DocType.TEXT_PDF:
-            return _extract_text_pdf_fast(path)
+        """Extract text from any PDF type via pymupdf4llm + MiniCPM-V OCR.
 
-        # For scanned/exam PDFs: try pymupdf first, then OCR
-        text = _extract_text_pdf_fast(path)
-        if text and len(text.strip()) > 50:
-            return text
-
-        # Need OCR — requires LLM client
-        if llm_client is None:
-            logger.warning("No LLM client available for scanned PDF %s", path.name)
-            return text or ""
-
-        return await cls._extract_scanned_pdf_text(path, llm_client, stats)
-
-    @classmethod
-    async def _extract_scanned_pdf_text(
-        cls, path: Path, llm_client, stats: dict,
-    ) -> str:
-        """OCR a scanned PDF using the multimodal LLM — pages run concurrently."""
-        try:
-            import fitz
-        except ImportError:
-            return ""
-
-        doc = fitz.open(path)
-        pages_text: list[str] = [""] * len(doc)
-
-        async def _ocr_page(i: int) -> tuple[int, str]:
-            page = doc[i]
-            pix = page.get_pixmap(dpi=200)
-            processed = _opencv_preprocess_image(pix.tobytes("png"))
-            img_b64 = _to_base64(processed)
-            try:
-                result = await asyncio.wait_for(
-                    llm_client.complete(
-                        "Transcribe all text from this document page. Return only the text.",
-                        image_data=img_b64,
-                        image_mime_type="image/png",
-                        image_filename=f"{path.name}:page{i+1}",
-                    ),
-                    timeout=120,
-                )
-                return i, result.strip()
-            except asyncio.TimeoutError:
-                logger.warning("OCR page %d of %s timed out after 120s", i + 1, path.name)
-                return i, ""
-            except Exception as exc:
-                logger.warning("OCR page %d of %s failed: %s", i + 1, path.name, exc)
-                return i, ""
-
-        try:
-            tasks = [_ocr_page(i) for i in range(len(doc))]
-            results = await asyncio.gather(*tasks)
-            for idx, text in results:
-                pages_text[idx] = text
-        finally:
-            doc.close()
-
-        stats["ocr_pages"] = sum(1 for t in pages_text if t)
-        return "\n\n".join(pages_text)
+        Uses ``extract_pdf_text(ocr_enabled=True)`` which delegates to
+        pymupdf4llm's hybrid OCR pipeline: text-layer pages pass through
+        unchanged, scanned regions are OCR'd via MiniCPM-V / rkllama.
+        No Tesseract required.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: extract_pdf_text(path, ocr_enabled=True),
+        )
 
     @classmethod
     async def _extract_image_text(
@@ -342,7 +295,7 @@ class UnifiedDocumentPipeline:
         if llm_client is None:
             return ""
         raw_bytes = path.read_bytes()
-        processed = _opencv_preprocess_image(raw_bytes)
+        processed = preprocess_image_bytes(raw_bytes)
         img_b64 = _to_base64(processed)
         try:
             result = await asyncio.wait_for(
@@ -373,24 +326,20 @@ class UnifiedDocumentPipeline:
         async def _run_sync(fn, *args):
             return await loop.run_in_executor(None, fn, *args)
 
-        # Try python-docx/openpyxl/python-pptx first (faster, no LLM)
+        # Try python-docx/openpyxl/python-pptx first (faster, richer output)
         text: str | None = None
         if ext == ".docx":
-            text = await _run_sync(_extract_docx_fast, path)
+            text = await _run_sync(extract_docx_text, path)
         elif ext == ".xlsx":
-            text = await _run_sync(_extract_xlsx_fast, path)
+            text = await _run_sync(extract_xlsx_text, path)
         elif ext == ".pptx":
-            text = await _run_sync(_extract_pptx_fast, path)
+            text = await _run_sync(extract_pptx_text, path)
         else:
-            text = await _run_sync(_extract_markitdown, path)
+            text = await _run_sync(extract_markitdown, path)
 
-        # If fast extraction failed, try markitdown
+        # If extraction failed, try markitdown as universal fallback
         if not text:
-            text = await _run_sync(_extract_markitdown, path)
-
-        # Also try specialized fallbacks for old Office formats
-        if not text and ext in (".doc", ".ppt", ".pps", ".xls", ".odt", ".rtf"):
-            text = await _run_sync(_extract_markitdown, path, True)
+            text = await _run_sync(extract_markitdown, path)
 
         # Extract and describe embedded images from the document
         if text:
@@ -425,68 +374,17 @@ class UnifiedDocumentPipeline:
         cls, path: Path, llm_client, max_pages: int, stats: dict,
     ) -> str | None:
         """Run Phase 1-4 structured exam pipeline on a PDF."""
-        from tutor_platform.rag.layout_engine import PaperLayoutEngine
-        from tutor_platform.rag.block_ocr import BlockOCREngine
-        from tutor_platform.rag.exam_structurer import ExamStructurer
-        import json as json_mod
+        from tutor_platform.rag.exam_pipeline import run_exam_pipeline, serialize_exam_paper_json
 
-        # Phase 1: Layout
-        layout = PaperLayoutEngine.process(path)
-
-        # Phase 2: Block OCR
-        ocr = BlockOCREngine(llm_client, path)
-        try:
-            # Limit pages
-            pages_to_process = layout.pages[:min(len(layout.pages), max_pages)]
-            page_contents = []
-            for pg in pages_to_process:
-                contents = await ocr.process_page(pg, save_figures=False)
-                page_contents.append(contents)
-        finally:
-            ocr.close()
-
-        # Phase 3: Structure
-        exam = ExamStructurer.structure(
-            pages_to_process, page_contents, file_hash=layout.file_hash,
+        exam_dict = await run_exam_pipeline(
+            path, llm_client, max_pages=max_pages,
+            save_figures=False, skip_non_exam=False,
         )
-        stats["exam_questions"] = len(exam.questions)
+        if exam_dict is None:
+            return None
 
-        # Phase 4: Serialize
-        serialized = {
-            "paper_id": exam.paper_id,
-            "raw_file_hash": exam.raw_file_hash,
-            "total_pages": exam.total_pages,
-            "metadata": {
-                "subject": exam.metadata.subject,
-                "grade": exam.metadata.grade,
-                "exam_type": exam.metadata.exam_type,
-                "year": exam.metadata.year,
-                "total_score": exam.metadata.total_score,
-                "duration_minutes": exam.metadata.duration_minutes,
-            },
-            "questions": [
-                {
-                    "question_id": q.question_id,
-                    "index": q.index,
-                    "type": q.type,
-                    "content": q.content,
-                    "options": q.options,
-                    "answer": q.answer,
-                    "score": q.score,
-                    "page_num": q.page_num,
-                    "figures": [
-                        {
-                            "figure_id": f.figure_id,
-                            "bbox": list(f.bbox),
-                            "description": f.description,
-                        }
-                        for f in q.figures
-                    ],
-                }
-                for q in exam.questions
-            ],
-        }
-        return json_mod.dumps(serialized, ensure_ascii=False, indent=2)
+        stats["exam_questions"] = len(exam_dict.get("questions", []))
+        return serialize_exam_paper_json(exam_dict)
 
     # ── Sidecar helpers ──────────────────────────────────────────
 
@@ -507,138 +405,6 @@ class UnifiedDocumentPipeline:
     def _write_sidecar_raw(cls, file_path: Path, content: str, suffix: str) -> str | None:
         """Write a raw sidecar file (not text-transformed)."""
         return cls._write_sidecar(file_path, content, suffix)
-
-
-# ── Standalone extraction helpers (no LLM) ────────────────────────
-
-def _extract_text_pdf_fast(path: Path) -> str:
-    """Extract text from a PDF via pymupdf (fast, no LLM)."""
-    try:
-        import fitz
-    except ImportError:
-        return ""
-    try:
-        doc = fitz.open(path)
-        pages = []
-        for page in doc:
-            pages.append(page.get_text().strip())
-        doc.close()
-        return "\n\n".join(pages)
-    except Exception:
-        return ""
-
-
-def _extract_docx_fast(path: Path) -> str:
-    """Extract text from .docx via python-docx."""
-    try:
-        from docx import Document
-    except ImportError:
-        return ""
-    try:
-        doc = Document(str(path))
-        return "\n".join(p.text for p in doc.paragraphs if p.text)
-    except Exception:
-        return ""
-
-
-def _extract_xlsx_fast(path: Path) -> str:
-    """Extract text from .xlsx via openpyxl."""
-    try:
-        from openpyxl import load_workbook
-    except ImportError:
-        return ""
-    try:
-        wb = load_workbook(str(path), read_only=True, data_only=True)
-        rows: list[str] = []
-        for sheet_name in wb.sheetnames:
-            ws = wb[sheet_name]
-            for row in ws.iter_rows(values_only=True):
-                row_text = "\t".join(str(c) if c is not None else "" for c in row)
-                if row_text.strip():
-                    rows.append(row_text)
-        wb.close()
-        return "\n".join(rows)
-    except Exception:
-        return ""
-
-
-def _extract_pptx_fast(path: Path) -> str:
-    """Extract text from .pptx via python-pptx."""
-    try:
-        from pptx import Presentation
-    except ImportError:
-        return ""
-    try:
-        prs = Presentation(str(path))
-        slides: list[str] = []
-        for i, slide in enumerate(prs.slides):
-            slide_text: list[str] = []
-            for shape in slide.shapes:
-                if shape.has_text_frame:
-                    for p in shape.text_frame.paragraphs:
-                        if p.text.strip():
-                            slide_text.append(p.text.strip())
-            if slide_text:
-                slides.append(f"Slide {i+1}:\n" + "\n".join(slide_text))
-        return "\n\n".join(slides)
-    except Exception:
-        return ""
-
-
-def _extract_markitdown(path: Path, use_ocr: bool = False) -> str:
-    """Extract text via Microsoft markitdown."""
-    try:
-        from markitdown import MarkItDown
-    except ImportError:
-        return ""
-    try:
-        if use_ocr:
-            md = _get_markitdown_with_ocr_standalone()
-        else:
-            md = MarkItDown()
-        result = md.convert(str(path))
-        return result.text_content if result else ""
-    except Exception:
-        return ""
-
-
-def _get_markitdown_with_ocr_standalone() -> "MarkItDown":
-    """Get MarkItDown with OCR layer enabled (standalone, uses env config)."""
-    import os as _os
-
-    try:
-        from markitdown import MarkItDown
-
-        class _SimpleMDLLM:
-            def is_multimodal(self) -> bool:
-                return True
-
-            def complete(self, prompt: str, **kwargs) -> str:
-                import requests
-                url = _os.getenv("OLLAMA_HOST", "http://ollama:11434")
-                images = kwargs.get("images", [])
-                payload = {
-                    "model": _os.getenv("OLLAMA_MODEL", "minicpm-v"),
-                    "messages": [{
-                        "role": "user",
-                        "content": prompt,
-                        **({"images": images} if images else {}),
-                    }],
-                    "stream": False,
-                    "options": {"temperature": 0},
-                }
-                try:
-                    resp = requests.post(f"{url}/api/chat", json=payload, timeout=60)
-                    if resp.status_code == 200:
-                        return resp.json().get("message", {}).get("content", "")
-                except Exception:
-                    pass
-                return ""
-
-        return MarkItDown(llm_client=_SimpleMDLLM(), llm_model="minicpm-v")
-    except Exception:
-        from markitdown import MarkItDown
-        return MarkItDown()
 
 
 # ── Office embedded image extraction ─────────────────────────────
@@ -734,76 +500,6 @@ def _to_base64(data: bytes) -> str:
     """Encode bytes to base64 string."""
     import base64
     return base64.b64encode(data).decode("ascii")
-
-
-# ── OpenCV image preprocessing (mirrors provider_api) ────────────
-
-def _opencv_preprocess_image(image_bytes: bytes) -> bytes:
-    """Preprocess image for OCR: downscale → grayscale → denoise → CLAHE → deskew → threshold.
-
-    Mirrors ``_opencv_preprocess_image`` from ``docker/platform/provider_api.py``.
-    When OpenCV is unavailable the raw bytes are returned unchanged.
-    """
-    try:
-        import cv2
-        import numpy as np
-    except ImportError:
-        return image_bytes
-
-    nparr = np.frombuffer(image_bytes, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if img is None:
-        return image_bytes
-
-    try:
-        # 1. Downscale: cap longest side at 1800px (MiniCPM-V 1.8M pixel limit)
-        _MAX_DIM = 1800
-        h, w = img.shape[:2]
-        if max(h, w) > _MAX_DIM:
-            scale = _MAX_DIM / max(h, w)
-            img = cv2.resize(img, (int(w * scale), int(h * scale)),
-                             interpolation=cv2.INTER_AREA)
-
-        # 2. Grayscale
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-        # 3. Denoise only noisy images (clean screenshots skip the expensive step)
-        _is_clean = gray.std() > 40
-        if _is_clean:
-            enhanced = gray
-        else:
-            denoised = cv2.fastNlMeansDenoising(gray)
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-            enhanced = clahe.apply(denoised)
-
-        # 4. Deskew: detect text angle and rotate
-        coords = np.column_stack(np.where(enhanced < 128))
-        if len(coords) > 10:
-            angle = cv2.minAreaRect(coords)[-1]
-            if angle < -45:
-                angle = 90 + angle
-            if abs(angle) > 0.3:
-                h, w = enhanced.shape
-                center = (w // 2, h // 2)
-                M = cv2.getRotationMatrix2D(center, angle, 1.0)
-                enhanced = cv2.warpAffine(
-                    enhanced, M, (w, h),
-                    flags=cv2.INTER_CUBIC,
-                    borderMode=cv2.BORDER_REPLICATE,
-                )
-
-        # 5. Adaptive threshold (binarize)
-        binary = cv2.adaptiveThreshold(
-            enhanced, 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            11, 2,
-        )
-
-        _, buffer = cv2.imencode(".jpg", binary, [cv2.IMWRITE_JPEG_QUALITY, 95])
-        return buffer.tobytes()
-    except Exception:
-        return image_bytes
 
 
 def _guess_mime(path: Path) -> str:

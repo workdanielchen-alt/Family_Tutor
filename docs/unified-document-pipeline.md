@@ -1,81 +1,95 @@
 # DeepTutor 统一文档处理架构
 
-> 版本: 1.2 | 最后更新: 2026-06-04
+> 版本: 2.0 | 最后更新: 2026-06-04
 
 ## 目录
 
 1. [架构概览](#1-架构概览)
 2. [文档分类体系](#2-文档分类体系)
-3. [统一入口 — UnifiedDocumentPipeline](#3-统一入口--unifieddocumentpipeline)
-4. [各类型文档处理路径](#4-各类型文档处理路径)
-5. [试卷结构化专属管线 (Phase 1-4)](#5-试卷结构化专属管线)
-6. [集成点 — 三个 API 端点](#6-集成点--三个-api-端点)
-   - [6.1 KB 同步双写决策](#61-kb-同步双写决策)
-7. [输出产物规范](#7-输出产物规范)
-8. [并发安全与稳定性](#8-并发安全与稳定性)
-9. [OpenCV 图像预处理管线](#9-opencv-图像预处理管线)
-10. [配置项参考](#10-配置项参考)
-11. [模块文件清单](#11-模块文件清单)
+3. [统一提取层 — `extractors.py`](#3-统一提取层--extractorspy)
+4. [统一入口 — UnifiedDocumentPipeline](#4-统一入口--unifieddocumentpipeline)
+5. [各类型文档处理路径](#5-各类型文档处理路径)
+6. [试卷结构化专属管线 (Phase 1-4)](#6-试卷结构化专属管线)
+7. [集成点 — API 端点](#7-集成点--api-端点)
+   - [7.1 KB 同步双写决策](#71-kb-同步双写决策)
+   - [7.2 Sidecar 富化](#72-sidecar-富化)
+8. [输出产物规范](#8-输出产物规范)
+9. [并发安全与稳定性](#9-并发安全与稳定性)
+10. [OpenCV 图像预处理管线](#10-opencv-图像预处理管线)
+11. [语义分块策略](#11-语义分块策略)
+12. [配置项参考](#12-配置项参考)
+13. [模块文件清单](#13-模块文件清单)
 
 ---
 
 ## 1. 架构概览
 
+### 入口矩阵 (6 条路径, 1 个统一提取层)
+
 ```
-                         ┌──────────────────────────────┐
-                         │     7 个文档入口              │
-                         ├──────────────────────────────┤
-                         │ Web KB 上传          │ POST /api/v1/knowledge/{kb}/upload
-                         │ WeChat 文件          │ POST /api/process/file
-                         │ MCP kb_upload_file   │ → POST /api/ingest/file
-                         │ MCP process_file     │ → POST /api/process/file
-                         │ MCP kb_upload_text   │ → POST /api/ingest/text
-                         │ Web KB 同步          │ POST /api/kb/ingest-file
-                         │ API 手动提取         │ POST /api/extract
-                         └──────────┬───────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  _spawn_unified_pipeline_bg(file_path)                              │
-│  ├─ 去重检测 (SHA-256)                                              │
-│  ├─ 全局 Semaphore(2) 并发控制                                      │
-│  └─ asyncio.create_task() → 不阻塞主请求                            │
-│                                                                     │
-│  _run_unified_pipeline_bg (max 600s)                                │
-│  └─ UnifiedDocumentPipeline.process(path)                           │
-│     ├─ classify → 11 DocTypes                                       │
-│     ├─ extract → per-type (OCR 带 OpenCV 预处理 + 120s timeout)     │
-│     ├─ structurize → .exam.json (仅 exam_pdf)                       │
-│     └─ .txt + .exam.json sidecars                                   │
-└─────────────────────────────────────────────────────────────────────┘
-                                    │
-                    ┌───────────────┼───────────────┐
-                    ▼               ▼               ▼
-              Platform         DeepTutor         File
-              ChromaDB         LlamaIndex        sidecars
+Web KB 上传  ─┐
+WeChat 文件  ─┤
+MCP 工具     ─┼─→ _handle_inbound_file()  ──→  extract_text() (extractors.py)
+Web Proxy    ─┤       │                              │
+DT 重建索引  ─┤    缓存 + vision           _EXTRACTOR_MAP dispatch
+Extract API  ─┘     + sidecar 富化              │
+                                          ┌───────┼───────┐
+                                          ▼       ▼       ▼
+                                        pdf    image   docx/xlsx/pptx
+                                         │       │         │
+                                    extract_pdf  OCR    python-docx
+                                    _text()      │     /openpyxl
+                                         │    OpenCV     /pptx
+                                    ┌────┴────┐ 预处理       │
+                                    │         │   │     markitdown
+                               text_pdf   scanned   │     fallback
+                               pymupdf4llm  pdf      │         │
+                               (use_ocr    pymupdf4llm  ┌──────┴──────┐
+                                =False)    (use_ocr  =True,   fast libs   markitdown
+                                         ocr_function
+                                         =MiniCPM-V)
 ```
 
-**核心设计原则**：所有入口共享同一套分类→提取→结构化逻辑，通过 fire-and-forget 后台任务触发，全局并发控制 + 超时保护，不阻塞主请求。
+**核心设计原则**：6 条入口 → `_handle_inbound_file()` → `extractors.py` 的 `extract_text()`（唯一提取真相源）。所有文档类型的提取逻辑集中在 `tutor_platform/rag/extractors.py`，无重复实现。
+
+### pymupdf4llm Hybrid OCR 管道
+
+扫描 PDF 不再需要 Tesseract。pymupdf4llm 的 `ocr_function` 参数接入 MiniCPM-V 适配器 (`tutor_platform/rag/ocr_adapters.py`)：
+
+```
+pymupdf4llm.to_markdown(
+    "scanned.pdf",
+    use_ocr=True,
+    ocr_function=MinicpmOCRFunc(trace_id="..."),
+)
+```
+
+pymupdf4llm 负责布局分析 + 表格检测 + 标题层级 + 阅读顺序 + Header/Footer 剔除 + **选择性 OCR**（只对无文字层区域调用 MiniCPM，~50% 减少 OCR 调用量）。MiniCPM 适配器内部走 Ollama → rkllama NPU fallback。
 
 ### 扫描 PDF 入库完整链路
 
 ```
-Web UI 上传 scanned.pdf
+用户上传 scanned.pdf
   │
   ├─→ [Deeptutor] LlamaIndex 索引
   │      fitz.get_text() → 空 (无文本层) → 向量为 0
   │
-  └─→ [Platform] POST /api/kb/ingest-file (fire-and-forget)
+  └─→ [Platform] POST /api/kb/ingest-file
          ├─ _handle_inbound_file()
-         │   └─ fitz → 无文本 → markitdown → 仍空 → 识别为扫描 PDF
-         │   └─ get_pixmap(dpi=300) → OpenCV 预处理 → MiniCPM OCR
+         │   └─ _handle_pdf()
+         │        └─ extract_pdf_text(ocr_enabled=True)
+         │             └─ pymupdf4llm.to_markdown(
+         │                  use_ocr=True,
+         │                  ocr_function=MinicpmOCRFunc)  ← MiniCPM-V OCR
+         │             → 完整结构化 Markdown (含表格/标题)
          │
          ├─ route == "document_extract" → **双写**
          │   └─ _ingest_to_kb(content, kb_name)
-         │       ├─ ① ChromaDB: 教学摘要 embedding → /data/chromadb
+         │       ├─ ① ChromaDB: 语义分块 → embedding → /data/chromadb
          │       └─ ② DT LlamaIndex: .txt → POST /api/v1/knowledge/{kb}/upload
          │
-         └─ _spawn_unified_pipeline_bg() → .txt + .exam.json sidecar
+         └─ _spawn_unified_pipeline_bg() → .txt / .exam.json sidecar
+              └─ 后续 _enrich_with_sidecar_content() 消费更完整的 sidecar
 
 ---
 
@@ -101,7 +115,114 @@ Web UI 上传 scanned.pdf
 
 ---
 
-## 3. 统一入口 — `UnifiedDocumentPipeline`
+## 3. 统一提取层 — `extractors.py`
+
+**文件**: `tutor_platform/rag/extractors.py`
+
+所有入口（`_handle_inbound_file` / `UnifiedDocumentPipeline` / `extract_text` API）最终都调用此模块的 `extract_text()` —— 它是文档提取的**唯一真相源**。
+
+### `extract_text(file_path, *, trace_id="") → str`
+
+按 `_EXTRACTOR_MAP` 根据扩展名自动分发到最优提取器：
+
+```python
+_EXTRACTOR_MAP = {
+    ".pdf":  "pdf",       # → extract_pdf_text() (pymupdf4llm)
+    ".docx": "docx",      # → extract_docx_text() → markitdown fallback
+    ".xlsx": "xlsx",      # → extract_xlsx_text() → markitdown fallback
+    ".pptx": "pptx",      # → extract_pptx_text() → markitdown fallback
+    ".jpg":  "image",     # → extract_image_text() (OpenCV + MiniCPM OCR)
+    ".png":  "image",     # → extract_image_text()
+    ".webp": "image",
+    ".heic": "image",
+    ".doc":  "markitdown",
+    ".ppt":  "markitdown",
+    ".xls":  "markitdown",
+    ".odt":  "markitdown",
+    ".rtf":  "markitdown",
+    ".epub": "markitdown",
+    ".zip":  "markitdown",  # 递归遍历 ZIP 内容
+    ".mp3":  "markitdown",  # 音频转录
+    ".wav":  "markitdown",
+    ".html": "html",        # 多编码读取 + XSS 消毒
+}
+```
+
+### `extract_pdf_text(file_path, *, ocr_enabled=False, ocr_trace_id="") → str`
+
+```python
+# 文字层 PDF (默认): 结构化 Markdown, 无 OCR
+text = extract_pdf_text("doc.pdf")
+
+# 扫描 PDF: 启用 MiniCPM-V Hybrid OCR
+text = extract_pdf_text("scanned.pdf", ocr_enabled=True, ocr_trace_id="task-1")
+# ↓ 内部调用:
+# pymupdf4llm.to_markdown(
+#     path,
+#     use_ocr=True,
+#     ocr_function=get_minicpm_ocr_function(trace_id="task-1"),
+# )
+```
+
+### `extract_image_text(file_path, *, trace_id="") → str`
+
+```python
+text = extract_image_text("photo.jpg", trace_id="task-1")
+# ↓
+# 1. 读取 raw bytes
+# 2. OpenCV 6步预处理 (降采样→灰度→降噪+CLAHE→倾斜校正→二值化)
+# 3. Ollama MiniCPM-V → rkllama NPU fallback OCR
+# 4. 全图失败时自动水平缝隙分割 + 并行 OCR
+```
+
+### 其他提取器
+
+| 函数 | 格式 | 策略 |
+|------|------|------|
+| `extract_docx_text` | .docx | python-docx → markitdown fallback |
+| `extract_xlsx_text` | .xlsx | openpyxl (GFM 表格/Sheet) → markitdown fallback |
+| `extract_pptx_text` | .pptx | python-pptx (Slide/Shape) → markitdown fallback |
+| `extract_text_file` | .txt/.md/… | 多编码链: utf-8→gbk→gb2312→gb18030→latin-1→cp1252 |
+| `extract_markitdown` | .epub/.doc/… | Microsoft markitdown 通用提取 |
+| `extract_pdf_tables` | .pdf | PyMuPDF `page.find_tables()` → 结构化 `list[dict]` |
+| `extract_pdf_tables_as_markdown` | .pdf | 同上，输出 GFM Markdown 表格 |
+| `extract_pdf_embedded_images` | .pdf | `doc.get_page_images()` → 提取嵌入图片 bytes |
+| `semantic_chunk` | 任意文本 | Markdown 标题感知分段 (§11) |
+
+### HTML XSS 消毒
+
+```python
+_sanitize_html(html_text)  # 剥离 script/style/iframe/object/embed/on* handlers
+```
+
+### OCR 适配器 (`ocr_adapters.py`)
+
+**文件**: `tutor_platform/rag/ocr_adapters.py`
+
+```python
+from tutor_platform.rag.ocr_adapters import MinicpmOCRFunc, get_minicpm_ocr_function
+
+ocr_fn = MinicpmOCRFunc(trace_id="task-1")
+# 签名: ocr_fn(fitz.Pixmap) → str
+# 内部: pixmap → PNG bytes → OpenCV 预处理 → base64 → Ollama/rkllama OCR
+```
+
+适配器内部调用路径：
+```
+pymupdf4llm 检测到需 OCR 的区域
+  → ocr_function(pixmap)
+    → pixmap.tobytes("png")
+    → preprocess_image_bytes() (OpenCV 6步)
+    → OCR_PROVIDER=ollama → Ollama /api/chat (MiniCPM-V)
+    → OCR_PROVIDER=rkllama → rkllama /v1/ocr (NPU)
+    → garbled 检测 → 失败返回 ""
+```
+
+**关键：No Tesseract。** OCR 全程走现有 MiniCPM-V / rkllama 基建。
+
+---
+
+## 4. 统一入口 — `UnifiedDocumentPipeline`
 
 **文件**: `tutor_platform/rag/unified_pipeline.py`
 
@@ -127,87 +248,96 @@ result = await UnifiedDocumentPipeline.process(
 
 ---
 
-## 4. 各类型文档处理路径
+## 5. 各类型文档处理路径
 
-### 4.1 纯文本文件 (TEXT)
+所有路径以 `extractors.py` 的 `extract_text()` 为统一入口。`_handle_inbound_file()` 在调用 `extract_text()` 后追加 Vision description（图片）和 Office 内嵌图片 OCR。
 
-```
-.txt/.md/.py/...  →  多编码读取 (utf-8 → gbk → latin-1, run_in_executor 异步)
-                  →  .txt
-```
-
-无 OCR，纯 I/O，`run_in_executor` 避免阻塞事件循环。
-
-### 4.2 图片文件 (IMAGE)
+### 5.1 纯文本文件 (TEXT)
 
 ```
-.jpg/.png/...
-  →  OpenCV 预处理 (见 §9):
-       降采样(max 1800px) → 灰度化 → 降噪+CLAHE → 倾斜校正 → 二值化
-  →  base64 编码
-  →  MiniCPM-V OCR (Ollama, timeout=120s)
-  →  .txt
+.txt/.md/.py/...  →  extract_text_file() 多编码读取 (utf-8→gbk→gb2312→latin-1→cp1252)
+                  →  run_in_executor 异步
 ```
 
-需要 `llm_client`。OpenCV 不可用时安全降级为原始字节直送 MiniCPM。
+html/.htm 额外经过 `_sanitize_html()` XSS 消毒。
 
-### 4.3 文字层 PDF (TEXT_PDF)
-
-```
-.pdf  →  fitz.open() → page.get_text()  →  拼接  →  .txt
-```
-
-纯 PyMuPDF，零 LLM 调用，<100ms/页。
-
-### 4.4 扫描 PDF (SCANNED_PDF)
+### 5.2 图片文件 (IMAGE)
 
 ```
-.pdf  →  fitz.open()
-  →  每页并发 asyncio.gather:
-       page.get_pixmap(dpi=200) → PNG → OpenCV 预处理(同 §4.2) → base64
-       → MiniCPM-V OCR (timeout=120s)
-  →  拼接  →  .txt
+.jpg/.png/.heic/...
+  →  extract_image_text()
+       ├─ 1. 读取 raw bytes
+       ├─ 2. OpenCV 6步预处理 (§10): 降采样(max 1800px)→灰度→降噪+CLAHE→倾斜校正→二值化
+       ├─ 3. Ollama MiniCPM-V OCR (OCR_PROVIDER=ollama) / rkllama NPU (OCR_PROVIDER=rkllama)
+       └─ 4. 全图失败 → 水平缝隙分割 → 并行 OCR
+  →  _handle_inbound_file 追加: _describe_diagram() MiniCPM 图形描述
+  →  短文本(<80 chars) 触发 tiered fallback 引导
 ```
 
-页级并发 OCR（10 页 ≈ 40s vs 原顺序 300s），需要 `llm_client`。
-
-### 4.5 考试 PDF (EXAM_PDF)
+### 5.3 文字层 PDF (TEXT_PDF)
 
 ```
-.pdf  →  同 SCANNED_PDF 先提取纯文本
-     →  然后触发 Phase 1-4 结构化管线 (见 §5)
-     →  .txt + .exam.json
+.pdf → extract_pdf_text(path, ocr_enabled=False)
+        → pymupdf4llm.to_markdown(use_ocr=False)
+        → 结构化 Markdown (标题层级 + GFM 表格 + 阅读顺序 + 粗斜体)
+        → pymupdf4llm 不可用 → raw pymupdf fallback
 ```
 
-### 4.6 Office 文档 (OFFICE_*)
+零 LLM 调用，~100ms/页。
+
+### 5.4 扫描 PDF (SCANNED_PDF / EXAM_PDF)
+
+```
+.pdf → extract_pdf_text(path, ocr_enabled=True,
+                          ocr_trace_id=trace_id)
+        → pymupdf4llm.to_markdown(
+             use_ocr=True,
+             ocr_function=MinicpmOCRFunc(trace_id))
+        │
+        ├─ pymupdf4llm 布局分析: 表格检测/标题层级/阅读顺序/页眉页脚剔除
+        ├─ 选择性 OCR: 只对无文字层区域调用 MiniCPM-V (~50% 减少)
+        └─ 无缝融合: OCR 结果 + 原生文本 → 一个 Markdown
+```
+
+**旧管线对比**：
+
+| 维度 | 旧: 手动 fitz 渲染 + OCR | 新: pymupdf4llm + MiniCPM 适配器 |
+|------|--------------------------|----------------------------------|
+| 布局分析 | ❌ 无 | ✅ 表格/标题/阅读顺序 |
+| OCR 范围 | 逐页全量 | 选择性 (~50% 减少) |
+| 输出格式 | 纯文本 | 结构化 Markdown |
+| 页眉/页脚 | 原样保留 | 自动剔除 |
+| Tesseract | 不需要 | 不需要 |
+| pymupdf4llm 不可用时 | N/A | 自动回退 `_pdf_manual_ocr_fallback()` (fitz 渲染 + MiniCPM OCR) |
+
+### 5.5 Office 文档 (OFFICE_*)
 
 **新格式 (docx/xlsx/pptx)**:
 ```
-.docx  →  python-docx 快速提取 (run_in_executor 异步)
-.xlsx  →  openpyxl 快速提取 (run_in_executor 异步)
-.pptx  →  python-pptx 快速提取 (run_in_executor 异步)
-       →  失败则降级到 markitdown (run_in_executor 异步)
-       →  提取内嵌图片 (ZIP-based)
-       →  .txt
+.docx → python-docx 快速提取 (run_in_executor 异步)
+.xlsx → openpyxl 快速提取 (run_in_executor 异步)
+.pptx → python-pptx 快速提取 (run_in_executor 异步)
+      → 失败则降级到 markitdown
+      → _handle_inbound_file 追加: _ocr_office_images() 内嵌图片 OCR
 ```
 
-**旧格式 (doc/ppt/xls) + 其他**:
+**旧格式 (doc/ppt/xls/odt/rtf) + EPUB**:
 ```
-.doc/.ppt/.xls/.odt/.rtf
-       →  markitdown 提取 (优先, run_in_executor 异步)
-       →  旧格式降级: antiword / catppt
-       →  OLE 内嵌图片扫描
-       →  .txt
+→ markitdown 提取 (run_in_executor 异步)
+→ ZIP/OLE 内嵌图片扫描 (_extract_office_images)
+```
+
+### 5.6 EPUB / ZIP / 音频
+
+```
+.epub     → markitdown
+.zip      → markitdown (递归遍历 ZIP 内容)
+.mp3/.wav → markitdown (音频转录, 需 markitdown[all])
 ```
 
 > **异步化**: Office 提取中的同步 I/O（`python-docx` / `openpyxl` / `markitdown`）全部通过 `loop.run_in_executor(None, ...)` 移至线程池执行，不阻塞事件循环。
 
-**markitdown OCR layer** (>= 0.1.5):
-```
-markitdown.MarkItDown(llm_client=ollama_adapter)
-    →  markitdown 自动识别并 OCR 文档内嵌图片
-    →  当前版本: 0.1.6 (PyPI 最新)
-```
+**markitdown OCR layer** (>= 0.1.5): markitdown 部署为 `markitdown[all]` (含 audio-transcription / youtube-transcription extras)，版本 0.1.6。旧格式 `.doc` 由 markitdown 覆盖，**不依赖 antiword**。
 
 **内嵌图片提取路径**:
 
@@ -218,7 +348,7 @@ markitdown.MarkItDown(llm_client=ollama_adapter)
 
 ---
 
-## 5. 试卷结构化专属管线 (Phase 1-4)
+## 6. 试卷结构化专属管线 (Phase 1-4)
 
 **触发条件**: `DocType == exam_pdf` 且 `enable_structured_exam=True` 且 `llm_client` 非空
 
@@ -323,28 +453,25 @@ ExamPaper → JSON 序列化 → .exam.json sidecar
 
 ---
 
-## 6. 集成点 — 三个 API 端点
+## 7. 集成点 — API 端点
 
-所有集成点在 `docker/platform/provider_api.py`，通过 `_spawn_unified_pipeline_bg()` 触发。
-
-### 函数定义
-
-```python
-# provider_api.py
-def _spawn_unified_pipeline_bg(file_path: str, trace_id: str = "") -> None:
-    """Submit file to unified pipeline as fire-and-forget background task.
-    Deduplicates by SHA-256, respects global semaphore."""
-```
+所有集成点在 `docker/platform/provider_api.py`。
 
 ### 调用点
 
-| 端点 | 行号 | 调用时机 | 文件位置 | 触发场景 |
-|------|------|---------|---------|---------|
-| `POST /api/ingest/file` | ~3700 | 文件写入 SOURCES_DIR 后 | `_spawn_unified_pipeline_bg(dest, trace_id)` | MCP 工具上传 |
-| `POST /api/process/file` | ~3584 | 文件写入 SOURCES_DIR 后 | `_spawn_unified_pipeline_bg(dest, trace_id)` | WeChat 文件上传 |
-| `POST /api/kb/ingest-file` | ~3208 | temp 文件准备好后 | `_spawn_unified_pipeline_bg(tmp_path, trace_id)` | Web UI KB 同步 |
+| 端点 | 触发方式 | 触发函数 | 触发场景 |
+|------|---------|---------|---------|
+| `POST /api/kb/ingest-file` | 同步调用 | `_handle_inbound_file()` | Web UI KB 同步 |
+| `POST /api/ingest/file` | 同步调用 | `_handle_inbound_file()` | MCP 工具上传 |
+| `POST /api/process/file` | 同步调用 | `_handle_inbound_file()` | WeChat 文件上传 |
+| `POST /api/ingest/proxy/{kb}` | 同步调用 | `_handle_inbound_file()` | Web 代理上传 |
+| `POST /api/kb/sync-from-dt` | 同步调用(批量) | `_handle_inbound_file()` per file | DT 重建索引 |
+| `POST /api/extract` | 同步调用 | `_handle_inbound_file()` | 轻量提取 |
+| `POST /api/ingest/text` | 直接入库 | `provider.ingest_text()` | MCP 文本入库 (不经提取) |
 
-### 6.1 KB 同步双写决策
+所有文件入口额外触发 `_spawn_unified_pipeline_bg()` — fire-and-forget 后台任务，产生 `.md` / `.exam.json` sidecar。`/api/ingest/proxy/{kb}` 也已补全此调用。
+
+### 7.1 KB 同步双写决策
 
 `POST /api/kb/ingest-file` 是 KB 扫描 PDF 入库的关键路径。它根据文件 OCR 路由决定写策略：
 
@@ -372,22 +499,29 @@ Web UI KB 上传 scanned.pdf
 | `text` | 文字层 PDF / 纯文本 | ✅ | ❌ 不写 | DT 已有完整文本层索引 |
 | `ocr_fallback` | OCR 部分失败 | ❌ | ❌ | 质量不足不入库 |
 
-**`_ingest_to_kb()` 双写流程**（`provider_api.py:2180`）:
+**`_ingest_to_kb()` 双写流程**（`provider_api.py:2039`）:
 1. 生成教学摘要（v3, best-effort）
-2. 分块后写入平台 ChromaDB（`provider.add_documents()`）
+2. 语义分块后写入平台 ChromaDB（`provider.add_documents()`，使用 `semantic_chunk()`）
 3. 创建临时 `.txt` → 通过 `POST /api/v1/knowledge/{kb}/upload` 回写 DT LlamaIndex
 
-### 设计要点
+### 7.2 Sidecar 富化
 
-- **fire-and-forget**: `asyncio.create_task()` — 不阻塞主 HTTP 响应
-- **SHA-256 去重**: 相同文件哈希不重复提交后台任务
-- **全局并发控制**: `asyncio.Semaphore(2)` 限制同时运行的后台任务数（见 §8）
-- **容错**: 若文件已被删除（temp 文件清理），后台任务静默返回
-- **平台容器零依赖**: `tutor_platform/rag/__init__.py` 使用 `__getattr__` 延迟加载
+`_enrich_with_sidecar_content()` 在 `_handle_inbound_file()` 中消费 `UnifiedDocumentPipeline` 的 `.md` sidecar：
+
+```python
+content = _enrich_with_sidecar_content(content, file_path)
+# → 若 {原文件名}.md sidecar 存在且长度 > 内联提取 × 1.2 → 使用 sidecar
+```
+
+`_inject_doc_type_meta()` 将 `DocType` 分类结果注入 metadata 供 RAG 检索过滤：
+
+```python
+{"doc_subtype": "text_pdf"}  # 来自 classify_file() → DocType
+```
 
 ---
 
-## 7. 输出产物规范
+## 8. 输出产物规范
 
 | 文件类型 | 产物 | 命名规范 | 内容 |
 |---------|------|---------|------|
@@ -399,7 +533,7 @@ Web UI KB 上传 scanned.pdf
 
 ---
 
-## 8. 并发安全与稳定性
+## 9. 并发安全与稳定性
 
 ### 8.1 全局并发控制
 
@@ -425,19 +559,18 @@ Web UI KB 上传 scanned.pdf
 
 **为什么需要**: 卡住的 Ollama 调用会永久占用 Semaphore 槽位，导致所有后续请求排队直到 OOM。
 
-### 8.3 扫描 PDF 页级并发
+### 9.3 扫描 PDF 页级并发 (pymupdf4llm 不可用时的 fallback)
 
 ```
-旧: for page in pages:  ← 顺序, 10页=300s
-    ocr(page)
-
-新: asyncio.gather(     ← 并发, 10页≈40s
-    *[ocr_page(i) for i in range(n)])
+_pdf_manual_ocr_fallback():
+  for page in doc:                            ← 顺序 fallback
+      get_pixmap(dpi=200) → OpenCV → OCR
 ```
 
-每页渲染 → OpenCV 预处理 → base64 → MiniCPM OCR（每页独立，无依赖关系）。
+> pymupdf4llm 可用时，pymupdf4llm 内部自行管理 OCR 并发。
+> 不可用时回退到手动 fallback，每页顺序 OCR。
 
-### 8.4 Office 提取异步化
+### 9.4 Office 提取异步化
 
 所有同步 I/O 调用移至线程池：
 
@@ -452,7 +585,7 @@ text = await loop.run_in_executor(None, _extract_docx_fast, path)
 
 适用: `python-docx`, `openpyxl`, `python-pptx`, `markitdown`, 文本文件解码。
 
-### 8.5 任务去重
+### 9.5 任务去重
 
 ```
 _spawn_unified_pipeline_bg()
@@ -461,7 +594,7 @@ _spawn_unified_pipeline_bg()
      └─ 不存在 → create_task() + 记录 "queued"
 ```
 
-### 8.6 结果追踪 API
+### 9.6 结果追踪 API
 
 ```
 GET /api/pipeline/status?file_hash=<sha256>
@@ -478,9 +611,9 @@ GET /api/pipeline/status
 
 ---
 
-## 9. OpenCV 图像预处理管线
+## 10. OpenCV 图像预处理管线
 
-所有图片 OCR 路径（§4.2 图片文件 + §4.4 扫描 PDF 每页）统一经过 6 步预处理：
+所有图片 OCR 路径（§5.2 图片文件 + §3 `extract_image_text` + `ocr_adapters.py` MiniCPM 适配器）统一经过 6 步预处理：
 
 ```
 原始图片 bytes
@@ -509,17 +642,72 @@ GET /api/pipeline/status
          quality=95, 返回 bytes
 ```
 
-**实现位置**: `tutor_platform/rag/unified_pipeline.py::_opencv_preprocess_image()`
+**实现位置**: `tutor_platform/tools/preprocess.py::preprocess_image_bytes()`
 
 **应用路径**:
-- `_extract_image_text()` — 图片文件 OCR
-- `_extract_scanned_pdf_text()` — 扫描 PDF 每页渲染后
+- `extract_image_text()` — extractors.py 图片 OCR
+- `MinicpmOCRFunc.__call__()` — ocr_adapters.py 扫描 PDF OCR 适配器
 
 **降级策略**: OpenCV 不可用时直接返回原始字节，MiniCPM 仍可处理原始图片。
 
 ---
 
-## 10. 配置项参考
+## 11. 语义分块策略
+
+**实现**: `tutor_platform/rag/extractors.py::semantic_chunk()`
+
+替换旧的 `_split_content_for_ingest()` (500 字符段落截断) 为语义感知分块。
+
+### 策略
+
+```python
+chunks = semantic_chunk(
+    text,
+    chunk_size=800,       # 默认值, 可通过 RAG_CHUNK_SIZE 环境变量配置
+    chunk_overlap=100,    # 前一 chunk 末尾拼接到后一 chunk 开头
+    doc_type="text_pdf",  # metadata 透传
+    filename="doc.pdf",
+)
+```
+
+**分块优先级**:
+1. **按 Markdown 标题切割** (## / ### / ####) — 保持知识点完整性
+2. **段落边界** (\n\n) — 标题内段落过长时 fallback
+3. **硬截断** — 最后一着
+
+### Chunk Metadata
+
+每个 chunk dict 包含：
+```python
+{
+    "text": "chunk 内容 (含 overlap 前缀)",
+    "heading_path": "第3章 > 勾股定理",  # Markdown 标题面包屑
+    "chunk_index": 0,
+    "char_count": 780,                   # 本 chunk 自身长度 (不含 overlap)
+    "doc_type": "text_pdf",
+    "filename": "math_textbook.pdf",
+}
+```
+
+### Overlap 机制
+
+```
+Chunk 1: [.....................]  ← char_count=750
+                                    overlap = 末尾100字符
+Chunk 2: [overlap前缀\n\n正文......]  ← 开头含上一 chunk 的末尾
+```
+
+确保跨段落边界的检索不丢失上下文。
+
+### 配置
+
+| 环境变量 | 默认值 | 说明 |
+|----------|--------|------|
+| `RAG_CHUNK_SIZE` | `800` | 目标 chunk 大小 (字符数) |
+
+---
+
+## 12. 配置项参考
 
 ### RAG Pipeline 配置 (`RAG_PIPELINE_*`)
 
@@ -540,21 +728,25 @@ GET /api/pipeline/status
 | 环境变量 | 默认值 | 说明 |
 |----------|--------|------|
 | `OLLAMA_URL` | `http://ollama:11434` | Ollama API 地址 |
-| `OLLAMA_MODEL` | `minicpm-v` | OCR 模型 |
+| `OLLAMA_OCR_MODEL` | `openbmb/minicpm-v4.6:q4_K_M` | OCR 模型 |
+| `RKLLAMA_URL` | `http://rkllama:8080` | rkllama NPU API 地址 |
+| `OCR_PROVIDER` | `rkllama` | OCR 后端选择: `ollama` 或 `rkllama` |
 
 ### markitdown OCR 配置
 
-markitdown >= 0.1.5 内置 OCR layer (`MarkItDown(llm_client=...)`)，当前版本 **0.1.6 (PyPI 最新)**。`_get_markitdown_with_ocr()` 和 `_create_markitdown_llm_client()` 在 `provider_api.py` 中实现了一个轻量适配器，将 markitdown 的 LLM 协议映射到 Ollama `/api/chat` 端点。
+markitdown >= 0.1.5 内置 OCR layer (`MarkItDown(llm_client=...)`)，部署为 `markitdown[all]` 版本 0.1.6。`_get_markitdown_with_ocr()` 和 `_create_markitdown_llm_client()` 在 `provider_api.py` 中实现了一个轻量适配器，将 markitdown 的 LLM 协议映射到 Ollama `/api/chat` 端点。
 
 ---
 
-## 11. 模块文件清单
+## 13. 模块文件清单
 
 ### 新增文件
 
 | 文件 | 行数 | 职责 |
 |------|------|------|
-| `tutor_platform/rag/unified_pipeline.py` | ~800 | 统一入口：分类 → 提取(含 OpenCV) → 结构化 → sidecar |
+| `tutor_platform/rag/extractors.py` | ~800 | **统一提取层**：`extract_text()` 单一真相源，11 种格式分发，image/HTML/pdf/docx/xlsx/pptx 提取器，语义分块 `semantic_chunk()` |
+| `tutor_platform/rag/ocr_adapters.py` | ~220 | **MiniCPM OCR 适配器**：`MinicpmOCRFunc` 实现 pymupdf4llm `ocr_function` 协议，Ollama/rkllama OCR dispatch |
+| `tutor_platform/rag/unified_pipeline.py` | ~500 | 统一入口：分类 → 提取 → 结构化 → sidecar |
 | `tutor_platform/rag/layout_engine.py` | 270 | Phase 1：PyMuPDF 布局分析，零 LLM |
 | `tutor_platform/rag/block_ocr.py` | 370 | Phase 2：块级 OCR + 图形描述，MiniCPM 分级 prompt |
 | `tutor_platform/rag/exam_structurer.py` | 290 | Phase 3：块→题语义组装，纯规则 |
@@ -562,25 +754,34 @@ markitdown >= 0.1.5 内置 OCR layer (`MarkItDown(llm_client=...)`)，当前版�
 
 ### 修改文件
 
-| 文件 | 改动 | 行数变化 |
-|------|------|---------|
-| `docker/platform/provider_api.py` | 全局 Semaphore + 超时 + 状态追踪 + pipeline/status API + markitdown OCR | +200 |
-| `tutor_platform/rag/pipeline.py` | `_stage_structured_exam` + `_structure_single_exam` + `_write_exam_sidecar` | +180 |
-| `tutor_platform/rag/config.py` | 添加 `RAG_PIPELINE_EXAM_*` + `RAG_PIPELINE_MAX_CONCURRENT_*` 配置项 | +5 |
-| `docker-compose.dev.yml` | PYTHONPATH 修复 | +1 |
-| `tests/test_pipeline.py` | 更新测试预期适配 `.exam.json` sidecar | +2/-14 |
+| 文件 | 改动 |
+|------|------|
+| `docker/platform/provider_api.py` | `_handle_pdf` 简化为 pymupdf4llm + MiniCPM 适配器调用；`_handle_inbound_file` 委托给 `extract_text()`；新增 `_enrich_with_sidecar_content` / `_inject_doc_type_meta`；新增 `_pdf_manual_ocr_fallback` (pymupdf4llm 不可用兜底)；Office 嵌入图片 OCR 仅限已知格式 |
+| `tutor_platform/rag/pipeline.py` | `_stage_structured_exam` + `_structure_single_exam` + `_write_exam_sidecar` |
+| `tutor_platform/rag/config.py` | 添加 `RAG_PIPELINE_EXAM_*` + `RAG_PIPELINE_MAX_CONCURRENT_*` 配置项 |
+| `docker/platform/Dockerfile` | `markitdown[all]` + `pymupdf4llm`；移除 `antiword` |
+| `tests/test_ingestion_consistency.py` | 20 个集成测试：提取一致性 / OCR / 表格 / 语义分块 / 分类 / sidecar 富化 |
 
 ### 依赖关系
 
 ```
+extractors.py  ← 统一提取层 (所有入口的单一真相源)
+  ├── ocr_adapters.py            (MiniCPM OCR 适配器, pymupdf4llm 集成)
+  ├── tools/preprocess.py        (OpenCV 6步预处理)
+  ├── markitdown                 (通用文档转换)
+  ├── python-docx / openpyxl / python-pptx  (Office 快速提取)
+  └── _sanitize_html()           (HTML XSS 消毒, 内置)
+
 unified_pipeline.py
-  ├── _opencv_preprocess_image()  (OpenCV 6步预处理, 独立函数)
-  ├── layout_engine.py             (Phase 1, 独立模块)
-  ├── block_ocr.py                 (Phase 2, 依赖 layout_engine 类型)
-  ├── exam_structurer.py           (Phase 3, 依赖 block_ocr + layout_engine 类型)
-  └── pipeline.py                  (Phase 4 集成入口)
+  ├── extractors.py              (文本提取)
+  ├── layout_engine.py            (Phase 1, 独立模块)
+  ├── block_ocr.py                (Phase 2, 依赖 layout_engine 类型)
+  ├── exam_structurer.py          (Phase 3, 依赖 block_ocr + layout_engine 类型)
+  └── pipeline.py                 (Phase 4 集成入口)
 
 provider_api.py
+  ├── extractors.py              (_handle_inbound_file 委托提取)
+  ├── ocr_adapters.py            (间接通过 extract_pdf_text)
   └── _spawn_unified_pipeline_bg()
       ├── SHA-256 去重
       ├── Semaphore(2) 并发控制
@@ -594,11 +795,13 @@ provider_api.py
 
 | 库 | 版本 | 用途 |
 |----|------|------|
-| PyMuPDF (fitz) | >= 1.26.0 | PDF 文本提取、页渲染、布局分析、矢量分析 |
+| PyMuPDF (fitz) | >= 1.26.0 | PDF 文本提取、页渲染、布局分析、表格检测、矢量分析 |
+| pymupdf4llm | >= 1.27.0 | 结构化 Markdown 提取 + Hybrid OCR 管道 (MiniCPM 适配) |
 | OpenCV (cv2) | - | 图片降采样、灰度化、降噪、CLAHE、倾斜校正、二值化 |
-| markitdown | 0.1.6 | Office 文档提取 + 内嵌 OCR (>= 0.1.5) |
+| markitdown[all] | 0.1.6 | Office/EPUB/ZIP/音频 文档提取 + 内嵌 OCR |
 | python-docx | - | .docx 快速提取 (run_in_executor 异步) |
 | openpyxl | - | .xlsx 快速提取 (run_in_executor 异步) |
 | python-pptx | - | .pptx 快速提取 (run_in_executor 异步) |
 | olefile | - | .doc/.ppt/.xls OLE 图像扫描 |
-| ollama (MiniCPM-V) | 4.6 | 块级 OCR + 图形描述 + 图表识别 |
+| MiniCPM-V (via Ollama) | 4.6 | 块级 OCR + 图形描述 + pymupdf4llm 适配器 OCR |
+| rkllama (NPU) | - | 替代 OCR 后端 (OCR_PROVIDER=rkllama) |

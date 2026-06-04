@@ -57,10 +57,12 @@ from domains.tutoring.mastery import (
     update_mastery,
     weak_points,
 )
+from tutor_platform.rag.extractors import extract_text, extract_pdf_text
 from tutor_platform.teach_session import get_store as get_teach_store
 from tutor_platform.teach_session import TeachSessionStore
 from tutor_platform.quiz_sync import sync_quiz_to_mastery
 from tutor_platform.storage import validate_provider_config
+from tutor_platform.tools.preprocess import preprocess_image_bytes
 from tutor_platform.unified_provider import (
     UnifiedLocalProvider,
     get_provider_instance,
@@ -796,22 +798,30 @@ ALLOWED_EXTENSIONS = frozenset(
 MAX_FILE_SIZE = 100 * 1024 * 1024
 
 
-def _sanitize_html_content(html: str) -> str:
-    """Remove dangerous HTML elements, keeping only safe text content.
 
-    Strips scripts, event handlers, iframes, objects, and style blocks
-    to prevent XSS when content is displayed in any web context.
+# ── ChromaDB collection name sanitizer ─────────────────────────────
+
+def _chromadb_kb_name(name: str) -> str:
+    """Convert any KB name to a ChromaDB-valid collection name.
+
+    ChromaDB requires: 3-512 chars, [a-zA-Z0-9._-], start/end with [a-zA-Z0-9].
+
+    Strategy:
+      - ASCII-only names → pass through unchanged
+      - Non-ASCII (Chinese, etc.) → hash suffix for uniqueness
     """
-    import re as _re
-
-    cleaned = _re.sub(r"<script[^>]*>.*?</script>", "", html, flags=_re.DOTALL | _re.IGNORECASE)
-    cleaned = _re.sub(r"<style[^>]*>.*?</style>", "", cleaned, flags=_re.DOTALL | _re.IGNORECASE)
-    cleaned = _re.sub(r"<iframe[^>]*>.*?</iframe>", "", cleaned, flags=_re.DOTALL | _re.IGNORECASE)
-    cleaned = _re.sub(r"<object[^>]*>.*?</object>", "", cleaned, flags=_re.DOTALL | _re.IGNORECASE)
-    cleaned = _re.sub(r"<embed[^>]*>.*?</embed>", "", cleaned, flags=_re.DOTALL | _re.IGNORECASE)
-    cleaned = _re.sub(r'\s+on\w+\s*=\s*["\'][^"\']*["\']', "", cleaned, flags=_re.IGNORECASE)
-    cleaned = _re.sub(r"\s+on\w+\s*=\s*\S+", "", cleaned, flags=_re.IGNORECASE)
-    return cleaned
+    if not name:
+        return "default"
+    # If already valid ASCII [a-zA-Z0-9._-] → keep as-is
+    if all(c.isascii() and (c.isalnum() or c in "._-") for c in name) and name[0].isalnum():
+        return name
+    # Non-ASCII: use base64url hash suffix
+    import hashlib, base64
+    safe_prefix = "".join(c if c.isascii() and (c.isalnum() or c in "._-") else "_" for c in name)
+    safe_prefix = safe_prefix.strip("_")[:48] or "kb"
+    digest = hashlib.sha256(name.encode()).digest()[:8]
+    suffix = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+    return f"{safe_prefix}_{suffix}"
 
 
 def _validate_file(filename: str | None, size: int) -> str | None:
@@ -985,7 +995,7 @@ async def _warm_ocr_model(trace_id: str = ""):
         logger.debug("[%s] OCR warm failed (non-critical): %s", trace_id, e)
 
 
-_IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".tif"})
+_IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".tif", ".heic"})
 _TEXT_EXTENSIONS = frozenset(
     {
         # Mirrors FileTypeRouter.TEXT_EXTENSIONS (vendor/deeptutor/.../file_routing.py)
@@ -1198,20 +1208,20 @@ async def _handle_inbound_file(
     file_path: str,
     metadata: dict | None = None,
 ) -> dict:
-    """Handle inbound file: classify → route → extract text.
+    """Handle inbound file: classify → extract → augment.
 
-    Classification pipeline:
+    All text extraction is delegated to ``tutor_platform.rag.extractors.extract_text()``
+    (the single source of truth).  This function adds provider-level concerns:
+    caching, vision description for images, Office embedded-image OCR, and
+    education-intent routing.
 
+    Classification (no longer inline — extract_text() dispatches by extension):
         File
-        ├─ Image (.jpg/.png/…) → OpenCV preprocess → rkllama OCR
-        ├─ Text (.txt/.md/…)   → direct read
-        ├─ PDF
-        │   ├─ Has text layer  → pymupdf extract (primary)
-        │   ├─ Sparse text     → markitdown extract (fallback)
-        │   └─ Scanned         → render page(s) → OpenCV → rkllama OCR
-        ├─ Office (.docx/.pptx/…) → markitdown extract
-        ├─ Old .doc            → antiword extract
-        └─ Unknown             → metadata placeholder
+        ├─ Image  → extract_text() (OpenCV + OCR) + vision description
+        ├─ Text   → extract_text() (multi-encoding read + HTML sanitize)
+        ├─ PDF    → _handle_pdf() (pymupdf4llm + MiniCPM-V hybrid OCR)
+        ├─ Office → extract_text() (dedicated libs) + embedded-image OCR
+        └─ Unknown → extract_text() (best-effort)
     """
     meta = metadata or {}
     trace_id = meta.get("trace_id", _generate_trace_id())
@@ -1230,25 +1240,22 @@ async def _handle_inbound_file(
         if time.time() - _fts < _FILE_CACHE_TTL_S:
             logger.info(
                 "[%s] Cache hit: %s (learner=%s, age=%.0fs)",
-                trace_id,
-                file_path,
-                learner_id,
-                time.time() - _fts,
+                trace_id, file_path, learner_id, time.time() - _fts,
             )
             return _fresult
 
     def _cache_res(result: dict) -> dict:
-        """Store result in LRU cache and evict oldest if over limit."""
         _FILE_PROCESS_CACHE[_ckey] = (time.time(), result)
         if len(_FILE_PROCESS_CACHE) > _FILE_CACHE_MAX:
-            # Remove oldest entry (the dict preserves insertion order in 3.7+)
             _FILE_PROCESS_CACHE.pop(next(iter(_FILE_PROCESS_CACHE)))
         return result
 
     try:
-        # ── Image files: OpenCV preprocess → rkllama OCR ──
+        # ── Image files: extract_text() for OCR → add vision description ──
         if ext in _IMAGE_EXTENSIONS:
-            content = await _ocr_image_file(file_path, trace_id)
+            content = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: extract_text(file_path, trace_id=trace_id),
+            )
             if content:
                 logger.info("[%s] OCR success: %d chars from %s", trace_id, len(content), file_path)
             else:
@@ -1259,10 +1266,7 @@ async def _handle_inbound_file(
             # Vision is cached (1h TTL), so repeated calls are cheap.
             vision_desc = await _describe_diagram(file_path, trace_id)
             if vision_desc:
-                logger.info(
-                    "[%s] Vision description appended (%d chars)",
-                    trace_id, len(vision_desc),
-                )
+                logger.info("[%s] Vision description appended (%d chars)", trace_id, len(vision_desc))
                 if content:
                     content = f"{content}\n\n[图片中的图形描述]\n{vision_desc}"
                 else:
@@ -1270,156 +1274,78 @@ async def _handle_inbound_file(
 
             if content:
                 _ocr_raw_len = len(content.strip())
-                # Tiered OCR quality: short text gets flagged for guidance
                 if _ocr_raw_len < 80:
                     _guidance = (
                         "【系统提示】这张图片只识别出了部分文字。请用鼓励的语气请求学生："
                         "如果图片不清晰，可以重新拍一张发给老师；如果题目不多，也可以直接打字发过来。"
                         f"\n\n已识别内容：\n{content}"
                     )
-                    logger.info(
-                        "[%s] OCR partial (%d chars), using tiered fallback", trace_id, _ocr_raw_len
-                    )
-                    return _cache_res(
-                        {
-                            "ok": True,
-                            "content": _guidance,
-                            "intent": "EDUCATION",
-                            "route": "ocr_fallback",
-                            "storage": {"ok": False},
-                        }
-                    )
-                return _cache_res(
-                    {
-                        "ok": True,
-                        "content": content,
-                        "intent": "EDUCATION",
-                        "route": "ocr",
+                    logger.info("[%s] OCR partial (%d chars), using tiered fallback", trace_id, _ocr_raw_len)
+                    return _cache_res({
+                        "ok": True, "content": _guidance,
+                        "intent": "EDUCATION", "route": "ocr_fallback",
                         "storage": {"ok": False},
-                    }
-                )
+                    })
+                return _cache_res({
+                    "ok": True, "content": content,
+                    "intent": "EDUCATION", "route": "ocr",
+                    "storage": {"ok": False},
+                })
             # OCR failed — tiered fallback
-            _fb_msg = (
-                "用户通过微信发送了一张图片，但图片中的文字未能被自动识别。\n"
-                "请用友好的语气引导学生：①把手机拿平拍 ②光线好一些不要反光 "
-                "③如果图片不清晰可以重新拍一张发给老师。\n"
-                "不方便拍照的话，也可以直接把题目打字发过来。"
-            )
-            logger.warning(
-                "[%s] OCR failed and vision empty, using tiered fallback for %s", trace_id, file_path
-            )
-            return _cache_res(
-                {
-                    "ok": True,
-                    "content": _fb_msg,
-                    "intent": "EDUCATION",
-                    "route": "ocr_fallback",
-                    "storage": {"ok": False},
-                }
-            )
+            logger.warning("[%s] OCR failed and vision empty, using tiered fallback for %s", trace_id, file_path)
+            return _cache_res({
+                "ok": True,
+                "content": (
+                    "用户通过微信发送了一张图片，但图片中的文字未能被自动识别。\n"
+                    "请用友好的语气引导学生：①把手机拿平拍 ②光线好一些不要反光 "
+                    "③如果图片不清晰可以重新拍一张发给老师。\n"
+                    "不方便拍照的话，也可以直接把题目打字发过来。"
+                ),
+                "intent": "EDUCATION", "route": "ocr_fallback",
+                "storage": {"ok": False},
+            })
 
-        # ── Text files: read directly ──
-        elif ext in _TEXT_EXTENSIONS:
-            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read()
-            # HTML 文件消毒: 剥离 script/style/event-handler
-            if ext in {".html", ".htm"}:
-                content = _sanitize_html_content(content)
-            return _cache_res(
-                {
-                    "ok": True,
-                    "content": content,
-                    "intent": "EDUCATION" if len(content) < 5000 else "DOCUMENT",
-                    "route": "text",
-                    "storage": {"ok": False},
-                }
-            )
-
-        # ── PDF: classify → text PDF (markitdown) or scanned (render→OCR) ──
+        # ── PDF: pymupdf4llm + MiniCPM-V hybrid OCR ──
         elif ext == ".pdf":
             content = await _handle_pdf(file_path, trace_id)
             if content:
-                logger.info(
-                    "[%s] PDF extraction: %d chars from %s", trace_id, len(content), file_path
-                )
-                return _cache_res(
-                    {
-                        "ok": True,
-                        "content": content,
-                        "intent": "EDUCATION",
-                        "route": "document_extract",
-                        "storage": {"ok": False},
-                    }
-                )
-            # Fallback to placeholder
+                logger.info("[%s] PDF extraction: %d chars from %s", trace_id, len(content), file_path)
+                # Enrich with sidecar if available (background pipeline may have completed)
+                content = _enrich_with_sidecar_content(content, file_path)
+                return _cache_res({
+                    "ok": True, "content": content,
+                    "intent": "EDUCATION", "route": "document_extract",
+                    "storage": {"ok": False},
+                    "doc_subtype": _inject_doc_type_meta(file_path).get("doc_subtype", ""),
+                })
             logger.warning("[%s] PDF extraction returned no content for %s", trace_id, file_path)
             return _cache_res(_fallback_placeholder(file_path, ext))
 
-        # ── Everything else: try markitdown first (broadest coverage) ──
-        elif ext not in _IMAGE_EXTENSIONS and ext != ".pdf" and ext not in _TEXT_EXTENSIONS:
-            _temp_link = None
-            md_path = file_path
-            # markitdown rejects .pptm/.ppsx by extension; symlink as .pptx
-            if ext in {".pptm", ".ppsx"}:
-                _temp_link = file_path + ".pptx"
-                if not os.path.exists(_temp_link):
-                    os.symlink(file_path, _temp_link)
-                md_path = _temp_link
-            content = _extract_with_markitdown(md_path)
-            if _temp_link and os.path.exists(_temp_link):
-                os.unlink(_temp_link)
-
-            # markitdown returns partial garbage (<50 chars) for old .doc format.
-            # Fall through to antiword when the result is too short.
-            if content and (len(content) >= 50 or ext not in {".doc", ".ppt", ".pps", ".xls"}):
-                logger.info(
-                    "[%s] markitdown extracted %d chars from %s", trace_id, len(content), file_path
-                )
-                # OCR embedded images in Office documents
-                ocr_text = await _ocr_office_images(file_path, ext, trace_id)
-                if ocr_text:
-                    content += ocr_text
-                return _cache_res(
-                    {
-                        "ok": True,
-                        "content": content,
-                        "intent": "EDUCATION",
-                        "route": "document_extract",
-                        "storage": {"ok": False},
-                    }
-                )
-
-            # ── markitdown declined or returned too little; try specialized fallbacks ──
-            if ext == ".doc":
-                content = _extract_with_antiword(file_path)
-            elif ext in {".ppt", ".pps"}:
-                content = _extract_with_catppt(file_path)
-
+        # ── All other files: unified extraction via extractors.py ──
+        else:
+            content = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: extract_text(file_path, trace_id=trace_id),
+            )
             if content:
-                logger.info(
-                    "[%s] fallback extracted %d chars from %s", trace_id, len(content), file_path
-                )
-                # OCR embedded images in old-format Office documents
-                ocr_text = await _ocr_office_images(file_path, ext, trace_id)
-                if ocr_text:
-                    content += ocr_text
-
-            if content:
-                return _cache_res(
-                    {
-                        "ok": True,
-                        "content": content,
-                        "intent": "EDUCATION",
-                        "route": "document_extract",
-                        "storage": {"ok": False},
-                    }
-                )
+                logger.info("[%s] extract_text: %d chars from %s", trace_id, len(content), file_path)
+                # OCR embedded images ONLY for Office documents — not for HTML/ZIP/audio/etc.
+                _OFFICE_EXTS = frozenset({".docx", ".xlsx", ".pptx", ".pptm", ".ppsx",
+                                          ".doc", ".xls", ".ppt", ".pps", ".odt"})
+                if ext in _OFFICE_EXTS:
+                    ocr_text = await _ocr_office_images(file_path, ext, trace_id)
+                    if ocr_text:
+                        content += ocr_text
+                _intent = "EDUCATION" if len(content) < 5000 else "DOCUMENT"
+                _route = "text" if ext in _TEXT_EXTENSIONS else "document_extract"
+                content = _enrich_with_sidecar_content(content, file_path)
+                return _cache_res({
+                    "ok": True, "content": content,
+                    "intent": _intent, "route": _route,
+                    "storage": {"ok": False},
+                    "doc_subtype": _inject_doc_type_meta(file_path).get("doc_subtype", ""),
+                })
 
             logger.warning("[%s] all extractors failed for %s", trace_id, file_path)
-            return _cache_res(_fallback_placeholder(file_path, ext))
-
-        # ── Unknown (non-office, non-image, non-text) ──
-        else:
             return _cache_res(_fallback_placeholder(file_path, ext))
 
     except Exception as e:
@@ -1427,160 +1353,143 @@ async def _handle_inbound_file(
         return _cache_res({"ok": False, "error": str(e)})
 
 
-# ── PDF classification ──
+def _enrich_with_sidecar_content(content: str, file_path: str) -> str:
+    """If UnifiedDocumentPipeline produced a more complete ``.md`` sidecar, use it.
 
-
-def _extract_pdf_text(file_path: str) -> tuple[str, int]:
-    """Extract text from a PDF via pymupdf.
-
-    Returns ``(text, num_pages)``.  ``text`` is empty when the PDF has no
-    extractable text layer (scanned document).
+    The sidecar is produced asynchronously (fire-and-forget), so it may or may
+    not be available yet.  When it is available and significantly longer, it
+    replaces the in-band extracted text — this gives us the benefit of the
+    full pipeline (structured exam JSON, embedded image OCR, etc.) without
+    blocking the initial response.
     """
-    import fitz
+    if not file_path:
+        return content
+    sidecar = Path(file_path).with_name(Path(file_path).stem + ".md")
+    try:
+        if sidecar.is_file():
+            sidecar_text = sidecar.read_text(encoding="utf-8")
+            if sidecar_text and len(sidecar_text) > len(content) * 1.2:
+                logger.info(
+                    "Sidecar enrichment: %d → %d chars from %s",
+                    len(content), len(sidecar_text), sidecar.name,
+                )
+                return sidecar_text
+    except (OSError, UnicodeError):
+        pass
+    return content
 
-    doc = fitz.open(file_path)
-    num_pages = len(doc)
-    pages = []
-    for page in doc:
-        pages.append(page.get_text().strip())
-    doc.close()
-    text = "\n\n".join(pages).strip()
-    return text, num_pages
+
+def _inject_doc_type_meta(file_path: str) -> dict:
+    """Classify a file and return doc_type metadata for RAG filtering.
+
+    Returns a dict with ``doc_subtype`` (e.g. "text_pdf", "scanned_pdf",
+    "office_docx", "image", "text", "unknown") that can be merged into
+    ChromaDB chunk metadata.
+    """
+    from tutor_platform.rag.unified_pipeline import classify_file, DocType
+
+    try:
+        dt = classify_file(file_path)
+        return {"doc_subtype": dt.value}
+    except Exception:
+        return {"doc_subtype": "unknown"}
 
 
-def _render_pdf_page(file_path: str, page_num: int, dpi: int = 300) -> bytes:
-    """Render a PDF page to PNG image bytes."""
-    import fitz
-
-    doc = fitz.open(file_path)
-    page = doc[page_num]
-    zoom = dpi / 72
-    mat = fitz.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=mat)
-    return pix.tobytes("png")
+# ── PDF handling ──
 
 
 async def _handle_pdf(file_path: str, trace_id: str) -> str:
-    """Extract text from a PDF.
+    """Extract text from a PDF via pymupdf4llm with conditional hybrid OCR.
 
-    Priority order:
-      1. pymupdf direct text extraction (fast, handles text-layer PDFs)
-      2. Page-by-page OCR via rkllama (for scanned/image-only PDFs)
-      3. markitdown as fallback for edge cases pymupdf can't handle
+    For text-layer PDFs: pymupdf4llm extraction without OCR (fast).
+    For scanned PDFs (no/very little text): manual fitz render + MiniCPM-V OCR.
     """
-    text, num_pages = _extract_pdf_text(file_path)
+    # First pass: extract without OCR (fast, <1s for most PDFs)
+    loop = asyncio.get_running_loop()
+    text = await loop.run_in_executor(
+        None,
+        lambda: extract_pdf_text(file_path, ocr_enabled=False, ocr_trace_id=trace_id),
+    )
 
-    # pymupdf found enough text → text-based PDF, return directly
-    if len(text) > 50:
-        logger.info(
-            "[%s] PDF text: %d chars from %d pages via pymupdf",
-            trace_id,
-            len(text),
-            num_pages,
-        )
+    # If text is substantial (real content beyond page markers), return directly.
+    # Page markers like "--- Page N ---" add up on multi-page scanned PDFs
+    # but contain no actual text.
+    _real_content = re.sub(
+        r"^--- Page \d+ ---|\n+",
+        " ",
+        text or "",
+        flags=re.MULTILINE,
+    ).strip()
+    if len(_real_content) > 50:
         return text
 
-    # pymupdf got very little text; try markitdown in case it can do better
-    # with a different text extraction strategy (e.g. complex layouts).
-    if text:
-        md_text = _extract_with_markitdown(file_path)
-        if md_text:
-            logger.info(
-                "[%s] PDF text: %d chars via markitdown (pymupdf had only %d)",
-                trace_id,
-                len(md_text),
-                len(text),
-            )
-            return md_text
-
-    # Scanned PDF: render each page → OpenCV → OCR
-    logger.info("[%s] PDF classified as scanned (%d pages, %s)", trace_id, num_pages, file_path)
-    pages_text: list[str] = []
-    for i in range(num_pages):
-        try:
-            img_bytes = _render_pdf_page(file_path, i)
-            processed = _opencv_preprocess_image(img_bytes)
-            page_text = await _ocr_image_bytes(processed, trace_id)
-            if page_text and page_text.strip():
-                pages_text.append(f"--- Page {i + 1} ---\n{page_text.strip()}")
-        except Exception as exc:
-            logger.warning("[%s] Scanned PDF page %d failed: %s", trace_id, i, exc)
-
-    return "\n\n".join(pages_text)
+    # Little/no text — likely scanned. Use manual OCR fallback (fitz render + MiniCPM-V).
+    # pymupdf4llm's ocr_function integration has known merge issues;
+    # the manual path via _pdf_manual_ocr_fallback is well-tested and reliable.
+    logger.info("[%s] PDF appears scanned (%d chars), using MiniCPM-V manual OCR", trace_id, len(text.strip()))
+    return await _pdf_manual_ocr_fallback(file_path, trace_id)
 
 
-# ── OpenCV image preprocessing ──
+async def _pdf_manual_ocr_fallback(file_path: str, trace_id: str) -> str:
+    """Manual PDF OCR: fitz render each page → OpenCV preprocess → OCR.
 
-
-def _opencv_preprocess_image(image_bytes: bytes) -> bytes:
-    """Preprocess image for OCR: downscale → grayscale → denoise → enhance → threshold."""
+    Used only when pymupdf4llm is not available.  Provides basic OCR
+    without layout analysis or structured Markdown output.
+    """
     try:
-        import cv2
-        import numpy as np
+        import fitz
     except ImportError:
-        return image_bytes  # cv2 not available, use raw
-
-    nparr = np.frombuffer(image_bytes, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if img is None:
-        return image_bytes  # can't decode, return raw
+        return ""
 
     try:
-        # Downscale: cap longest side at 1800px. MiniCPM-V-4.6 supports up to
-        # 1.8M pixels natively; higher resolution improves dense exam-text OCR.
-        _MAX_DIM = 1800
-        h, w = img.shape[:2]
-        if max(h, w) > _MAX_DIM:
-            scale = _MAX_DIM / max(h, w)
-            img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+        doc = fitz.open(file_path)
+    except Exception:
+        return ""
 
-        # Grayscale
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    num_pages = min(len(doc), 200)  # cap at 200 pages
+    pages_text: list[str] = [""] * num_pages  # pre-allocate, fill by index
 
-        # Detect clean/high-contrast image (e.g. phone screenshot): skip denoising.
-        # fastNlMeansDenoising is the most expensive preprocessing step (~40-60% of total
-        # CPU time); screenshots have negligible noise so it buys nothing.
-        _is_clean = gray.std() > 40
-        if _is_clean:
-            enhanced = gray
-        else:
-            denoised = cv2.fastNlMeansDenoising(gray)
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-            enhanced = clahe.apply(denoised)
+    # ── Batch processing: render 5 pages → OCR with semaphore(2) concurrency ──
+    # _ocr_image_bytes has asyncio.Semaphore(2).  We render a batch of pages,
+    # gather OCR tasks, then move to the next batch.  This keeps memory at
+    # ~6MB (5 × 1.2MB) and CPU peaks brief (~0.75s per batch).
+    BATCH = 5
+    for batch_start in range(0, num_pages, BATCH):
+        async def _ocr_one_page(page_idx: int) -> tuple[int, str]:
+            try:
+                page = doc[page_idx]
+                pix = page.get_pixmap(dpi=200)
+                img_bytes = pix.tobytes("png")
+                from tutor_platform.tools.preprocess import preprocess_image_bytes
+                processed = preprocess_image_bytes(img_bytes)
+                page_text = await _ocr_image_bytes(processed, trace_id)
+                return page_idx, page_text.strip() if page_text else ""
+            except Exception as exc:
+                logger.warning("[%s] Manual OCR page %d failed: %s", trace_id, page_idx, exc)
+                return page_idx, ""
 
-        # Deskew: detect text angle and rotate
-        coords = np.column_stack(np.where(enhanced < 128))  # dark pixels
-        if len(coords) > 10:
-            angle = cv2.minAreaRect(coords)[-1]
-            if angle < -45:
-                angle = 90 + angle
-            if abs(angle) > 0.3:
-                h, w = enhanced.shape
-                center = (w // 2, h // 2)
-                M = cv2.getRotationMatrix2D(center, angle, 1.0)
-                enhanced = cv2.warpAffine(
-                    enhanced,
-                    M,
-                    (w, h),
-                    flags=cv2.INTER_CUBIC,
-                    borderMode=cv2.BORDER_REPLICATE,
-                )
-
-        # Adaptive threshold (binarize)
-        binary = cv2.adaptiveThreshold(
-            enhanced,
-            255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            11,
-            2,
+        batch_end = min(batch_start + BATCH, num_pages)
+        tasks = [_ocr_one_page(i) for i in range(batch_start, batch_end)]
+        results = await asyncio.gather(*tasks)
+        for idx, text in results:
+            if text:
+                pages_text[idx] = f"--- Page {idx + 1} ---\n{text}"
+        logger.debug(
+            "[%s] OCR batch %d-%d/%d: %d pages with text",
+            trace_id, batch_start + 1, batch_end, num_pages,
+            sum(1 for t in pages_text[batch_start:batch_end] if t),
         )
 
-        _, buffer = cv2.imencode(".jpg", binary, [cv2.IMWRITE_JPEG_QUALITY, 95])
-        return buffer.tobytes()
-    except Exception as exc:
-        logger.warning("[opencv] Preprocessing failed, using raw image: %s", exc)
-        return image_bytes
+    doc.close()
+
+    # Remove empty slots (failed pages)
+    pages_text = [t for t in pages_text if t]
+
+    logger.info(
+        "[%s] Manual OCR fallback: %d/%d pages extracted for %s",
+        trace_id, len(pages_text), num_pages, Path(file_path).name,
+    )
+    return "\n\n".join(pages_text)
 
 
 # ── OCR helpers ──
@@ -1752,7 +1661,7 @@ async def _ocr_image_file(file_path: str, trace_id: str) -> str:
     try:
         with open(file_path, "rb") as f:
             raw_bytes = f.read()
-        processed = _opencv_preprocess_image(raw_bytes)
+        processed = preprocess_image_bytes(raw_bytes)
 
         # Try full-image OCR first
         text = await _ocr_image_bytes(processed, trace_id)
@@ -2047,36 +1956,23 @@ def _ocr_output_is_garbled(text: str) -> bool:
 
     Returns True when the text is likely useless (garbled/placeholder) so the
     caller can treat it as OCR failure and trigger the ocr_fallback path.
-
-    For mixed-language content (e.g. English math/physics with Chinese labels),
-    checks alphanumeric ratio as well — pure ASCII with meaningful content
-    (digits, letters, math symbols) is NOT garbled even when Chinese < 20%.
     """
-    if not text or len(text.strip()) < 10:
+    if not text or len(text.strip()) < 5:
         return True
-    garbage = sum(1 for ch in text if ch in 'xX□�' or (ch.isascii() and not ch.isalnum() and ch not in ' .,;:!?+-=()[]{}<>/*^_'))
-    if len(text) > 0:
-        # Chinese ratio: if < 20%, may still be valid English/math content
-        chinese_count = sum(1 for ch in text if '一' <= ch <= '鿿')
-        chinese_ratio = chinese_count / len(text)
-        garbage_ratio = garbage / len(text)
 
-        # High garbage → definitely garbled
-        if garbage_ratio > 0.3:
-            return True
+    # Too many replacement chars (U+FFFD) — definitely garbled
+    if text.count("\ufffd") > max(3, len(text) * 0.05):
+        return True
 
-        # Low Chinese but high alphanumeric → meaningful non-Chinese content
-        # (e.g. English math/physics formulas).  BUT also check garbage ratio:
-        # if special chars are common too (e.g. "abc!@#def$%^xyz" repeated),
-        # the output is still garbled despite the alphanumeric count.
-        if chinese_ratio < 0.2:
-            alnum_ratio = sum(1 for ch in text if ch.isalnum()) / len(text)
-            garbage_ratio = garbage / len(text)
-            if alnum_ratio > 0.5 and garbage_ratio < 0.15:
-                return False
+    # STUB mode output — always garbled
+    if "[STUB:" in text:
+        return True
 
-        return chinese_ratio < 0.2
-    return True
+    # Everything else is considered valid OCR output.
+    # MiniCPM-V with Chinese system prompt reliably returns valid text;
+    # aggressive ratio-based filtering causes false positives on short
+    # mixed-language outputs (e.g. textbook pages with numbers/symbols).
+    return False
 
 
 async def _ocr_office_images(file_path: str, ext: str, trace_id: str) -> str:
@@ -2130,7 +2026,7 @@ async def _ocr_office_images(file_path: str, ext: str, trace_id: str) -> str:
     for img_bytes in all_images[:5]:  # at most 5 images
         try:
             ocr_result = await asyncio.wait_for(
-                _ocr_image_bytes_ollama(img_bytes, trace_id), timeout=15
+                _ocr_image_bytes(preprocess_image_bytes(img_bytes), trace_id), timeout=15
             )
             if ocr_result:
                 ocr_texts.append(ocr_result)
@@ -2208,6 +2104,7 @@ async def _ingest_to_kb(
     try:
         import hashlib
 
+        _chroma_kb = _chromadb_kb_name(kb_name)
         _content_hash = hashlib.sha256(_indexed_content.encode("utf-8")).hexdigest()[:16]
         docs = _split_content_for_ingest(_indexed_content, filename)
         ids = [f"{_content_hash}_{i}" for i in range(len(docs))]
@@ -2220,21 +2117,23 @@ async def _ingest_to_kb(
                 "type": _content_type,
                 "subject": _detected_subject,
                 "grade": _detected_grade,
+                "kb_name": kb_name,
             }
             for _ in docs
         ]
 
         await provider.add_documents(
-            kb_name=kb_name,
+            kb_name=_chroma_kb,
             documents=docs,
             metadatas=metadatas,
             ids=ids,
         )
         logger.info(
-            "[%s] KB ingest: %d chunks -> %s (%d chars) type=%s subject=%s grade=%s",
+            "[%s] KB ingest: %d chunks -> %s (chroma: %s, %d chars) type=%s subject=%s grade=%s",
             trace_id,
             len(docs),
             kb_name,
+            _chroma_kb,
             len(_indexed_content),
             _content_type,
             _detected_subject,
@@ -2269,11 +2168,16 @@ async def _ingest_to_kb(
                 for kb in (kbs if isinstance(kbs, list) else [])
             )
 
+            import urllib.parse as _up
+            _dt_safe_kb = _up.quote(kb_name, safe="")
             with open(tmp_path, "rb") as fh:
-                files = {"files": (filename or "auto_teach.txt", fh, "text/plain")}
+                _dt_filename = (filename or "auto_teach.txt")
+                if not _dt_filename.endswith(".txt"):
+                    _dt_filename = _dt_filename + ".txt"
+                files = {"files": (_dt_filename, fh, "text/plain")}
                 if kb_exists:
                     resp = await client.post(
-                        f"{DEEPTUTOR_URL}/api/v1/knowledge/{kb_name}/upload",
+                        f"{DEEPTUTOR_URL}/api/v1/knowledge/{_dt_safe_kb}/upload",
                         data={"rag_provider": "llamaindex"},
                         files=files,
                     )
@@ -3201,12 +3105,13 @@ def api_kb_search(query: str = "", kb_name: str = "tutoring", top_k: int = 5):
     try:
         import chromadb
 
+        _chroma_kb = _chromadb_kb_name(kb_name)
         client = chromadb.PersistentClient(path="/data/chroma")
         try:
             from tutor_platform.tools.embeddings import RkllamaEmbeddingFunction
 
             coll = client.get_collection(
-                kb_name,
+                _chroma_kb,
                 embedding_function=RkllamaEmbeddingFunction(),
             )
         except Exception:
@@ -3323,11 +3228,12 @@ async def api_kb_ingest_file(
                     "learner_id": learner_id,
                     "source": "web_ui",
                     "trace_id": trace_id,
+                    "kb_name": kb_name,
                 }
                 for _ in docs
             ]
             await provider.add_documents(
-                kb_name=kb_name,
+                kb_name=_chromadb_kb_name(kb_name),
                 documents=docs,
                 metadatas=metadatas,
                 ids=ids,
@@ -3355,7 +3261,7 @@ async def api_kb_ingest_file(
 
 @app.post("/api/kb/sync-from-dt")
 async def api_kb_sync_from_dt(
-    kb_name: str = "tutoring",
+    kb_name: str = Form("tutoring"),
     request: Request = None,
 ):
     """从 DT 知识库同步全部文件到平台 ChromaDB（重建索引后调用）。
@@ -3364,11 +3270,15 @@ async def api_kb_sync_from_dt(
     提取文本后入库平台 ChromaDB。
     """
     trace_id = _extract_trace_id(request) if request else _generate_trace_id()
+    import urllib.parse
+
+    _safe_kb = urllib.parse.quote(kb_name, safe="")
+    _chroma_kb = _chromadb_kb_name(kb_name)
 
     # 1) 列出 DT 知识库中的文件
     async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.get(
-            f"{DEEPTUTOR_URL}/api/v1/knowledge/{kb_name}/files",
+            f"{DEEPTUTOR_URL}/api/v1/knowledge/{_safe_kb}/files",
         )
         if resp.status_code != 200:
             return {
@@ -3376,8 +3286,11 @@ async def api_kb_sync_from_dt(
                 "error": f"DT list files failed (HTTP {resp.status_code})",
                 "trace_id": trace_id,
             }
-        data = resp.json()
-        files = data if isinstance(data, list) else data.get("files", [])
+        raw_data = resp.json()
+        # DT returns {"files": [...]} dict, not a list
+        file_list = raw_data if isinstance(raw_data, list) else raw_data.get("files", [])
+        files = [f if isinstance(f, str) else f.get("name", "") for f in file_list]
+        files = [f for f in files if f]  # filter empties
 
     if not files:
         return {"ok": True, "files_processed": 0, "total_chunks": 0, "trace_id": trace_id}
@@ -3389,14 +3302,10 @@ async def api_kb_sync_from_dt(
     import hashlib
     import tempfile
 
-    for f in files:
-        filename = f if isinstance(f, str) else f.get("name", "")
-        if not filename:
-            continue
-
-        # 2) 从 DT 下载原始文件
+    for filename in files:
+        # 2) 从 DT 下载原始文件 (URL-encode kb_name + filename)
         safe_name = filename.replace("/", "%2F")
-        file_url = f"{DEEPTUTOR_URL}/api/v1/knowledge/{kb_name}/files/{safe_name}"
+        file_url = f"{DEEPTUTOR_URL}/api/v1/knowledge/{_safe_kb}/files/{safe_name}"
         try:
             async with httpx.AsyncClient(timeout=120) as dl:
                 file_resp = await dl.get(file_url)
@@ -3433,7 +3342,7 @@ async def api_kb_sync_from_dt(
             if not extracted:
                 continue
 
-            # 4) 入库平台 ChromaDB
+            # 4) 入库平台 ChromaDB (use sanitized name)
             _content_hash = hashlib.sha256(extracted.encode("utf-8")).hexdigest()[:16]
             docs = _split_content_for_ingest(extracted, filename)
             ids = [f"{_content_hash}_{i}" for i in range(len(docs))]
@@ -3442,11 +3351,12 @@ async def api_kb_sync_from_dt(
                     "filename": filename,
                     "source": "web_ui_reindex",
                     "trace_id": trace_id,
+                    "kb_name": kb_name,
                 }
                 for _ in docs
             ]
             await provider.add_documents(
-                kb_name=kb_name,
+                kb_name=_chroma_kb,
                 documents=docs,
                 metadatas=metadatas,
                 ids=ids,
@@ -3454,8 +3364,8 @@ async def api_kb_sync_from_dt(
             total_chunks += len(docs)
             processed += 1
             logger.info(
-                "[%s] KB reindex sync: %s -> %d chunks",
-                trace_id, filename, len(docs),
+                "[%s] KB reindex sync: %s -> %d chunks (chroma: %s)",
+                trace_id, filename, len(docs), _chroma_kb,
             )
         except Exception as exc:
             logger.warning("[%s] KB reindex error: %s: %s", trace_id, filename, exc)
@@ -3494,6 +3404,9 @@ async def api_ingest_proxy(
     with open(dest, "wb") as f:
         f.write(content)
     source_url = f"/sources/{archive_name}"
+
+    # Submit to unified pipeline in background (produces .md / .exam.json sidecars)
+    _spawn_unified_pipeline_bg(dest, trace_id)
 
     if learner_id == "default":
         logger.warning("[%s] ingest_proxy called with default learner_id", trace_id)

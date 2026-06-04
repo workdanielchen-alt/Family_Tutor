@@ -92,6 +92,7 @@ services:
       - HERMES_CONTAINER=hermes_agent
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
       - RKLLM_STUB_MODE=true
+      - OCR_PROVIDER=ollama
       - DEVICE_IP=127.0.0.1
     volumes:
       - ./data/mastery:/data/mastery

@@ -152,6 +152,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsm6 \
     libxext6 \
     libxrender1 \
+    antiword \
+    catdoc \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy Node.js from node-runtime stage (platform-matched binary)
@@ -433,6 +435,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     vim \
     git \
     antiword \
+    catdoc \
     && rm -rf /var/lib/apt/lists/*
 
 # Install development Python packages

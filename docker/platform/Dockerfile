@@ -5,20 +5,21 @@
 
 FROM python:3.11-slim
 
-# Install avahi-utils for mDNS LAN discovery + antiword (old .doc) + catdoc (catppt for old .ppt)
+# Install system deps (minimal — no antiword needed since markitdown covers .doc)
 RUN sed -i 's/deb.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true && \
     apt-get update && apt-get install -y --no-install-recommends \
     avahi-utils \
-    antiword \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 # Install Python dependencies (shared project deps + platform extras)
+# Use Aliyun mirror — pypi.org times out on some CN networks.
 COPY requirements/ ./requirements/
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt \
-    && pip install --no-cache-dir chromadb mcp markitdown "qrcode[pil]" opencv-python-headless pymupdf
+RUN pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/ && \
+    pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir chromadb mcp "markitdown[all]" "qrcode[pil]" opencv-python-headless pymupdf pymupdf4llm
 
 # Copy local packages (paths match dev sys.path inserts)
 COPY tutor_platform/ /tutor_platform/

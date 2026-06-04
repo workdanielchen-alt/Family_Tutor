@@ -495,33 +495,45 @@ SOUL.md 注入 (每次教学前):
 ```
 上传文件
     │
-    ├─ 分类 (按扩展名)
+    ├─ _handle_inbound_file() → extract_text() (extractors.py 统一入口)
     │    │
-    │    ├─ 图片 (.jpg/.png/…)
-    │    │    └─ OpenCV 预处理 (去偏斜 → 去噪 → CLAHE 增强 → 自适应二值化)
-    │    │         └─ OCR (rkllama NPU / Ollama MiniCPM-V 兜底) → 文本
+    │    ├─ 图片 (.jpg/.png/.heic/…)
+    │    │    └─ extract_image_text(): OpenCV 6步预处理 → MiniCPM-V OCR → 水平分割并行
+    │    │    └─ _describe_diagram(): MiniCPM 图形描述 (vision)
     │    │
     │    ├─ PDF
-    │    │    ├─ 含文本层 → markitdown 提取
-    │    │    └─ 扫描件 → 每页渲染 PNG → OpenCV → OCR
+    │    │    └─ extract_pdf_text(ocr_enabled=True):
+    │    │         ├─ pymupdf4llm.to_markdown() 结构化 Markdown
+    │    │         ├─ 扫描件 → ocr_function=MinicpmOCRFunc (MiniCPM-V, 无 Tesseract)
+    │    │         └─ pymupdf4llm 不可用 → _pdf_manual_ocr_fallback()
     │    │
-    │    ├─ Office (.docx/.pptx/.xlsx)
-    │    │    └─ markitdown 提取
+    │    ├─ Office (.docx/.xlsx/.pptx)
+    │    │    ├─ python-docx / openpyxl / python-pptx 快速提取
+    │    │    ├─ 失败 → markitdown fallback
+    │    │    └─ _ocr_office_images() 内嵌图片 OCR
     │    │
-    │    ├─ 旧版 .doc
-    │    │    └─ antiword CLI 提取
+    │    ├─ 旧版 Office (.doc/.ppt/.xls/.odt/.rtf) + EPUB
+    │    │    └─ markitdown 提取 (不依赖 antiword)
     │    │
-    │    └─ 文本 (.txt/.md/.html)
-    │         └─ 直接读取 (HTML 做 XSS 消毒)
+    │    ├─ HTML (.html/.htm)
+    │    │    └─ extract_text_file() 多编码读取 + _sanitize_html() XSS 消毒
+    │    │
+    │    ├─ 音频 (.mp3/.wav) / ZIP
+    │    │    └─ markitdown[all] 提取 (音频转录 / 递归遍历)
+    │    │
+    │    └─ 文本 (.txt/.md/…)
+    │         └─ extract_text_file() 多编码链 (utf-8→gbk→gb2312→latin-1→cp1252)
     │
-    ├─ 教育内容检测
-    │    └─ 关键词 + 格式特征启发式判断
-    │
-    ├─ 异步双写入向量存储
+    ├─ vector_store 异步双写入
     │    ├─ 平台 ChromaDB (PersistentClient, 内嵌)
-    │    │    └─ 按段落分块 (≤500 字符), 带 metadata 入库
+    │    │    └─ semantic_chunk() 语义分块 (≤800 字符, 标题感知 + overlap), 带 metadata 入库
     │    └─ DT LlamaIndex (HTTP POST /api/v1/knowledge)
-    │         └─ 写入临时文件 → 上传到知识库
+    │         └─ 扫描 PDF 路径双写: OCR 文本 → .txt → upload API
+    │
+    ├─ UnifiedDocumentPipeline (fire-and-forget 后台)
+    │    ├─ classify_file() → 11 DocTypes
+    │    ├─ Phase 1-4 考试结构化 (.exam.json sidecar)
+    │    └─ _enrich_with_sidecar_content() 消费更完整的 sidecar
     │
     ├─ 缓存教学上下文到内存 + 持久化到磁盘
     │
