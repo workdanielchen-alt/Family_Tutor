@@ -515,49 +515,11 @@ class _TTLock:
 # TTL 120s — HTTP release 可能因网络故障静默失败, TTL 兜底自动恢复.
 _llm_lock = _TTLock(ttl=120)
 
-# ── Inter-process OCR lock (flock-based, shared across docker exec and API) ──
-# asyncio.Semaphore only protects same-process concurrency.  When a background
-# docker exec runs OCR at the same time as an API upload, both processes would
-# race on ollama without a shared lock.  flock on a file gives us true
-# cross-process mutual exclusion.
-import fcntl as _fcntl
-
-_OCR_LOCK_PATH = os.path.join(os.environ.get("CHROMA_PERSIST_DIR", "/data/chromadb"), ".ocr_ipc.lock")
-
-class _InterProcessOCRLock:
-    """flock-based mutex — shared across all processes in the same filesystem.
-
-    Usage: ``async with _ocr_semaphore: ...`` — identical to asyncio.Semaphore.
-    """
-
-    def __init__(self) -> None:
-        self._fd: int | None = None
-
-    def _ensure_fd(self) -> None:
-        if self._fd is None:
-            self._fd = os.open(_OCR_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o644)
-
-    async def __aenter__(self) -> "_InterProcessOCRLock":
-        if self._fd is None:
-            self._ensure_fd()
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, _fcntl.flock, self._fd, _fcntl.LOCK_EX)
-        return self
-
-    async def __aexit__(self, *args: object) -> None:
-        if self._fd is not None:
-            try:
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, _fcntl.flock, self._fd, _fcntl.LOCK_UN)
-            except (OSError, RuntimeError):
-                pass
-
-
-_ocr_ipc_lock = _InterProcessOCRLock()
-
-
-# OCR 并发控制: 最多 2 个并发 OCR 请求, 防止 NPU OOM.
-_ocr_semaphore = _ocr_ipc_lock  # Inter-process flock — Single-request MiniCPM-V CPU inference avoids timeouts
+# OCR 并发控制: 单请求 MiniCPM-V CPU 推理, 避免并发超时.
+# asyncio.Semaphore(1) 保护同进程内的并发.  跨进程场景下 (docker exec + API)
+# 两个进程各自有独立的 semaphore, 但 ollama 单模型处理能力有限, 同时发送两个
+# 请求自然排队.  如需统一调度可用 API 端点的 /api/kb/sync-from-dt 代替 docker exec.
+_ocr_semaphore = asyncio.Semaphore(1)
 
 # OCR warm-once: 首次图片请求时 warm, 后续跳过 (模型加载后常驻).
 # 持久化到文件, 容器重启后跳过 warm (模型在 rkllama 容器中常驻).
@@ -1349,7 +1311,7 @@ async def _handle_inbound_file(
         # ── PDF: pymupdf4llm + MiniCPM-V hybrid OCR ──
         elif ext == ".pdf":
             _kb_name = meta.get("kb_name", "")
-            _filename = os.path.basename(file_path) if file_path else ""
+            _filename = meta.get("dt_filename") or meta.get("filename") or (os.path.basename(file_path) if file_path else "")
             content = await _handle_pdf(file_path, trace_id, kb_name=_kb_name, filename=_filename)
             if content:
                 logger.info("[%s] PDF extraction: %d chars from %s", trace_id, len(content), file_path)
@@ -3464,6 +3426,7 @@ async def api_kb_sync_from_dt(
                     "source": "web_ui_reindex",
                     "kb_name": kb_name,
                     "trace_id": trace_id,
+                    "dt_filename": filename,
                 },
             )
             extracted = result.get("content", "").strip()
