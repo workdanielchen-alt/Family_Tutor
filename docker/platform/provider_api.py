@@ -1307,7 +1307,9 @@ async def _handle_inbound_file(
 
         # ── PDF: pymupdf4llm + MiniCPM-V hybrid OCR ──
         elif ext == ".pdf":
-            content = await _handle_pdf(file_path, trace_id)
+            _kb_name = meta.get("kb_name", "")
+            _filename = os.path.basename(file_path) if file_path else ""
+            content = await _handle_pdf(file_path, trace_id, kb_name=_kb_name, filename=_filename)
             if content:
                 logger.info("[%s] PDF extraction: %d chars from %s", trace_id, len(content), file_path)
                 # Enrich with sidecar if available (background pipeline may have completed)
@@ -1398,11 +1400,15 @@ def _inject_doc_type_meta(file_path: str) -> dict:
 # ── PDF handling ──
 
 
-async def _handle_pdf(file_path: str, trace_id: str) -> str:
+async def _handle_pdf(file_path: str, trace_id: str, kb_name: str = "", filename: str = "") -> str:
     """Extract text from a PDF via pymupdf4llm with conditional hybrid OCR.
 
     For text-layer PDFs: pymupdf4llm extraction without OCR (fast).
     For scanned PDFs (no/very little text): manual fitz render + MiniCPM-V OCR.
+
+    When ``kb_name`` and ``filename`` are provided, scanned-page OCR results
+    are persisted to ChromaDB incrementally (batch of 5 pages) so interrupted
+    runs can resume from the last completed page.
     """
     # First pass: extract without OCR (fast, <1s for most PDFs)
     loop = asyncio.get_running_loop()
@@ -1427,14 +1433,16 @@ async def _handle_pdf(file_path: str, trace_id: str) -> str:
     # pymupdf4llm's ocr_function integration has known merge issues;
     # the manual path via _pdf_manual_ocr_fallback is well-tested and reliable.
     logger.info("[%s] PDF appears scanned (%d chars), using MiniCPM-V manual OCR", trace_id, len(text.strip()))
-    return await _pdf_manual_ocr_fallback(file_path, trace_id)
+    return await _pdf_manual_ocr_fallback(file_path, trace_id, kb_name=kb_name, filename=filename)
 
 
-async def _pdf_manual_ocr_fallback(file_path: str, trace_id: str) -> str:
+async def _pdf_manual_ocr_fallback(file_path: str, trace_id: str, kb_name: str = "", filename: str = "") -> str:
     """Manual PDF OCR: fitz render each page → OpenCV preprocess → OCR.
 
-    Used only when pymupdf4llm is not available.  Provides basic OCR
-    without layout analysis or structured Markdown output.
+    When ``kb_name`` is provided (incremental/resumable mode):
+      - Before OCRing a page, checks ChromaDB for existing results (by filename + page_number).
+      - After each 5-page batch, writes OCR results to ChromaDB immediately.
+      - Interrupted runs can resume by re-invoking with the same ``kb_name`` / ``filename``.
     """
     try:
         import fitz
@@ -1448,17 +1456,45 @@ async def _pdf_manual_ocr_fallback(file_path: str, trace_id: str) -> str:
 
     num_pages = min(len(doc), 200)  # cap at 200 pages
     pages_text: list[str] = [""] * num_pages  # pre-allocate, fill by index
+    _chroma_kb = _chromadb_kb_name(kb_name) if kb_name else ""
 
-    # ── Batch processing: render 5 pages → OCR with semaphore(2) concurrency ──
-    # _ocr_image_bytes has asyncio.Semaphore(2).  We render a batch of pages,
-    # gather OCR tasks, then move to the next batch.  This keeps memory at
-    # ~6MB (5 × 1.2MB) and CPU peaks brief (~0.75s per batch).
+    # ── Pre-check: skip pages already in ChromaDB (resume from last checkpoint) ──
+    if _chroma_kb:
+        try:
+            import chromadb as _ch
+            from chromadb.config import Settings as _CS
+            _c = _ch.PersistentClient(path=os.environ.get("CHROMA_PERSIST_DIR", "/data/chromadb"), settings=_CS(anonymized_telemetry=False))
+            _coll = _c.get_or_create_collection(name=_chroma_kb)
+            _existing = _coll.get(
+                where={"filename": filename},
+                include=["metadatas"],
+            )
+            for _m in (_existing.get("metadatas") or []):
+                _pn = _m.get("page_number")
+                if _pn is not None and 0 <= _pn < num_pages:
+                    pages_text[_pn] = f"--- Page {_pn + 1} ---\n[resumed]"
+            _already = sum(1 for t in pages_text if t)
+            if _already:
+                logger.info("[%s] Resuming OCR: %d/%d pages already in ChromaDB, %d remaining",
+                            trace_id, _already, num_pages, num_pages - _already)
+        except Exception as _e:
+            logger.warning("[%s] Resume pre-check failed (non-fatal): %s", trace_id, _e)
+
+    # ── Batch processing: render 5 pages → OCR with semaphore(1) concurrency ──
     BATCH = 5
     for batch_start in range(0, num_pages, BATCH):
+        # Filter out already-done pages in this batch (resume mode)
+        batch_pages = [
+            i for i in range(batch_start, min(batch_start + BATCH, num_pages))
+            if not pages_text[i]
+        ]
+        if not batch_pages:
+            continue
+
         async def _ocr_one_page(page_idx: int) -> tuple[int, str]:
             try:
-                page = doc[page_idx]
-                pix = page.get_pixmap(dpi=200)
+                page_obj = doc[page_idx]
+                pix = page_obj.get_pixmap(dpi=200)
                 img_bytes = pix.tobytes("png")
                 from tutor_platform.tools.preprocess import preprocess_image_bytes
                 processed = preprocess_image_bytes(img_bytes)
@@ -1468,17 +1504,33 @@ async def _pdf_manual_ocr_fallback(file_path: str, trace_id: str) -> str:
                 logger.warning("[%s] Manual OCR page %d failed: %s", trace_id, page_idx, exc)
                 return page_idx, ""
 
-        batch_end = min(batch_start + BATCH, num_pages)
-        tasks = [_ocr_one_page(i) for i in range(batch_start, batch_end)]
+        tasks = [_ocr_one_page(i) for i in batch_pages]
         results = await asyncio.gather(*tasks)
         for idx, text in results:
             if text:
                 pages_text[idx] = f"--- Page {idx + 1} ---\n{text}"
-        logger.debug(
-            "[%s] OCR batch %d-%d/%d: %d pages with text",
-            trace_id, batch_start + 1, batch_end, num_pages,
-            sum(1 for t in pages_text[batch_start:batch_end] if t),
+        logger.info(
+            "[%s] OCR batch %d-%d/%d: %d pages extracted",
+            trace_id, batch_start + 1, min(batch_start + BATCH, num_pages), num_pages,
+            sum(1 for t in pages_text[batch_start:min(batch_start + BATCH, num_pages)] if t),
         )
+
+        # ── Incremental write: persist this batch to ChromaDB immediately ──
+        if _chroma_kb and any(pages_text[i] for i in range(batch_start, min(batch_start + BATCH, num_pages))):
+            try:
+                _batch_indices = [i for i in range(batch_start, min(batch_start + BATCH, num_pages)) if pages_text[i]]
+                import hashlib as _hl
+                _chunk_hash = _hl.sha256(str(_batch_indices).encode()).hexdigest()[:12]
+                _ids = [f"{_chunk_hash}_p{i}" for i in _batch_indices]
+                _md = [{"filename": filename, "kb_name": kb_name, "source": "ocr_batch", "page_number": i} for i in _batch_indices]
+                _docs = [pages_text[i] for i in _batch_indices]
+                from tutor_platform.unified_provider import get_provider_instance
+                _p = get_provider_instance()
+                await _p.add_documents(kb_name=_chroma_kb, documents=_docs, metadatas=_md, ids=_ids)
+                logger.info("[%s] Saved batch %d-%d (%d pages) to ChromaDB",
+                            trace_id, batch_start + 1, min(batch_start + BATCH, num_pages), len(_docs))
+            except Exception as _e:
+                logger.warning("[%s] Incremental write failed (non-fatal): %s", trace_id, _e)
 
     doc.close()
 
