@@ -44,27 +44,35 @@ Extract API  ─┘     + sidecar 富化              │
                                     │         │   │     markitdown
                                text_pdf   scanned   │     fallback
                                pymupdf4llm  pdf      │         │
-                               (use_ocr    pymupdf4llm  ┌──────┴──────┐
-                                =False)    (use_ocr  =True,   fast libs   markitdown
-                                         ocr_function
-                                         =MiniCPM-V)
+                               (use_ocr    fitz render  ┌──────┴──────┐
+                                =False)    + OpenCV     fast libs   markitdown
+                                         + MiniCPM-V
+                                         (5页/批并发,
+                                          semaphore 1)
 ```
 
 **核心设计原则**：6 条入口 → `_handle_inbound_file()` → `extractors.py` 的 `extract_text()`（唯一提取真相源）。所有文档类型的提取逻辑集中在 `tutor_platform/rag/extractors.py`，无重复实现。
 
-### pymupdf4llm Hybrid OCR 管道
+### MiniCPM-V 手动 OCR 管线
 
-扫描 PDF 不再需要 Tesseract。pymupdf4llm 的 `ocr_function` 参数接入 MiniCPM-V 适配器 (`tutor_platform/rag/ocr_adapters.py`)：
+扫描 PDF 不再需要 Tesseract。处理路径为：
 
 ```
-pymupdf4llm.to_markdown(
-    "scanned.pdf",
-    use_ocr=True,
-    ocr_function=MinicpmOCRFunc(trace_id="..."),
-)
+_handle_pdf()
+  ├─ extract_pdf_text(ocr_enabled=False)  ← 纯文字层提取, <1s
+  │   └─ 剥除 "--- Page N ---" 分页标记后判断真实内容长度
+  │        >50 chars → 文字层 PDF, 直接返回
+  │
+  └─ ≤50 chars → 扫描件
+       └─ _pdf_manual_ocr_fallback()
+            ├─ fitz 逐页渲染 (get_pixmap dpi=200)
+            ├─ OpenCV 6步预处理 (降采样→灰度→降噪+CLAHE→deskew→二值化)
+            ├─ 5页/批 asyncio.gather 并发
+            ├─ _ocr_semaphore(1) 串行 MiniCPM-V OCR（CPU推理,并发2会过载超时）
+            └─ 拼接 "--- Page N ---" 分页标记 + OCR 文本
 ```
 
-pymupdf4llm 负责布局分析 + 表格检测 + 标题层级 + 阅读顺序 + Header/Footer 剔除 + **选择性 OCR**（只对无文字层区域调用 MiniCPM，~50% 减少 OCR 调用量）。MiniCPM 适配器内部走 Ollama → rkllama NPU fallback。
+> **为什么不直接用 pymupdf4llm 的 `ocr_function`？** pymupdf4llm v1.27+ 存在 OCR 合并 bug（结果被 silent-drop），直接逐页渲染 + MiniCPM-V 的手动路径更可靠且生产已验证。
 
 ### 扫描 PDF 入库完整链路
 
@@ -77,16 +85,20 @@ pymupdf4llm 负责布局分析 + 表格检测 + 标题层级 + 阅读顺序 + He
   └─→ [Platform] POST /api/kb/ingest-file
          ├─ _handle_inbound_file()
          │   └─ _handle_pdf()
-         │        └─ extract_pdf_text(ocr_enabled=True)
-         │             └─ pymupdf4llm.to_markdown(
-         │                  use_ocr=True,
-         │                  ocr_function=MinicpmOCRFunc)  ← MiniCPM-V OCR
-         │             → 完整结构化 Markdown (含表格/标题)
+         │        ├─ extract_pdf_text(ocr_enabled=False) → 分页标记 2188 字
+         │        ├─ 剥除标记 → 0 字真实内容 → 判定为扫描件
+         │        └─ _pdf_manual_ocr_fallback()
+         │             ├─ fitz.get_pixmap(dpi=200)
+         │             ├─ preprocess_image_bytes (OpenCV 6步)
+         │             └─ _ocr_semaphore(1) → ollama MiniCPM-V
+         │             → 逐页 OCR 文本 (5页/批 asyncio.gather)
          │
          ├─ route == "document_extract" → **双写**
          │   └─ _ingest_to_kb(content, kb_name)
          │       ├─ ① ChromaDB: 语义分块 → embedding → /data/chromadb
+         │       │    (ChromaDB 集合名经 _chromadb_kb_name() 自动映射)
          │       └─ ② DT LlamaIndex: .txt → POST /api/v1/knowledge/{kb}/upload
+         │            (文件名追加 .txt 后缀, 不覆盖原始 PDF)
          │
          └─ _spawn_unified_pipeline_bg() → .txt / .exam.json sidecar
               └─ 后续 _enrich_with_sidecar_content() 消费更完整的 sidecar
@@ -288,27 +300,37 @@ html/.htm 额外经过 `_sanitize_html()` XSS 消毒。
 ### 5.4 扫描 PDF (SCANNED_PDF / EXAM_PDF)
 
 ```
-.pdf → extract_pdf_text(path, ocr_enabled=True,
-                          ocr_trace_id=trace_id)
-        → pymupdf4llm.to_markdown(
-             use_ocr=True,
-             ocr_function=MinicpmOCRFunc(trace_id))
+.pdf → _handle_pdf()
+        ├─ pymupdf4llm.to_markdown(use_ocr=False)
+        │   → 仅 "--- Page N ---" 分页标记, 无文字
+        ├─ 剥除分页标记 → _real_content ≤ 50 chars → 扫描件判定
         │
-        ├─ pymupdf4llm 布局分析: 表格检测/标题层级/阅读顺序/页眉页脚剔除
-        ├─ 选择性 OCR: 只对无文字层区域调用 MiniCPM-V (~50% 减少)
-        └─ 无缝融合: OCR 结果 + 原生文本 → 一个 Markdown
+        └─ _pdf_manual_ocr_fallback()
+             ├─ fitz.get_pixmap(dpi=200) → PNG bytes
+             ├─ preprocess_image_bytes() (OpenCV 6步)
+             ├─ 5页/批 asyncio.gather + _ocr_semaphore(1)
+             │    → ollama /api/chat MiniCPM-V (CPU 推理, 并发 1)
+             │    → OCR_PROVIDER=rkllama 时走 rkllama NPU
+             └─ 拼接 "--- Page N ---\n{OCR 文本}" → 输出
 ```
 
-**旧管线对比**：
+**关键设计决策**：
 
-| 维度 | 旧: 手动 fitz 渲染 + OCR | 新: pymupdf4llm + MiniCPM 适配器 |
-|------|--------------------------|----------------------------------|
-| 布局分析 | ❌ 无 | ✅ 表格/标题/阅读顺序 |
-| OCR 范围 | 逐页全量 | 选择性 (~50% 减少) |
-| 输出格式 | 纯文本 | 结构化 Markdown |
-| 页眉/页脚 | 原样保留 | 自动剔除 |
-| Tesseract | 不需要 | 不需要 |
-| pymupdf4llm 不可用时 | N/A | 自动回退 `_pdf_manual_ocr_fallback()` (fitz 渲染 + MiniCPM OCR) |
+| 维度 | 选择 | 原因 |
+|------|------|------|
+| OCR 引擎 | 手动 fitz 渲染 + MiniCPM-V | pymupdf4llm 的 `ocr_function` 有合并 bug（结果被 silent-drop） |
+| 并发策略 | Semaphore(1) + 5页/批 gather | MiniCPM-V CPU 推理 ~350%/req，并发 2 导致超时/500 |
+| 分页标记 | 保留 "--- Page N ---" | 下游分块和检索可用页码过滤 |
+| 文字层判断 | `re.sub` 剥标记后 >50 chars | 121 页扫描件 = 2188 字分页标记 → 误判修复 |
+| DT 写回 | 文件名追加 `.txt` | 不覆盖原始 PDF（下册曾被污染为纯文本） |
+
+**性能**：
+
+| 规模 | 耗时 | 说明 |
+|------|------|------|
+| 1 页 | ~9s | MiniCPM-V CPU 推理 |
+| 121 页 (下册) | ~30-35min | Semaphore(1) 单请求, 零超时 |
+| 5页/批 gather | ~45s/批 | 5 页并发送 MiniCPM, 内存 ~6MB |
 
 ### 5.5 Office 文档 (OFFICE_*)
 
@@ -318,7 +340,9 @@ html/.htm 额外经过 `_sanitize_html()` XSS 消毒。
 .xlsx → openpyxl 快速提取 (run_in_executor 异步)
 .pptx → python-pptx 快速提取 (run_in_executor 异步)
       → 失败则降级到 markitdown
-      → _handle_inbound_file 追加: _ocr_office_images() 内嵌图片 OCR
+      → _ocr_office_images() 内嵌图片 OCR:
+           ZIP 解包 (word/media/ ppt/media/ xl/media/) → OLE 扫描 (旧格式)
+           → preprocess_image_bytes (OpenCV 6步) → _ocr_image_bytes (统一调度)
 ```
 
 **旧格式 (doc/ppt/xls/odt/rtf) + EPUB**:
@@ -559,16 +583,29 @@ content = _enrich_with_sidecar_content(content, file_path)
 
 **为什么需要**: 卡住的 Ollama 调用会永久占用 Semaphore 槽位，导致所有后续请求排队直到 OOM。
 
-### 9.3 扫描 PDF 页级并发 (pymupdf4llm 不可用时的 fallback)
+### 9.3 OCR 并发策略 — `_ocr_semaphore(1)`
 
 ```
-_pdf_manual_ocr_fallback():
-  for page in doc:                            ← 顺序 fallback
-      get_pixmap(dpi=200) → OpenCV → OCR
+for batch_start in range(0, 121, BATCH=5):
+    tasks = [_ocr_one_page(i) for i in batch_start:batch_start+5]
+    results = await asyncio.gather(*tasks)
+    # task 内部: _ocr_semaphore(1) → 一次只有一个 MiniCPM-V 请求
 ```
 
-> pymupdf4llm 可用时，pymupdf4llm 内部自行管理 OCR 并发。
-> 不可用时回退到手动 fallback，每页顺序 OCR。
+**为什么 Semaphore(1) 而不是 2？**
+
+| Semaphore 值 | 效果 |
+|:-----------:|------|
+| 2 | 两个并发 Ollama 请求争抢 MiniCPM-V，CPU 726% 过载 → 间歇性超时/500 |
+| 1 | 单请求稳定执行，~9s/页，零超时 |
+
+**为什么 gather 批量为 5？**
+
+| 批量 | Peak 内存 | CPU 尖峰 | 安全性 |
+|:---:|--------|:------:|:---:|
+| 121 (全量) | ~140MB | 18s 连续 | ❌ 可能 OOM |
+| 5 | ~6MB | 0.75s | ✅ 稳定 |
+| 1 | ~1.2MB | 随时 | ✅ 最安全但太慢 |
 
 ### 9.4 Office 提取异步化
 
@@ -613,7 +650,7 @@ GET /api/pipeline/status
 
 ## 10. OpenCV 图像预处理管线
 
-所有图片 OCR 路径（§5.2 图片文件 + §3 `extract_image_text` + `ocr_adapters.py` MiniCPM 适配器）统一经过 6 步预处理：
+所有图片 OCR 路径（§5.2 图片文件 + §5.5 Office 内嵌图片 + §3 `extract_image_text` + `ocr_adapters.py` MiniCPM 适配器 + §5.4 扫描 PDF）统一经过 6 步预处理：
 
 ```
 原始图片 bytes
@@ -646,7 +683,9 @@ GET /api/pipeline/status
 
 **应用路径**:
 - `extract_image_text()` — extractors.py 图片 OCR
-- `MinicpmOCRFunc.__call__()` — ocr_adapters.py 扫描 PDF OCR 适配器
+- `_pdf_manual_ocr_fallback()` — provider_api.py 扫描 PDF OCR (5页/批 gather)
+- `_ocr_office_images()` — provider_api.py Office 内嵌图片 OCR
+- `MinicpmOCRFunc.__call__()` — ocr_adapters.py pymupdf4llm 适配器
 
 **降级策略**: OpenCV 不可用时直接返回原始字节，MiniCPM 仍可处理原始图片。
 
@@ -707,6 +746,29 @@ Chunk 2: [overlap前缀\n\n正文......]  ← 开头含上一 chunk 的末尾
 
 ---
 
+### 中文 KB 名 ChromaDB 映射 — `_chromadb_kb_name()`
+
+ChromaDB 要求 collection 名为 `[a-zA-Z0-9._-]`（64 字符内）。`_chromadb_kb_name()` 在 `provider_api.py:802` 自动映射：
+
+```python
+_chromadb_kb_name("tutoring")    → "tutoring"        # ASCII 直通
+_chromadb_kb_name("初中教材")    → "kb_Zu4F3wD-a-s"   # SHA256→base64url
+_chromadb_kb_name("数学练习")    → "kb_4fIj150sJUQ"
+```
+
+**所有代码路径使用同一函数**：`_ingest_to_kb()`、`api_kb_ingest_file()`、`api_kb_sync_from_dt()`、`api_kb_search()`。
+
+DT API 调用侧的 KB 名始终使用**原始中文名**（如 `初中教材`），仅 ChromaDB collection 名做映射。
+
+**`api_kb_sync_from_dt` URL 编码修复**：
+- KB 名用 `urllib.parse.quote()` 编码后才拼入 DT API URL
+- DT `/api/v1/knowledge/{kb}/files` 返回 `{"files": [...]}` dict 而非直接列表 — 已适配
+- 下载 URL 同理使用编码后的 `_safe_kb` + `_safe_name`
+
+
+
+---
+
 ## 12. 配置项参考
 
 ### RAG Pipeline 配置 (`RAG_PIPELINE_*`)
@@ -728,9 +790,19 @@ Chunk 2: [overlap前缀\n\n正文......]  ← 开头含上一 chunk 的末尾
 | 环境变量 | 默认值 | 说明 |
 |----------|--------|------|
 | `OLLAMA_URL` | `http://ollama:11434` | Ollama API 地址 |
-| `OLLAMA_OCR_MODEL` | `openbmb/minicpm-v4.6:q4_K_M` | OCR 模型 |
+| `OLLAMA_OCR_MODEL` | `openbmb/minicpm-v4.6:q4_K_M` | OCR 模型 (1.5GB CPU 推理) |
 | `RKLLAMA_URL` | `http://rkllama:8080` | rkllama NPU API 地址 |
-| `OCR_PROVIDER` | `rkllama` | OCR 后端选择: `ollama` 或 `rkllama` |
+| `OCR_PROVIDER` | `ollama` | OCR 后端选择: `ollama` (MiniCPM-V) 或 `rkllama` (NPU) |
+| `RAG_CHUNK_SIZE` | `800` | semantic_chunk() 目标 chunk 大小 (字符数) |
+| `OLLAMA_KEEP_ALIVE` | `15m` | Ollama 模型常驻时间 |
+
+### 乱码检测
+
+`_ocr_output_is_garbled()` 仅检测两种确定性失败：
+- **U+FFFD 替换字符过多** (>5%): 编码损坏
+- **STUB 模式输出**: `[STUB:DeepSeekOCR-3B]` — rkllama 未真实运行
+
+> 已移除基于 `chinese_ratio < 0.2` 的启发式规则 — 该规则曾误杀 MiniCPM-V 对化学教材扫描件的合法中文输出。
 
 ### markitdown OCR 配置
 
@@ -756,11 +828,13 @@ markitdown >= 0.1.5 内置 OCR layer (`MarkItDown(llm_client=...)`)，部署为 
 
 | 文件 | 改动 |
 |------|------|
-| `docker/platform/provider_api.py` | `_handle_pdf` 简化为 pymupdf4llm + MiniCPM 适配器调用；`_handle_inbound_file` 委托给 `extract_text()`；新增 `_enrich_with_sidecar_content` / `_inject_doc_type_meta`；新增 `_pdf_manual_ocr_fallback` (pymupdf4llm 不可用兜底)；Office 嵌入图片 OCR 仅限已知格式 |
+| `docker/platform/provider_api.py` | `_handle_pdf`: 文字层快读 → 分页标记剥离 → 扫描件 `_pdf_manual_ocr_fallback` (5页/批 gather + Semaphore(1) MiniCPM-V)；`_handle_inbound_file` 委托给 `extract_text()`；新增 `_chromadb_kb_name()` 中文KB名映射；新增 `_enrich_with_sidecar_content` / `_inject_doc_type_meta`；`_ocr_office_images` 统一走 `preprocess_image_bytes` + `_ocr_image_bytes`；`_ocr_output_is_garbled` 简化为仅检测 STUB/U+FFFD；`_ocr_semaphore(1)` (CPU 推理避免并发超时)；`_ingest_to_kb` DT 写回追加 `.txt` 后缀避免覆盖原始 PDF；`api_kb_sync_from_dt` 用 `Form()` + URL 编码 + DT 响应格式适配 |
 | `tutor_platform/rag/pipeline.py` | `_stage_structured_exam` + `_structure_single_exam` + `_write_exam_sidecar` |
 | `tutor_platform/rag/config.py` | 添加 `RAG_PIPELINE_EXAM_*` + `RAG_PIPELINE_MAX_CONCURRENT_*` 配置项 |
-| `docker/platform/Dockerfile` | `markitdown[all]` + `pymupdf4llm`；移除 `antiword` |
-| `tests/test_ingestion_consistency.py` | 20 个集成测试：提取一致性 / OCR / 表格 / 语义分块 / 分类 / sidecar 富化 |
+| `docker/platform/Dockerfile` | `markitdown[all]` + `pymupdf4llm` + 阿里云镜像；移除 `antiword` |
+| `docker-compose.yml` | `OCR_PROVIDER=ollama` |
+| `tests/test_deployment_e2e.py` | 24 个 E2E 测试 (6入口 × 5文档类型 + 检索 + 双写 + 回归) |
+| `tests/test_ingestion_consistency.py` | 20 个单元测试 (提取一致性 / OCR / 表格 / 语义分块 / 分类 / sidecar 富化) |
 
 ### 依赖关系
 
@@ -784,7 +858,7 @@ provider_api.py
   ├── ocr_adapters.py            (间接通过 extract_pdf_text)
   └── _spawn_unified_pipeline_bg()
       ├── SHA-256 去重
-      ├── Semaphore(2) 并发控制
+      ├── _ocr_semaphore(1) (OCR 并发控制, MiniCPM-V 单请求)
       └── _run_unified_pipeline_bg()
           ├── asyncio.wait_for(600s)
           └── UnifiedDocumentPipeline.process()
@@ -796,12 +870,12 @@ provider_api.py
 | 库 | 版本 | 用途 |
 |----|------|------|
 | PyMuPDF (fitz) | >= 1.26.0 | PDF 文本提取、页渲染、布局分析、表格检测、矢量分析 |
-| pymupdf4llm | >= 1.27.0 | 结构化 Markdown 提取 + Hybrid OCR 管道 (MiniCPM 适配) |
+| pymupdf4llm | >= 1.27.0 | 文字层 PDF 结构化 Markdown 提取 (use_ocr=False)；OCR 走 _pdf_manual_ocr_fallback |
 | OpenCV (cv2) | - | 图片降采样、灰度化、降噪、CLAHE、倾斜校正、二值化 |
 | markitdown[all] | 0.1.6 | Office/EPUB/ZIP/音频 文档提取 + 内嵌 OCR |
 | python-docx | - | .docx 快速提取 (run_in_executor 异步) |
 | openpyxl | - | .xlsx 快速提取 (run_in_executor 异步) |
 | python-pptx | - | .pptx 快速提取 (run_in_executor 异步) |
 | olefile | - | .doc/.ppt/.xls OLE 图像扫描 |
-| MiniCPM-V (via Ollama) | 4.6 | 块级 OCR + 图形描述 + pymupdf4llm 适配器 OCR |
+| MiniCPM-V (via Ollama) | 4.6 | 图片 OCR + Office 内嵌 OCR + PDF 扫描页 OCR (3 条路径统一 `_ocr_image_bytes`) |
 | rkllama (NPU) | - | 替代 OCR 后端 (OCR_PROVIDER=rkllama) |
