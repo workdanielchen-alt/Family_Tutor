@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useTranslation } from "react-i18next";
+import { useAppShell } from "@/context/AppShellContext";
 import { fetchPendingTasks, type PendingTask } from "@/lib/platform-api";
 
 const SOURCE_ICONS: Record<string, string> = {
@@ -20,10 +21,11 @@ const STATUS_LABELS: Record<string, string> = {
 export default function PendingTasksBanner() {
   const { t } = useTranslation();
   const router = useRouter();
+  const { sidebarCollapsed: collapsed } = useAppShell();
   const [tasks, setTasks] = useState<PendingTask[]>([]);
 
   useEffect(() => {
-    fetchPendingTasks("default")
+    fetchPendingTasks()
       .then((data) => setTasks(data.tasks || []))
       .catch(() => { /* silent */ });
   }, []);
@@ -31,14 +33,49 @@ export default function PendingTasksBanner() {
   if (tasks.length === 0) return null;
 
   const handleStartTask = (task: PendingTask) => {
-    // If the task has a chat session, navigate to it
+    // Dispatch CustomEvent so the chat page picks it up even when
+    // already mounted (same-page nav via router.push may not remount).
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(
+        new CustomEvent("start-teach", { detail: task.teach_session_id }),
+      );
+    }
+    // Also navigate — handles cross-page case (user on /co-writer etc.)
     if (task.dt_session_id) {
       router.push(`/chat/${task.dt_session_id}`);
-      return;
+    } else {
+      router.push(`/chat?teach=${task.teach_session_id}`);
     }
-    // Navigate to chat with teach param — chat page uses URL param (single path, no double-fire)
-    router.push(`/chat?teach=${task.teach_session_id}`);
   };
+
+  if (collapsed) {
+    return (
+      <div className="flex w-full flex-col items-center gap-0.5 px-1">
+        {tasks.slice(0, 3).map((task) => (
+          <button
+            key={task.teach_session_id}
+            onClick={() => handleStartTask(task)}
+            title={task.title}
+            className="relative flex h-9 w-9 items-center justify-center rounded-xl text-[var(--muted-foreground)] transition-colors hover:bg-[var(--background)]/50 hover:text-[var(--foreground)]"
+          >
+            <span className="text-[14px]">
+              {SOURCE_ICONS[task.task_source] || "📄"}
+            </span>
+            {task.total_questions > 0 && (
+              <span className="absolute -bottom-0.5 -right-0.5 flex h-4 min-w-[16px] items-center justify-center rounded-full bg-[var(--primary)] px-1 text-[9px] font-medium text-white">
+                {task.total_questions}
+              </span>
+            )}
+          </button>
+        ))}
+        {tasks.length > 3 && (
+          <span className="text-[10px] text-[var(--muted-foreground)]/40">
+            +{tasks.length - 3}
+          </span>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div className="border-b border-[var(--border)]/20 pb-1">

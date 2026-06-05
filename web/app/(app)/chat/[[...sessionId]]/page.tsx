@@ -943,6 +943,12 @@ export default function ChatPage() {
         }).catch(() => null);
 
         if (data?.ok && data.first_question) {
+          // The consumed original session is now marked completed.
+          // Use the NEW teach session id returned by api_teach_start
+          // so continueTeach targets the active session, not the consumed one.
+          if (data.teach_session_id) {
+            teachSessionIdRef.current = data.teach_session_id;
+          }
           setTeachingMessages([{ role: "assistant", content: data.first_question! }]);
         } else {
           setTeachingMessages([]);
@@ -964,7 +970,15 @@ export default function ChatPage() {
     const urlTeach = typeof window !== "undefined"
       ? new URLSearchParams(window.location.search).get("teach")
       : null;
-    if (urlTeach) launchTeaching(urlTeach);
+    if (urlTeach) {
+      launchTeaching(urlTeach);
+      // Remove ?teach= from URL so refresh doesn't re-create the task
+      if (typeof window !== "undefined") {
+        const next = new URL(window.location.href);
+        next.searchParams.delete("teach");
+        window.history.replaceState(null, "", next.toString());
+      }
+    }
 
     return () => window.removeEventListener("start-teach", handler);
   }, []);
@@ -2083,6 +2097,7 @@ export default function ChatPage() {
               </div>
             )}
 
+            {teachingMessages.length === 0 || !teachSessionIdRef.current ? (
             <ChatComposer
               composerRef={composerRef}
               capMenuRef={capMenuRef}
@@ -2152,6 +2167,7 @@ export default function ChatPage() {
               onCancelStreaming={cancelStreamingTurn}
               prefillInputRef={prefillInputRef}
             />
+            ) : null}
 
             <div
               aria-hidden="true"

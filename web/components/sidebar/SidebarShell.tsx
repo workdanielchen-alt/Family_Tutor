@@ -162,6 +162,9 @@ export function SidebarShell({
         {/* Subtle divider */}
         <div className="my-1.5 h-px w-7 bg-[var(--border)]/40" />
 
+        {/* Pending tasks — compact icons in collapsed mode */}
+        {pendingTasksSlot}
+
         {/* Primary nav */}
         <nav className="flex w-full flex-col items-center gap-1 px-1.5">
           {PRIMARY_NAV.map((item) => {

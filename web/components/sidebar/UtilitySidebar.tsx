@@ -7,6 +7,7 @@ import { SidebarShell } from "@/components/sidebar/SidebarShell";
 import { LogoutButton } from "@/components/auth/LogoutButton";
 import { AdminLink } from "@/components/auth/AdminLink";
 import { useAppShell } from "@/context/AppShellContext";
+import PendingTasksBanner from "@/components/sidebar/PendingTasksBanner";
 import {
   deleteSession,
   listSessions,
@@ -101,6 +102,7 @@ export default function UtilitySidebar() {
           <LogoutButton />
         </>
       }
+      pendingTasksSlot={<PendingTasksBanner />}
     />
   );
 }

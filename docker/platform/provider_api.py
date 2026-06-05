@@ -8681,26 +8681,44 @@ async def api_teach_start(request: Request):
     if not ocr_text:
         return {"ok": False, "error": "OCR 文本为空，无法开始教学"}
 
-    # ── 创建 TeachSession ──
+    # ── 获取或创建 TeachSession ──
     store = get_teach_store()
-    session = store.create(
-        learner_id=learner_id,
-        source=_source,
-        ocr_text=ocr_text,
-        source_file=source_file,
-        dt_session_id=dt_session_id,
-        title=_title,
-        task_type=_task_type,
-        bypass_guards=True,
-    )
+    is_consume = bool(consume_sid)
 
-    # ── Consume original pending task (if launching from sidebar task) ──
-    if consume_sid:
-        try:
+    if is_consume:
+        # Reuse the existing pending session — don't create a new one.
+        # Otherwise every click would chain-create sessions (new "active"
+        # session also appears in get_pending(), leading to multiplication).
+        session = store.get(consume_sid)
+        if not session:
+            return {"ok": False, "error": "任务不存在或已过期"}
+        if session.status == "completed":
+            return {"ok": False, "error": "该任务已完成，不能再使用"}
+        if session.is_expired:
             store.mark_completed(consume_sid)
-            logger.info("[%s] Consumed pending task %s", trace_id, consume_sid)
-        except Exception:
-            pass
+            return {"ok": False, "error": "教学链接已过期"}
+        # Use session's stored data
+        learner_id = session.learner_id
+        ocr_text = session.ocr_text
+        _title = session.title or _title
+        _task_type = session.task_type or _task_type
+        _source = session.source
+        store.mark_active(consume_sid)
+        logger.info("[%s] Reusing pending session %s for learner %s", trace_id, consume_sid, learner_id)
+    else:
+        session = store.create(
+            learner_id=learner_id,
+            source=_source,
+            ocr_text=ocr_text,
+            source_file=source_file,
+            dt_session_id=dt_session_id,
+            title=_title,
+            task_type=_task_type,
+            bypass_guards=True,
+        )
+        # Mark active BEFORE _tutor_chat_core — prevents its auto-create guard
+        # from creating a duplicate when the freshly-created session is still "pending".
+        store.mark_active(session.session_id)
 
     try:
         # ── 调用 _tutor_chat_core 出第一题 ──
@@ -8719,7 +8737,6 @@ async def api_teach_start(request: Request):
         if reply:
             # 缓存第一题到 session
             session.first_question = reply
-            store.mark_active(session.session_id)
 
             # 估算总题数（LLM 输出中有则取，无则从 OCR 文本检测）
             import re
@@ -8938,6 +8955,8 @@ async def api_teach_get_session(session_id: str):
     if session.is_expired and session.status not in ("completed",):
         store.mark_completed(session_id)
         return {"ok": False, "error": "教学链接已过期"}
+    if session.status == "completed":
+        return {"ok": False, "error": "该任务已完成，不能再使用"}
     return {
         "ok": True,
         "session_id": session.session_id,
@@ -9106,15 +9125,19 @@ async def api_task_update_progress(teach_session_id: str, request: Request):
 
 
 @app.get("/api/tasks/pending")
-async def api_task_pending(learner_id: str = "default"):
+async def api_task_pending(learner_id: str = ""):
     """获取学习者的待完成任务列表（包含完整任务元数据）。
 
+    learner_id 为空时返回所有学习者的待办。
     返回: { ok, tasks: [{ teach_session_id, dt_session_id, title, task_type,
              task_source, total_questions, current_question, correct_count,
              wrong_count, status, knowledge_points, subject, ... }], total_pending }
     """
     store = get_teach_store()
-    sessions = store.get_pending(learner_id, limit=30)
+    if learner_id:
+        sessions = store.get_pending(learner_id, limit=30)
+    else:
+        sessions = store.get_all_pending(limit=30)
 
     tasks = []
     for s in sessions:

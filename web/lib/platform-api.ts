@@ -276,9 +276,12 @@ export interface TaskCreateResponse {
 }
 
 export async function fetchPendingTasks(
-  learnerId: string,
+  learnerId = "",
 ): Promise<{ tasks: PendingTask[]; total_pending: number }> {
-  return apiGet(`/tasks/pending?learner_id=${encodeURIComponent(learnerId)}`);
+  const params = learnerId
+    ? `?learner_id=${encodeURIComponent(learnerId)}`
+    : "";
+  return apiGet(`/tasks/pending${params}`);
 }
 
 export async function fetchTasksForSessions(

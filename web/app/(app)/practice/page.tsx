@@ -65,37 +65,6 @@ function PracticePageInner() {
   }, []);
 
 
-  // ── Pending tasks from unified task API ──
-  const [pendingTasks, setPendingTasks] = useState<
-    Array<{ teach_session_id: string; title: string; task_type: string;
-            task_source: string; total_questions: number; current_question: number;
-            correct_count: number; wrong_count: number; status: string }>
-  >([]);
-
-  useEffect(() => {
-    fetch(`/api/platform/tasks/pending?learner_id=${LEARNER_ID}`)
-      .then((r) => r.json())
-      .then((d) => { if (d.ok) setPendingTasks(d.tasks || []); })
-      .catch(() => {});
-  }, []);
-
-  const startPendingTask = async (teachSessionId: string) => {
-    setIsGenerating(true);
-    try {
-      const r = await fetch(`/api/platform/teach/session/${teachSessionId}`);
-      const data = await r.json();
-      if (data.ok) {
-        setTeachSessionId(teachSessionId);
-        setTopicTitle(data.title || data.source_file || "教学任务");
-        if (data.first_question) {
-          setChatMessages([{ role: "teacher", content: data.first_question }]);
-          setCurrentQuestion(data.first_question);
-        }
-      }
-    } catch { /* ignore */ }
-    setIsGenerating(false);
-  };
-
   // Auto-scroll + auto-focus on new messages
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -367,51 +336,6 @@ function PracticePageInner() {
 
   return (
     <div className="space-y-4">
-      {/* ── Pending tasks ── */}
-      {pendingTasks.length > 0 && (
-        <div className="space-y-2">
-          <h3 className="text-sm font-semibold text-[var(--foreground)]">
-            📋 待完成任务
-          </h3>
-          {pendingTasks.map((task) => {
-            const icon =
-              task.task_source === "wechat" ? "📱" :
-              task.task_source === "auto_generated" ? "🤖" : "💻";
-            const total = task.total_questions || 1;
-            const current = task.current_question || 0;
-            const pct = Math.min(100, Math.round((current / total) * 100));
-            return (
-              <button
-                key={task.teach_session_id}
-                onClick={() => startPendingTask(task.teach_session_id)}
-                disabled={isGenerating}
-                className="flex w-full items-center gap-3 rounded-xl border border-[var(--border)]/60 bg-[var(--card)] px-4 py-3 text-left shadow-sm transition-all hover:border-[var(--primary)]/40 disabled:opacity-60"
-              >
-                <span className="shrink-0 text-xl">{icon}</span>
-                <div className="min-w-0 flex-1">
-                  <p className="truncate text-[14px] font-medium text-[var(--foreground)]">
-                    {task.title || "未命名任务"}
-                  </p>
-                  <div className="mt-1 flex items-center gap-2">
-                    <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-[var(--muted)]/40">
-                      <div
-                        className="h-full rounded-full bg-gradient-to-r from-blue-400 to-emerald-400 transition-all"
-                        style={{ width: `${pct}%` }}
-                      />
-                    </div>
-                    <span className="shrink-0 text-[11px] text-[var(--muted-foreground)]">
-                      {current}/{total}
-                    </span>
-                  </div>
-                </div>
-                <ChevronRight size={16} className="shrink-0 text-[var(--muted-foreground)]" />
-              </button>
-            );
-          })}
-        </div>
-      )}
-
-      {/* ── Tab buttons ── */}
       <div className="flex gap-2 overflow-x-auto pb-1">
         {tabs.map((t) => (
           <button

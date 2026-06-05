@@ -134,13 +134,13 @@ export function TeachingChatView({
               等待老师出题...
             </div>
           ) : (
-            messages.map((msg, i) => (
-              <MemoizedMessageBubble
-                key={i}
-                msg={msg}
-                isLast={msg === lastAssistant}
-              />
-            ))
+            messages
+              // Current question is shown in the sticky header above —
+              // skip it here so the user doesn't see the same text twice.
+              .filter((msg) => msg !== lastAssistant)
+              .map((msg, i) => (
+                <MemoizedMessageBubble key={i} msg={msg} isLast={false} />
+              ))
           )}
           <div ref={messagesEndRef} className="h-1" />
         </div>
