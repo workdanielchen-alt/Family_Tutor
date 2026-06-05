@@ -20,13 +20,13 @@ dev:
 	docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
 
 prod:
-	docker compose up -d --build
+	docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
 
 down:
-	docker compose down
+	docker compose -f docker-compose.yml -f docker-compose.prod.yml down
 
 logs:
-	docker compose logs -f
+	docker compose -f docker-compose.yml -f docker-compose.prod.yml logs -f
 
 shell:
 	docker exec -it deeptutor bash
@@ -67,3 +67,21 @@ clean:
 	find . -type d -name ".ruff_cache" -exec rm -rf {} + 2>/dev/null || true
 	find . -type d -name ".mypy_cache" -exec rm -rf {} + 2>/dev/null || true
 	rm -rf .coverage htmlcov/
+
+# ── Docker disk cleanup ──────────────────────────────────────────────
+docker-clean:
+	@echo "=== Cleaning stopped containers ==="
+	@docker container prune -f 2>/dev/null || true
+	@echo "=== Cleaning dangling images ==="
+	@docker image prune -f 2>/dev/null || true
+	@echo "=== Cleaning build cache (older than 24h) ==="
+	@docker buildx prune --force --filter=until=24h 2>/dev/null || true
+	@echo "=== Done ==="
+	@docker system df
+
+docker-clean-all:
+	@echo "=== AGGRESSIVE: all unused images + full build cache ==="
+	@docker image prune -a -f 2>/dev/null || true
+	@docker buildx prune --force --all 2>/dev/null || true
+	@echo "=== Done ==="
+	@docker system df

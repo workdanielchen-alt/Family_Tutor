@@ -2221,7 +2221,6 @@ class WeixinAdapter(BasePlatformAdapter):
                                 form = aiohttp.FormData()
                                 form.add_field("file", f, filename=_filename)
                                 form.add_field("learner_id", effective_chat_id)
-                                form.add_field("kb_name", "tutoring")
                                 form.add_field("suppress_auto_teach", "1")
                                 resp = await session.post(
                                     f"{platform_url}/api/process/file",
@@ -2230,6 +2229,14 @@ class WeixinAdapter(BasePlatformAdapter):
                             if resp.status == 200:
                                 data = await resp.json()
                                 if data.get("ok") and data.get("content"):
+                                    # Skip passthrough (fallback placeholder) — it's a system
+                                    # error message, not teachable content.
+                                    if data.get("route") == "passthrough":
+                                        logger.info(
+                                            "[%s] File extraction failed for %s: %s",
+                                            self.name, _filename, data.get("content", "")[:100],
+                                        )
+                                        continue
                                     _txt = data["content"].strip()
                                     if _txt:
                                         _page_texts.append(f"--- 第{_idx+1}页 ---\n{_txt}")
@@ -2255,16 +2262,39 @@ class WeixinAdapter(BasePlatformAdapter):
                         self._save_teaching_sessions()
 
                 # ── Build the teaching message ──
+                # Initialize defaults for both OCR-success and text-only paths
+                _teach_msg = message if (
+                    message and not message.startswith("请分析这份")
+                ) else ""
+                _teach_ctx = ""
+
+                if media_paths and not _teach_context:
+                    # All file extractions failed — send fallback reply directly.
+                    # Never call tutor/chat with empty context — that would reuse
+                    # stale cached exam text from a previous session.
+                    self._running_teachings.discard(effective_chat_id)
+                    try:
+                        await asyncio.wait_for(
+                            self.send(
+                                content=(
+                                    "收到您的文件，但系统未能成功提取其中的文字内容"
+                                    "（可能是扫描件或图片格式）。请检查文件是否清晰，"
+                                    "或重新发送一份可复制的文字版试题，我会立即为您开始出题和辅导。"
+                                ),
+                                chat_id=effective_chat_id,
+                            ),
+                            timeout=15,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "[%s] Fallback reply send timed out for %s",
+                            self.name, effective_chat_id,
+                        )
+                    return
+
                 if _teach_context:
                     # Image with OCR: use extracted text as context
-                    _teach_msg = message if (
-                        message and not message.startswith("请分析这份")
-                    ) else ""
                     _teach_ctx = _teach_context
-                else:
-                    # Document or follow-up text: send as-is (original behavior)
-                    _teach_msg = message
-                    _teach_ctx = ""
 
                 # Pass total_questions from session so platform can detect completion
                 _tq = 0

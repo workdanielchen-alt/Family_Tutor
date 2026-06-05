@@ -317,7 +317,6 @@ export default function ChatPage() {
   const [pendingTasks, setPendingTasks] = useState<
     { session_id: string; source: "wechat" | "webui"; total_questions: number; current_question: number; first_question: string }[]
   >([]);
-  const [showPendingTasks, setShowPendingTasks] = useState(false);
   useEffect(() => {
     (async () => {
       try {
@@ -1956,66 +1955,41 @@ export default function ChatPage() {
                   </div>
                 )}
 
-                {/* ── Pending teach tasks ── */}
+                {/* ── Pending teach tasks from WeChat (active teaching sessions) ── */}
                 {pendingTasks.length > 0 && !teachSessionIdRef.current && (
-                  <div className="mt-4 text-center">
-                    <button
-                      onClick={() => setShowPendingTasks(true)}
-                      className="text-[13px] text-[var(--muted-foreground)] underline underline-offset-2 decoration-dotted hover:text-[var(--foreground)]"
-                    >
-                      📚 你有 {pendingTasks.length} 份待完成的试卷
-                    </button>
-                  </div>
-                )}
-
-                {/* ── Pending teach flyout ── */}
-                {showPendingTasks && (
-                  <div
-                    className="fixed inset-0 z-50 flex items-center justify-center bg-black/30"
-                    onClick={() => setShowPendingTasks(false)}
-                  >
-                    <div
-                      className="w-80 max-h-64 overflow-y-auto rounded-xl bg-[var(--card)] p-4 shadow-xl"
-                      onClick={(e) => e.stopPropagation()}
-                    >
-                      <p className="mb-3 text-[14px] font-medium">待完成试卷</p>
-                      {pendingTasks.length === 0 && (
-                        <p className="text-[13px] text-[var(--muted-foreground)]">暂无</p>
-                      )}
-                      {pendingTasks.map((s) => (
-                        <button
-                          key={s.session_id}
-                          onClick={async () => {
-                            setShowPendingTasks(false);
-                            try {
-                              const res = await fetch(`/api/platform/teach/session/${s.session_id}`);
-                              const data = await res.json();
-                              if (data.ok && data.first_question) {
-                                teachSessionIdRef.current = s.session_id;
-                                // 先用 sendMessage 确保聊天会话存在
-                                if (!state.sessionId) newSession();
-                                // 再注入 assistant 消息到标准聊天
-                                injectAssistantMessage(data.first_question);
-                              }
-                            } catch { /* ignore */ }
-                          }}
-                          className="flex w-full items-center justify-between rounded-lg px-3 py-2 hover:bg-[var(--muted)]/50"
-                        >
-                          <span className="text-[13px]">
-                            {s.source === "wechat" ? "👨‍👩‍👧 家长发来的" : "📄 已上传"}
-                          </span>
-                          <span className="text-[12px] text-[var(--muted-foreground)]">
-                            {s.current_question || 0}/{s.total_questions || "?"}
-                          </span>
-                        </button>
-                      ))}
+                  <div className={`${pendingQuizzes.length > 0 ? "mt-4" : "mt-8"} w-full max-w-md space-y-3`}>
+                    <p className="text-center text-[13px] font-medium text-[var(--muted-foreground)]">
+                      📚 来自微信的待完成试卷
+                    </p>
+                    {pendingTasks.slice(0, 5).map((s) => (
                       <button
-                        onClick={() => setShowPendingTasks(false)}
-                        className="mt-2 w-full text-center text-[12px] text-[var(--muted-foreground)]"
+                        key={s.session_id}
+                        onClick={async () => {
+                          try {
+                            const res = await fetch(`/api/platform/teach/session/${s.session_id}`);
+                            const data = await res.json();
+                            if (data.ok && data.first_question) {
+                              teachSessionIdRef.current = s.session_id;
+                              if (!state.sessionId) newSession();
+                              injectAssistantMessage(data.first_question);
+                            }
+                          } catch { /* ignore */ }
+                        }}
+                        className="flex w-full items-center justify-between rounded-xl border border-[var(--border)]/60 bg-[var(--card)] px-4 py-3 text-left shadow-sm transition-all hover:border-[var(--primary)]/40 hover:bg-[var(--primary)]/[0.03]"
                       >
-                        关闭
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate text-[14px] font-medium text-[var(--foreground)]">
+                            {s.source === "wechat" ? "📸 微信试卷" : "📄 已上传试卷"}
+                          </p>
+                          <p className="text-[12px] text-[var(--muted-foreground)]">
+                            {s.current_question > 0 ? `已开始 · 第${s.current_question}题` : "未开始"}{s.total_questions > 0 ? ` / 共${s.total_questions}题` : ""}
+                          </p>
+                        </div>
+                        <span className="ml-3 shrink-0 rounded-lg bg-[var(--primary)] px-3 py-1.5 text-[12px] font-medium text-white">
+                          {s.current_question > 0 ? "继续" : "开始答题"}
+                        </span>
                       </button>
-                    </div>
+                    ))}
                   </div>
                 )}
               </div>

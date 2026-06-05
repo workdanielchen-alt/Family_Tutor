@@ -386,7 +386,7 @@ class TestSmoke:
         """Search existing tutoring KB (1245+ chunks)."""
         from tutor_platform.unified_provider import get_provider_instance
         provider = get_provider_instance()
-        results = await provider.query("tutoring", ["数学"], n_results=3)
+        results = await provider.query("初中教材", ["数学"], n_results=3)
         assert isinstance(results, list), f"Search should return list: {results}"
         # tutoring KB may be empty, but the call should not crash
 

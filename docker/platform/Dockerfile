@@ -5,10 +5,11 @@
 
 FROM python:3.11-slim
 
-# Install system deps (minimal — no antiword needed since markitdown covers .doc)
+# Install system deps (antiword needed for old binary .doc files by markitdown)
 RUN sed -i 's/deb.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true && \
     apt-get update && apt-get install -y --no-install-recommends \
     avahi-utils \
+    antiword \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

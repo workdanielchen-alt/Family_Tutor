@@ -57,7 +57,7 @@ from domains.tutoring.mastery import (
     update_mastery,
     weak_points,
 )
-from tutor_platform.rag.extractors import extract_text, extract_pdf_text
+from tutor_platform.rag.extractors import extract_text, extract_pdf_text, has_pdf_text_layer
 from tutor_platform.teach_session import get_store as get_teach_store
 from tutor_platform.teach_session import TeachSessionStore
 from tutor_platform.quiz_sync import sync_quiz_to_mastery
@@ -107,6 +107,8 @@ HERMES_AGENT_URL = os.getenv("HERMES_AGENT_URL", "http://hermes_agent:8004")
 DEEPTUTOR_URL = os.getenv("DEEPTUTOR_API_URL", "http://deeptutor:8001")
 UPLOADS_DIR = os.getenv("UPLOADS_DIR", "/data/uploads")
 SOURCES_DIR = os.getenv("SOURCES_DIR", "/data/sources")
+SOURCES_RETENTION_HOURS = float(os.getenv("SOURCES_RETENTION_HOURS", "72"))
+INGEST_STATUS_DIR = os.getenv("INGEST_STATUS_DIR", "/data/ingest_status")
 
 _dm_process: subprocess.Popen | None = None
 
@@ -1323,7 +1325,18 @@ async def _handle_inbound_file(
                     "storage": {"ok": False},
                     "doc_subtype": _inject_doc_type_meta(file_path).get("doc_subtype", ""),
                 })
-            logger.warning("[%s] PDF extraction returned no content for %s", trace_id, file_path)
+            logger.warning("[%s] PDF extraction returned no content for %s, trying extract_text fallback", trace_id, file_path)
+            content = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: extract_text(file_path, trace_id=trace_id),
+            )
+            if content:
+                content = _enrich_with_sidecar_content(content, file_path)
+                return _cache_res({
+                    "ok": True, "content": content,
+                    "intent": "EDUCATION", "route": "document_extract",
+                    "storage": {"ok": False},
+                    "doc_subtype": _inject_doc_type_meta(file_path).get("doc_subtype", ""),
+                })
             return _cache_res(_fallback_placeholder(file_path, ext))
 
         # ── All other files: unified extraction via extractors.py ──
@@ -1413,29 +1426,22 @@ async def _handle_pdf(file_path: str, trace_id: str, kb_name: str = "", filename
     are persisted to ChromaDB incrementally (batch of 5 pages) so interrupted
     runs can resume from the last completed page.
     """
-    # First pass: extract without OCR (fast, <1s for most PDFs)
-    loop = asyncio.get_running_loop()
-    text = await loop.run_in_executor(
-        None,
-        lambda: extract_pdf_text(file_path, ocr_enabled=False, ocr_trace_id=trace_id),
-    )
-
-    # If text is substantial (real content beyond page markers), return directly.
-    # Page markers like "--- Page N ---" add up on multi-page scanned PDFs
-    # but contain no actual text.
-    _real_content = re.sub(
-        r"^--- Page \d+ ---|\n+",
-        " ",
-        text or "",
-        flags=re.MULTILINE,
-    ).strip()
-    if len(_real_content) > 50:
-        return text
+    # Fast check: does the PDF have a usable text layer?
+    # pymupdf4llm may produce page markers even for scanned PDFs;
+    # has_pdf_text_layer() strips those before counting actual text content.
+    if has_pdf_text_layer(file_path, min_chars=200):
+        loop = asyncio.get_running_loop()
+        text = await loop.run_in_executor(
+            None,
+            lambda: extract_pdf_text(file_path, ocr_enabled=False, ocr_trace_id=trace_id),
+        )
+        if text and len(text.strip()) > 50:
+            return text
 
     # Little/no text — likely scanned. Use manual OCR fallback (fitz render + MiniCPM-V).
     # pymupdf4llm's ocr_function integration has known merge issues;
     # the manual path via _pdf_manual_ocr_fallback is well-tested and reliable.
-    logger.info("[%s] PDF appears scanned (%d chars), using MiniCPM-V manual OCR", trace_id, len(text.strip()))
+    logger.info("[%s] PDF appears scanned, using MiniCPM-V manual OCR", trace_id)
     return await _pdf_manual_ocr_fallback(file_path, trace_id, kb_name=kb_name, filename=filename)
 
 
@@ -2181,8 +2187,8 @@ async def _ingest_to_kb(
         return
 
     # Detect subject & grade from content for metadata enrichment.
-    _detected_subject = subject or _detect_exam_subject(content[:2000])
-    _detected_grade = _infer_grade(content[:2000])
+    _detected_subject = subject or _detect_exam_subject(content)
+    _detected_grade = _infer_grade(content)
 
     # v3: Generate teaching summary for pedagogical value.
     # Async, best-effort — if it fails, fall back to raw OCR text.
@@ -2258,6 +2264,15 @@ async def _ingest_to_kb(
                 for kb in (kbs if isinstance(kbs, list) else [])
             )
 
+            if not kb_exists:
+                # Reject auto-creation: KB must be explicitly created via Web UI
+                logger.warning(
+                    "[%s] DT sync skipped — KB '%s' does not exist. "
+                    "Create it first in Settings → Knowledge Bases.",
+                    trace_id, kb_name,
+                )
+                return  # exit _ingest_to_kb without creating
+
             import urllib.parse as _up
             _dt_safe_kb = _up.quote(kb_name, safe="")
             with open(tmp_path, "rb") as fh:
@@ -2265,18 +2280,11 @@ async def _ingest_to_kb(
                 if not _dt_filename.endswith(".txt"):
                     _dt_filename = _dt_filename + ".txt"
                 files = {"files": (_dt_filename, fh, "text/plain")}
-                if kb_exists:
-                    resp = await client.post(
-                        f"{DEEPTUTOR_URL}/api/v1/knowledge/{_dt_safe_kb}/upload",
-                        data={"rag_provider": "llamaindex"},
-                        files=files,
-                    )
-                else:
-                    resp = await client.post(
-                        f"{DEEPTUTOR_URL}/api/v1/knowledge/create",
-                        data={"name": kb_name, "rag_provider": "llamaindex"},
-                        files=files,
-                    )
+                resp = await client.post(
+                    f"{DEEPTUTOR_URL}/api/v1/knowledge/{_dt_safe_kb}/upload",
+                    data={"rag_provider": "llamaindex"},
+                    files=files,
+                )
 
             if resp.status_code in (200, 201):
                 logger.info("[%s] DT index sync: OK -> %s (%s)", trace_id, kb_name, filename)
@@ -2294,7 +2302,7 @@ async def _ingest_to_kb(
                 pass
 
 
-def _split_content_for_ingest(content: str, filename: str, chunk_size: int = 500) -> list[str]:
+def _split_content_for_ingest(content: str, filename: str, chunk_size: int = 800) -> list[str]:
     """Split content into chunks for KB ingestion.
 
     Each chunk is a subsection of the document, split at sensible boundaries.
@@ -2330,6 +2338,83 @@ def _split_content_for_ingest(content: str, filename: str, chunk_size: int = 500
         return final
 
     return chunks if chunks else [content]
+
+
+async def _maybe_ingest_result(
+    provider,
+    result: dict,
+    kb_name: str,
+    filename: str,
+    learner_id: str,
+    source: str,
+    trace_id: str,
+) -> None:
+    """Persist extraction result to ChromaDB + DT (dual-write).
+
+    Called from every ingestion path (Web UI, MCP, WeChat proxy) after
+    ``_handle_inbound_file()`` to guarantee consistent storage regardless
+    of entry point.
+
+    KB must already exist in DT — we never auto-create KBs from uploads.
+    """
+    content = result.get("content", "").strip()
+    if not content:
+        return
+
+    # ── Gate: KB must exist in DT before any writes ──
+    if not await _check_kb_exists_on_dt(kb_name):
+        logger.warning(
+            "[%s] Ingest blocked — KB '%s' does not exist. "
+            "Create it first in Settings → Knowledge Bases.",
+            trace_id, kb_name,
+        )
+        return
+
+    route = result.get("route", "")
+    needs_dt_sync = route in ("ocr", "document_extract")
+
+    if needs_dt_sync:
+        # Full dual-write: ChromaDB + DT LlamaIndex
+        await _ingest_to_kb(
+            provider=provider,
+            content=content,
+            kb_name=kb_name,
+            filename=filename,
+            learner_id=learner_id,
+            source=source,
+            trace_id=trace_id,
+        )
+        logger.info(
+            "[%s] Ingest dual-write: %d chars -> %s + DT (source=%s)",
+            trace_id, len(content), kb_name, source,
+        )
+    else:
+        # Text-layer PDF / plain text: DT already has content, only write ChromaDB
+        import hashlib
+        _content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+        docs = _split_content_for_ingest(content, filename)
+        ids = [f"{_content_hash}_{i}" for i in range(len(docs))]
+        _chroma_kb = _chromadb_kb_name(kb_name)
+        metadatas = [
+            {
+                "filename": filename,
+                "learner_id": learner_id,
+                "source": source,
+                "trace_id": trace_id,
+                "kb_name": kb_name,
+            }
+            for _ in docs
+        ]
+        await provider.add_documents(
+            kb_name=_chroma_kb,
+            documents=docs,
+            metadatas=metadatas,
+            ids=ids,
+        )
+        logger.info(
+            "[%s] Ingest ChromaDB-only: %d chunks -> %s (source=%s)",
+            trace_id, len(docs), kb_name, source,
+        )
 
 
 async def _generate_teaching_summary(
@@ -2577,20 +2662,123 @@ def _write_marker(name: str, value: str) -> None:
         pass
 
 
+def _periodic_quiz_sync() -> dict:
+    """Periodic quiz sync: scan mastery dir for learners with pending quiz data.
+
+    Quiz results are normally synced in real time via POST /api/quiz/sync
+    and POST /api/sync/quiz.  This background sweep catches any answers
+    that may have been missed (e.g. during a platform restart).
+    """
+    import os as _os
+
+    mastery_dir = os.getenv("MASTERY_DIR", "/data/mastery")
+    total_synced = 0
+    total_errors = 0
+
+    try:
+        for fname in _os.listdir(mastery_dir):
+            if fname.endswith("_session.json") or not fname.endswith(".json"):
+                continue
+            fpath = _os.path.join(mastery_dir, fname)
+            try:
+                with open(fpath, encoding="utf-8") as fh:
+                    data = json.load(fh)
+            except (json.JSONDecodeError, OSError):
+                continue
+            # Only process files that look like learner mastery records
+            learner_id = data.get("learner_id", "")
+            if not learner_id:
+                continue
+            # Look for unsynced quiz answers — currently empty;
+            # the real-time API path handles all syncs.
+            pending = data.get("_pending_quiz_answers", [])
+            if not pending:
+                continue
+            try:
+                result = sync_quiz_to_mastery(learner_id, pending)
+                total_synced += result.get("synced", 0)
+                total_errors += result.get("errors", 0)
+                # Clear pending after successful sync
+                if result.get("synced", 0) > 0:
+                    data.pop("_pending_quiz_answers", None)
+                    data["updated_at"] = time.time()
+                    tmp_path = fpath + ".tmp"
+                    try:
+                        with open(tmp_path, "w", encoding="utf-8") as fh:
+                            fh.write(json.dumps(data, ensure_ascii=False))
+                        _os.replace(tmp_path, fpath)
+                    except OSError:
+                        pass
+            except Exception:
+                total_errors += 1
+                logger.exception(
+                    "[periodic] quiz_sync failed for learner=%s", learner_id
+                )
+    except Exception:
+        logger.exception("[periodic] quiz_sync scan error")
+
+    return {"synced": total_synced, "errors": total_errors}
+
+
+def _cleanup_old_sources():
+    """Remove source files and ingest status older than SOURCES_RETENTION_HOURS.
+
+    Sources dir is a transient staging area — canonical files live in
+    knowledge_bases/<kb>/raw/.  This prevents test uploads from accumulating.
+    """
+    try:
+        now = time.time()
+        cutoff = now - (SOURCES_RETENTION_HOURS * 3600)
+        removed_src = 0
+        removed_st = 0
+
+        for _dir, _counter in [(SOURCES_DIR, "sources"), (INGEST_STATUS_DIR, "status")]:
+            if not os.path.isdir(_dir):
+                continue
+            for _f in os.listdir(_dir):
+                _fp = os.path.join(_dir, _f)
+                if not os.path.isfile(_fp):
+                    continue
+                try:
+                    if os.path.getmtime(_fp) < cutoff:
+                        os.unlink(_fp)
+                        if _counter == "sources":
+                            removed_src += 1
+                        else:
+                            removed_st += 1
+                except OSError:
+                    pass
+
+        if removed_src or removed_st:
+            logger.info(
+                "[cleanup] sources: removed %d old files + %d old status files "
+                "(retention=%.0fh)",
+                removed_src, removed_st, SOURCES_RETENTION_HOURS,
+            )
+    except Exception:
+        pass  # non-critical — never disrupt main loop
+
+
 async def _periodic_task_loop():
     """Background loop: quiz sync + report push on schedule.
 
     Runs every 60 s and delegates to marker-tracked helper functions.
     """
+    _last_src_cleanup = 0.0
     while True:
         await asyncio.sleep(60)
         try:
             now_bj = datetime.now(BEIJING_TZ)
 
+            # ── Periodic sources cleanup (every 6 hours) ──
+            if time.time() - _last_src_cleanup >= 21600:
+                await asyncio.to_thread(_cleanup_old_sources)
+                _last_src_cleanup = time.time()
+
             # ── Quiz sync (every 5 min) ──
             _last = _read_marker("quiz_sync_last.txt")
             if not _last or time.time() - float(_last) >= 300:
-                result = await asyncio.to_thread(sync_quiz_to_mastery)
+                result = await asyncio.to_thread(_periodic_quiz_sync)
                 if result.get("synced", 0) > 0 or result.get("errors", 0) == 0:
                     _write_marker("quiz_sync_last.txt", str(time.time()))
                 logger.debug(
@@ -3188,7 +3376,7 @@ def api_source_by_trace_id(trace_id: str):
 
 
 @app.get("/api/kb/search")
-def api_kb_search(query: str = "", kb_name: str = "tutoring", top_k: int = 5):
+def api_kb_search(query: str = "", kb_name: str = "初中教材", top_k: int = 5):
     """ChromaDB 知识库搜索 (v7.0: PersistentClient 内嵌)."""
     if not query.strip():
         return {"ok": False, "error": "query is required"}
@@ -3235,10 +3423,24 @@ def api_kb_search(query: str = "", kb_name: str = "tutoring", top_k: int = 5):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+async def _check_kb_exists_on_dt(kb_name: str) -> bool:
+    """Verify a KB exists in DeepTutor before allowing any writes to it."""
+    try:
+        async with httpx.AsyncClient(timeout=30) as _client:
+            _resp = await _client.get(f"{DEEPTUTOR_URL}/api/v1/knowledge/list")
+            _kbs = _resp.json() if _resp.status_code == 200 else []
+            return any(
+                kb.get("name") == kb_name or kb.get("id") == kb_name
+                for kb in (_kbs if isinstance(_kbs, list) else [])
+            )
+    except Exception:
+        return False
+
+
 @app.post("/api/kb/ingest-file")
 async def api_kb_ingest_file(
     file: UploadFile = File(...),
-    kb_name: str = Form("tutoring"),
+    kb_name: str = Form("初中教材"),
     learner_id: str = Form("web"),
     request: Request = None,
 ):
@@ -3255,6 +3457,11 @@ async def api_kb_ingest_file(
     error = _validate_file(file.filename or "unknown", len(raw))
     if error:
         return {"ok": False, "error": error, "trace_id": trace_id}
+
+    # ── Gate: KB must exist in DT ──
+    if not await _check_kb_exists_on_dt(kb_name):
+        logger.warning("[%s] Web UI ingest blocked — KB '%s' does not exist.", trace_id, kb_name)
+        return {"ok": False, "error": f"KB '{kb_name}' does not exist", "trace_id": trace_id}
 
     import tempfile
 
@@ -3280,6 +3487,7 @@ async def api_kb_ingest_file(
             },
         )
         extracted = result.get("content", "").strip()
+        _raw_content = result.get("content", "")
         if not extracted:
             return {"ok": False, "error": "No extractable content", "trace_id": trace_id}
 
@@ -3335,6 +3543,7 @@ async def api_kb_ingest_file(
         return {
             "ok": True,
             "trace_id": trace_id,
+            "content": _raw_content,
             "content_len": len(extracted),
             "route": result.get("route", ""),
             "dt_synced": needs_dt_sync,
@@ -3351,7 +3560,7 @@ async def api_kb_ingest_file(
 
 @app.post("/api/kb/sync-from-dt")
 async def api_kb_sync_from_dt(
-    kb_name: str = Form("tutoring"),
+    kb_name: str = Form("初中教材"),
     request: Request = None,
 ):
     """从 DT 知识库同步全部文件到平台 ChromaDB（重建索引后调用）。
@@ -3523,6 +3732,16 @@ async def api_ingest_proxy(
             "tool_name": tool_name,
         },
     )
+    # Write extracted content to ChromaDB + DT (was missing — audit fix)
+    await _maybe_ingest_result(
+        provider,
+        result,
+        kb_name=kb_name,
+        filename=os.path.basename(file.filename or "unknown"),
+        learner_id=learner_id,
+        source="web",
+        trace_id=trace_id,
+    )
     IngestStatusTracker.mark(
         trace_id,
         "completed",
@@ -3550,6 +3769,7 @@ async def api_ingest_proxy(
         "kb_name": kb_name,
         "intent": result.get("intent"),
         "route": result.get("route"),
+        "content": result.get("content", ""),
         "content_len": len(result.get("content", "")),
     }
 
@@ -3565,6 +3785,12 @@ async def api_create_kb_and_ingest(
     error = _validate_file(file.filename, len(content))
     if error:
         return {"ok": False, "error": error}
+
+    # ── Gate: KB must exist in DT (never auto-create) ──
+    if not await _check_kb_exists_on_dt(kb_name):
+        logger.warning("Ingest proxy blocked — KB '%s' does not exist.", kb_name)
+        return {"ok": False, "error": f"KB '{kb_name}' does not exist"}
+
     tool_name = request.headers.get("X-Tool-Name", "") if request else ""
     trace_id = _extract_trace_id(request) if request else _generate_trace_id()
     sources_dir = SOURCES_DIR
@@ -3600,6 +3826,16 @@ async def api_create_kb_and_ingest(
             "tool_name": tool_name,
         },
     )
+    # Write extracted content to ChromaDB + DT (was missing — audit fix)
+    await _maybe_ingest_result(
+        provider,
+        result,
+        kb_name=kb_name,
+        filename=os.path.basename(file.filename or "unknown"),
+        learner_id=learner_id,
+        source="web",
+        trace_id=trace_id,
+    )
     IngestStatusTracker.mark(
         trace_id,
         "completed",
@@ -3627,6 +3863,7 @@ async def api_create_kb_and_ingest(
         "kb_name": kb_name,
         "intent": result.get("intent"),
         "route": result.get("route"),
+        "content": result.get("content", ""),
         "content_len": len(result.get("content", "")),
     }
 
@@ -3640,14 +3877,14 @@ async def api_process_file(request: Request):
     if "application/json" in content_type:
         body = await request.json()
         file_path = body.get("file_path", "")
-        kb_name = body.get("kb_name", "tutoring")
+        kb_name = body.get("kb_name", "初中教材")
         learner_id = body.get("learner_id", "default")
         file = None
     elif "multipart/form-data" in content_type:
         form = await request.form()
         file = form.get("file")
         file_path = form.get("file_path", "")
-        kb_name = form.get("kb_name", "tutoring")
+        kb_name = form.get("kb_name", "初中教材")
         learner_id = form.get("learner_id", "default")
     else:
         return {"ok": False, "error": "Unsupported content-type; use JSON or multipart/form-data"}
@@ -3712,6 +3949,20 @@ async def api_process_file(request: Request):
         },
     )
 
+    # Write extracted content to ChromaDB + DT if a KB is requested.
+    # WeChat sends files for OCR+teaching (no kb_name), so ingestion is optional.
+    _proc_filename = file.filename if file and file.filename else os.path.basename(file_path_ref)
+    if kb_name and kb_name.strip():
+        await _maybe_ingest_result(
+            provider,
+            result,
+            kb_name=kb_name,
+            filename=_proc_filename,
+            learner_id=learner_id,
+            source="mcp",
+            trace_id=trace_id,
+        )
+
     IngestStatusTracker.mark(
         trace_id,
         "completed",
@@ -3735,9 +3986,9 @@ async def api_process_file(request: Request):
 
     # ── Update context cache + persist to disk for ALL files with OCR content ──
     # 后续 auto-trigger 或 tutor_chat 会从缓存取 context 更新 SOUL.md
-    # 跳过 ocr_fallback 路线, 防止虚假上下文污染后续交互
+    # 跳过 ocr_fallback/passthrough 路线, 防止虚假上下文污染后续交互
     _ocr_content = result.get("content", "").strip()
-    if _ocr_content and result.get("ok") and result.get("route") != "ocr_fallback":
+    if _ocr_content and result.get("ok") and result.get("route") not in ("ocr_fallback", "passthrough"):
         _last_tutor_context[learner_id] = _ocr_content
         if len(_last_tutor_context) > _MAX_CACHED_CONTEXTS:
             _last_tutor_context.clear()
@@ -3746,20 +3997,21 @@ async def api_process_file(request: Request):
             "[%s] Cached context for %s (%d chars)", trace_id, learner_id, len(_ocr_content)
         )
 
-        # ── 入库: 异步将提取文本写入知识库 ChromaDB ──
-        asyncio.create_task(
-            _ingest_to_kb(
-                provider=provider,
-                content=_ocr_content,
-                kb_name=kb_name,
-                filename=file.filename
-                if file and file.filename
-                else os.path.basename(file_path_ref),
-                learner_id=learner_id,
-                source="weixin",
-                trace_id=trace_id,
+        # ── 入库: 异步写入 ChromaDB + DT（不阻塞 WeChat 教学回复）──
+        if kb_name and kb_name.strip():
+            asyncio.create_task(
+                _maybe_ingest_result(
+                    provider=provider,
+                    result=result,
+                    kb_name=kb_name,
+                    filename=file.filename
+                    if file and file.filename
+                    else os.path.basename(file_path_ref),
+                    learner_id=learner_id,
+                    source="weixin",
+                    trace_id=trace_id,
+                )
             )
-        )
 
     return result
 
@@ -3767,7 +4019,7 @@ async def api_process_file(request: Request):
 @app.post("/api/ingest/file")
 async def api_ingest_file(
     file: UploadFile = File(...),
-    kb_name: str = Form("tutoring"),
+    kb_name: str = Form("初中教材"),
     learner_id: str = Form("default"),
     request: Request = None,
 ):
@@ -3812,6 +4064,17 @@ async def api_ingest_file(
             "trace_id": trace_id,
             "tool_name": tool_name,
         },
+    )
+
+    # Write extracted content to ChromaDB + DT (was missing — audit fix)
+    await _maybe_ingest_result(
+        provider,
+        result,
+        kb_name=kb_name,
+        filename=filename,
+        learner_id=learner_id,
+        source="mcp",
+        trace_id=trace_id,
     )
 
     IngestStatusTracker.mark(
@@ -4153,14 +4416,30 @@ async def api_tutor_context(request: Request):
 
 
 _SUBJECT_KEYWORDS = {
-    "chemistry": ["化学", "初三化学", "初中化学", "高考化学"],
+    "chemistry": [
+        "化学", "初三化学", "初中化学", "高考化学",
+        "元素", "原子", "分子", "离子", "化合物",
+        "化学式", "化学方程式", "反应", "置换", "分解",
+        "化合", "复分解", "氧化", "还原", "燃烧",
+        "溶液", "溶解度", "溶质", "溶剂", "浓度",
+        "金属", "非金属", "合金", "铁", "铜", "铝", "锌",
+        "酸", "碱", "盐", "中和", "pH", "指示剂",
+        "盐酸", "硫酸", "硝酸", "氢氧化钠", "碳酸钙",
+        "催化剂", "质量守恒", "摩尔", "物质的量",
+        "有机", "无机", "电解", "沉淀", "过滤",
+        "蒸馏", "结晶", "蒸发", "升华", "凝华",
+    ],
     "physics": ["物理", "初中物理", "高中物理", "高考物理"],
     "math": ["数学", "初中数学", "高中数学", "高考数学", "中考数学"],
 }
 
 
 def _detect_exam_subject(context: str) -> str:
-    """Detect exam subject from OCR text by keyword matching, fallback to env."""
+    """Detect exam subject from text by keyword matching, fallback to env.
+
+    Scans the full context (unlike the old 2000-char limit) so late-page
+    signals (e.g. "化学方程式" appearing on page 50 of a PDF) are caught.
+    """
     for subject, keywords in _SUBJECT_KEYWORDS.items():
         for kw in keywords:
             if kw in context:
@@ -4451,7 +4730,7 @@ async def _build_teaching_persona(
     try:
         logger.debug("KB section ENTERED for %s", learner_id)
         provider = await _get_provider()
-        _kb_results = await provider.query("tutoring", [_exam], n_results=10)
+        _kb_results = await provider.query("初中教材", [_exam], n_results=10)
         _kb_found = []
         if _exam:
             # Pass 1: prefer teaching_summary entries matching current subject.
@@ -5575,6 +5854,7 @@ async def _tutor_chat_core(
 
     # 1. Context cache: remember last teaching context per learner.
     #    Persisted to disk for container restart recovery.
+    _teach_session_id: str = ""
     if context.strip():
         _last_tutor_context[learner_id] = context
         _last_question_num[learner_id] = 0
@@ -5584,6 +5864,17 @@ async def _tutor_chat_core(
         # ── Fatigue: new session starts now ──
         if learner_id not in _session_start_time:
             _session_start_time[learner_id] = time.time()
+        # ── Auto-create TeachSession for WeChat → Web UI bridge ──
+        try:
+            _ts = get_teach_store().create(
+                learner_id=learner_id,
+                source="wechat",
+                ocr_text=context.strip(),
+            )
+            _teach_session_id = _ts.session_id
+            logger.info("[%s] Auto-created TeachSession %s for %s", trace_id, _teach_session_id, learner_id)
+        except Exception:
+            pass
 
     # 1a. Fatigue check: "累了/休息" resets session timer.
     _msg_lower = message.strip().lower()
@@ -6219,6 +6510,26 @@ async def _tutor_chat_core(
     if result.get("ok") and _last_tutor_context.get(learner_id):
         _save_context_to_disk(learner_id)
 
+    # ── Auto-update TeachSession with first question (WeChat → Web bridge) ──
+    if _teach_session_id and result.get("ok"):
+        try:
+            _ts_store = get_teach_store()
+            _ts = _ts_store.get(_teach_session_id)
+            if _ts and _ts.status == "pending" and result.get("content"):
+                _ts.first_question = result["content"]
+                _ts.status = "active"
+                _tq_m = re.search(r"(?:共|/)\s*(\d+)\s*题", result["content"])
+                if _tq_m:
+                    _ts.total_questions = int(_tq_m.group(1))
+                else:
+                    _detected = _detect_total_questions(_last_tutor_context.get(learner_id, ""))
+                    if _detected:
+                        _ts.total_questions = _detected
+                _ts_store.save(_ts)
+                logger.info("[%s] TeachSession %s updated (q=%d/%d)", trace_id, _teach_session_id, 1, _ts.total_questions)
+        except Exception:
+            pass
+
     logger.info(
         "[%s] tutor_chat timing: bot_setup=%.2fs total=%.2fs msg=%s profile_switched=%s",
         trace_id,
@@ -6453,7 +6764,7 @@ async def api_vision_solve(request: Request):
 
 class IngestTextRequest(BaseModel):
     content: str
-    kb_name: str = "tutoring"
+    kb_name: str = "初中教材"
     filename: str = ""
     source: str = "api"
     learner_id: str = "default"
@@ -6462,9 +6773,18 @@ class IngestTextRequest(BaseModel):
 @app.post("/api/ingest/text")
 async def api_ingest_text(req: IngestTextRequest, request: Request = None):
     trace_id = _extract_trace_id(request) if request else _generate_trace_id()
+
+    if not await _check_kb_exists_on_dt(req.kb_name):
+        logger.warning(
+            "[%s] Text ingest blocked — KB '%s' does not exist.",
+            trace_id, req.kb_name,
+        )
+        return {"ok": False, "error": f"KB '{req.kb_name}' does not exist"}
+
     provider = await _get_provider()
-    result = await provider.ingest_text(  # type: ignore[attr-defined]
-        req.content, req.kb_name, req.filename, req.source, trace_id=trace_id
+    _chroma_kb = _chromadb_kb_name(req.kb_name)
+    result = await provider.ingest_text(
+        req.content, _chroma_kb, req.filename, req.source, trace_id=trace_id
     )
     return result
 
@@ -8361,15 +8681,15 @@ async def api_teach_continue(request: Request):
 
     teach_session_id = str(body.get("teach_session_id", "")).strip()
     message = str(body.get("message", "")).strip()
-    learner_id = str(body.get("learner_id", "default")).strip()
-
     if not teach_session_id or not message:
         return {"ok": False, "error": "缺少 teach_session_id 或 message"}
-
+    # Use the session's learner_id, not the request body's — WeChat sessions
+    # are created under WeChat user IDs, not "default".
     store = get_teach_store()
     session = store.get(teach_session_id)
     if not session:
         return {"ok": False, "error": "教学会话不存在"}
+    learner_id = session.learner_id
     if session.status == "completed":
         return {"ok": False, "error": "教学已结束"}
     if session.is_expired:

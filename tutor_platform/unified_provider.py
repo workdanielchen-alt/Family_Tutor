@@ -138,7 +138,7 @@ class UnifiedLocalProvider:
                 path=self._chroma_dir,
                 settings=Settings(anonymized_telemetry=False),
             )
-            collection = client.get_or_create_collection(name=collection_name)
+            collection = client.get_collection(name=collection_name)
 
             embed_fn = self._get_embed_fn()
             loop = asyncio.get_running_loop()

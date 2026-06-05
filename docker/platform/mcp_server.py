@@ -928,7 +928,7 @@ async def reset_circuit(target: str = "deeptutor", agent_role: str = "") -> str:
 
 
 @mcp.tool()
-async def kb_search(query: str, kb_name: str = "tutoring", top_k: int = 5) -> str:
+async def kb_search(query: str, kb_name: str = "初中教材", top_k: int = 5) -> str:
     async def _run():
         chroma_data = []
         try:
@@ -1475,7 +1475,7 @@ async def get_memory(learner_id: str) -> str:
 
 @mcp.tool()
 async def process_file(
-    file_path: str, kb_name: str = "tutoring", learner_id: str = "default"
+    file_path: str, kb_name: str = "初中教材", learner_id: str = "default"
 ) -> str:
     perm = _check_tool_permission("process_file", learner_id)
     if perm:

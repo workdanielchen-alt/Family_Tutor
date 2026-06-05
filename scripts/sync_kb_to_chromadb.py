@@ -28,8 +28,10 @@ KB_BASE_DIR = Path(os.getenv("KB_BASE_DIR", str(Path(__file__).resolve().parent.
 CHROMA_DIR = os.getenv("CHROMA_PERSIST_DIR", str(Path(KB_BASE_DIR).parent / "chromadb"))
 CHUNK_SIZE = 512       # characters per chunk
 CHUNK_OVERLAP = 64     # overlap
-TARGET_COLLECTION = os.getenv("TARGET_COLLECTION", "tutoring")
-KB_NAMES = ["初中数学教材", "初中物理教材", "初中化学教材"]
+# Default collection: use KB name from config, fallback to env
+_DEFAULT_COLLECTION = "初中教材"  # matches kb_config.json
+TARGET_COLLECTION = os.getenv("TARGET_COLLECTION", _DEFAULT_COLLECTION)
+KB_NAMES = ["初中教材"]
 
 # On first use this downloads ~79 MB (all-MiniLM-L6-v2 ONNX model) and caches it.
 # Subsequent calls are instant.

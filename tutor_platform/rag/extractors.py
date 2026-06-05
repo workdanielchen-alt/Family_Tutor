@@ -103,15 +103,22 @@ def extract_pdf_json(file_path: str | Path) -> list[dict]:
     return []
 
 
-def has_pdf_text_layer(file_path: str | Path, min_chars: int = 50) -> bool:
+def has_pdf_text_layer(file_path: str | Path, min_chars: int = 200) -> bool:
     """Quick check whether a PDF has meaningful extractable text.
 
-    Returns True when the total extracted text across all pages exceeds
-    ``min_chars`` — meaning the document has a usable digital text layer
-    and does NOT need OCR.
+    Strips ``--- Page N ---`` markers (which accumulate on multi-page
+    scanned PDFs and can easily exceed a naive char-count threshold)
+    before evaluating.
+
+    Returns True when the total *actual* extracted text across all pages
+    exceeds ``min_chars`` — meaning the document has a usable digital text
+    layer and does NOT need OCR.
     """
+    import re as _re
     text = _extract_pdf_text_fast(str(file_path))
-    return len(text.strip()) > min_chars
+    # Strip page markers that pymupdf page.get_text() prepends even for empty pages
+    real = _re.sub(r"^--- Page \d+ ---\s*", "", text, flags=_re.MULTILINE).strip()
+    return len(real) > min_chars
 
 
 def extract_pdf_page_count(file_path: str | Path) -> int:
@@ -691,6 +698,12 @@ def _extract_pdf_text_fast(file_path: str) -> str:
 
 def _extract_markitdown(path_str: str) -> str:
     """Extract text via Microsoft markitdown."""
+    # For old binary .doc files, try antiword first (markitdown doesn't handle them).
+    ext = os.path.splitext(path_str)[1].lower()
+    if ext == ".doc":
+        text = _extract_doc_antiword(path_str)
+        if text:
+            return text
     try:
         from markitdown import MarkItDown
     except ImportError:
@@ -701,6 +714,20 @@ def _extract_markitdown(path_str: str) -> str:
         return result.text_content if result else ""
     except Exception:
         return ""
+
+def _extract_doc_antiword(file_path: str) -> str:
+    """Extract text from old binary .doc files using antiword."""
+    import subprocess as _sp
+    try:
+        result = _sp.run(
+            ["antiword", file_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return ""
 
 
 # ── Semantic chunking ───────────────────────────────────────────────

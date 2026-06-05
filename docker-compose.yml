@@ -33,6 +33,11 @@ services:
         - NEXT_PUBLIC_AUTH_ENABLED=false
     container_name: deeptutor
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
     dns:
       - 1.1.1.1
     environment:
@@ -49,6 +54,10 @@ services:
       - ./data/user:/app/data/user
       - ./data/memory:/app/data/memory
       - ./data/knowledge_bases:/app/data/knowledge_bases
+      # Persist pre-built frontend across container rebuilds
+      - ./web/.next2:/app/web/.next2:ro
+      # Production supervisor config (prevents dev config from being used)
+      - ./docker/deeptutor-supervisord.conf:/etc/supervisor/conf.d/deeptutor.conf:ro
 
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:${DEEPTUTOR_DOCKER_BACKEND_PORT:-8001}/"]
@@ -69,6 +78,11 @@ services:
       dockerfile: docker/platform/Dockerfile
     container_name: platform
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
     dns:
       - 1.1.1.1
     ports:
