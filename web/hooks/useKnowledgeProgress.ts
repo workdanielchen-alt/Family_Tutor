@@ -48,6 +48,8 @@ export function useKnowledgeProgress(options?: UseKnowledgeProgressOptions) {
   const sourcesRef = useRef<Record<string, EventSource>>({});
   const aliveRef = useRef(true);
   useEffect(() => {
+    // Reset for React StrictMode double-mount (dev mode).
+    aliveRef.current = true;
     return () => {
       aliveRef.current = false;
       // Tear down live connections eagerly so no stale callbacks fire during

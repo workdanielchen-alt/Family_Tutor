@@ -7,6 +7,7 @@ import { SidebarShell } from "@/components/sidebar/SidebarShell";
 import { LogoutButton } from "@/components/auth/LogoutButton";
 import { AdminLink } from "@/components/auth/AdminLink";
 import { useUnifiedChat } from "@/context/UnifiedChatContext";
+import PendingTasksBanner from "@/components/sidebar/PendingTasksBanner";
 
 import {
   deleteSession,
@@ -134,6 +135,7 @@ export default function WorkspaceSidebar() {
           <LogoutButton />
         </>
       }
+      pendingTasksSlot={<PendingTasksBanner />}
     />
   );
 }

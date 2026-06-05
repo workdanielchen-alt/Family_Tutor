@@ -1,4 +1,4 @@
-﻿"""
+"""
 platform/provider_api.py — Provider API (v7.0, 从 hermes_ingest 合并)
 
 改编自 docker/hermes_ingest/server.py:
@@ -2053,21 +2053,28 @@ def _ocr_output_is_garbled(text: str) -> bool:
     Returns True when the text is likely useless (garbled/placeholder) so the
     caller can treat it as OCR failure and trigger the ocr_fallback path.
     """
-    if not text or len(text.strip()) < 5:
+    stripped = text.strip()
+    if not stripped or len(stripped) < 10:
         return True
 
     # Too many replacement chars (U+FFFD) — definitely garbled
-    if text.count("\ufffd") > max(3, len(text) * 0.05):
+    if text.count("\ufffd") > max(2, len(text) * 0.03):
         return True
 
     # STUB mode output — always garbled
     if "[STUB:" in text:
         return True
 
-    # Everything else is considered valid OCR output.
-    # MiniCPM-V with Chinese system prompt reliably returns valid text;
-    # aggressive ratio-based filtering causes false positives on short
-    # mixed-language outputs (e.g. textbook pages with numbers/symbols).
+    # Dominated by non-letter symbols (garbage ASCII noise)
+    alnum = sum(1 for c in stripped if c.isalnum() or c.isspace())
+    if alnum < len(stripped) * 0.6:
+        return True
+
+    # Chinese ratio check: very low Chinese ratio → likely garbled
+    chinese = sum(1 for c in stripped if '\u4e00' <= c <= '\u9fff')
+    if chinese < len(stripped) * 0.10 and len(stripped) >= 15:
+        return True
+
     return False
 
 
@@ -2765,10 +2772,19 @@ async def _periodic_task_loop():
     Runs every 60 s and delegates to marker-tracked helper functions.
     """
     _last_src_cleanup = 0.0
+    _last_expire_stale = 0.0
     while True:
         await asyncio.sleep(60)
         try:
             now_bj = datetime.now(BEIJING_TZ)
+
+            # ── Periodic session expiration (every 5 minutes) ──
+            if time.time() - _last_expire_stale >= 300:
+                try:
+                    await asyncio.to_thread(get_teach_store().expire_stale)
+                except Exception:
+                    pass
+                _last_expire_stale = time.time()
 
             # ── Periodic sources cleanup (every 6 hours) ──
             if time.time() - _last_src_cleanup >= 21600:
@@ -5135,7 +5151,7 @@ def _mark_auto_exam_generated(learner_id: str) -> None:
 
 
 async def _auto_generate_exam(learner_id: str, trace_id: str, kp_filter: str = ""):
-    """Background task: auto-generate exam paper and inject into teaching context.
+    """Background task: auto-generate exam paper and create a task session.
 
     Throttled to once per 24h per learner — caller must check _auto_exam_due first.
     """
@@ -5148,8 +5164,30 @@ async def _auto_generate_exam(learner_id: str, trace_id: str, kp_filter: str = "
         return
 
     exam_text = result["exam_text"]
+    title = result.get("title", "强化训练")
+    total = result.get("total", 0)
+    kp_covered = result.get("kp_covered", [])
+
     # Save as pending exam context — next teaching interaction will pick it up
     _pending_exam_context[learner_id] = exam_text
+
+    # Also create a task session for the unified task UI
+    try:
+        store = get_teach_store()
+        store.create(
+            learner_id=learner_id,
+            source="auto_generated",
+            ocr_text=exam_text,
+            title=title,
+            task_type="auto_reinforce",
+            total_questions=total,
+            knowledge_points=",".join(kp_covered),
+        )
+        logger.info("[%s] Auto-exam task session created: %s (%d questions, %d KPIs)",
+                    trace_id, title, total, len(kp_covered))
+    except Exception:
+        pass
+
     logger.info(
         "[%s] Auto-exam generated for %s: %d questions, %d KPIs",
         trace_id,
@@ -5297,6 +5335,8 @@ def _match_answers(student: str, correct: str) -> bool:
     c_clean = re.sub(r"[.。，,、\s单位个只条约根种]+$", "", c)
     if s_clean and c_clean and s_clean == c_clean:
         return True
+
+    return False
 
 
 def _match_answers_semantic(student: str, correct: str) -> bool:
@@ -5865,14 +5905,28 @@ async def _tutor_chat_core(
         if learner_id not in _session_start_time:
             _session_start_time[learner_id] = time.time()
         # ── Auto-create TeachSession for WeChat → Web UI bridge ──
+        # Only create if no active session already exists for this learner
         try:
-            _ts = get_teach_store().create(
-                learner_id=learner_id,
-                source="wechat",
-                ocr_text=context.strip(),
-            )
-            _teach_session_id = _ts.session_id
-            logger.info("[%s] Auto-created TeachSession %s for %s", trace_id, _teach_session_id, learner_id)
+            _existing = get_teach_store().get_pending(learner_id, limit=1)
+            if not _existing:
+                # Derive title from OCR first line
+                _title = ""
+                _raw = context.strip()
+                if _raw:
+                    _first_line = _raw.split("\n")[0].strip()
+                    _candidate = re.sub(r"^\s*[#\d一二三四五六七八九十]+[.、．）\)\s]+", "", _first_line)
+                    _title = _candidate[:50]
+                if not _title:
+                    _title = "微信试卷"
+                _ts = get_teach_store().create(
+                    learner_id=learner_id,
+                    source="wechat",
+                    ocr_text=context.strip(),
+                    title=_title,
+                    task_type="exam_paper",
+                )
+                _teach_session_id = _ts.session_id
+                logger.info("[%s] Auto-created TeachSession %s for %s", trace_id, _teach_session_id, learner_id)
         except Exception:
             pass
 
@@ -7497,7 +7551,7 @@ async def api_practice_teach(request: Request):
     teach_context = context_text.strip()
     store = get_teach_store()
     session = store.create(learner_id=learner_id, source="child_practice",
-        ocr_text=teach_context, source_file=topic_name)
+        ocr_text=teach_context, source_file=topic_name, bypass_guards=True)
     try:
         result = await _tutor_chat_core(message="", learner_id=learner_id,
             context=teach_context, mode="guide", trace_id=trace_id, fast=True)
@@ -8587,7 +8641,9 @@ async def api_teach_start(request: Request):
 
     两种输入方式：
       - WeChat: { ocr_text, learner_id, source_file }
-      - WebUI:  { file_base64, filename, learner_id }
+      - WebUI:  { file_base64, filename, learner_id, title, task_type }
+    返回: { ok, teach_session_id, dt_session_id, first_question, total_questions,
+            source, current, title, task_type }
     """
     trace_id = _extract_trace_id(request)
     body = await request.json()
@@ -8596,6 +8652,8 @@ async def api_teach_start(request: Request):
     source_file = str(body.get("source_file", "")).strip()
     mode = str(body.get("mode", "guide")).strip()
     ocr_text = str(body.get("ocr_text", "")).strip()
+    _title = str(body.get("title", "")).strip()
+    _task_type = str(body.get("task_type", "")).strip()
 
     # ── WebUI 路径：base64 → OCR ──
     file_base64 = str(body.get("file_base64", "")).strip()
@@ -8607,11 +8665,18 @@ async def api_teach_start(request: Request):
         ocr_text = ocr_result["content"].strip()
         if not source_file:
             source_file = _fn
-        _source = "webui"
+        _source = "web_upload"
+        if not _title:
+            _title = _fn.rsplit(".", 1)[0] if "." in _fn else _fn
+        if not _task_type:
+            _task_type = "exam_paper"
     else:
         _source = "wechat"
+        if not _task_type:
+            _task_type = "exam_paper"
 
     dt_session_id = str(body.get("dt_session_id", "")).strip()
+    consume_sid = str(body.get("consume_session_id", "")).strip()
 
     if not ocr_text:
         return {"ok": False, "error": "OCR 文本为空，无法开始教学"}
@@ -8624,7 +8689,18 @@ async def api_teach_start(request: Request):
         ocr_text=ocr_text,
         source_file=source_file,
         dt_session_id=dt_session_id,
+        title=_title,
+        task_type=_task_type,
+        bypass_guards=True,
     )
+
+    # ── Consume original pending task (if launching from sidebar task) ──
+    if consume_sid:
+        try:
+            store.mark_completed(consume_sid)
+            logger.info("[%s] Consumed pending task %s", trace_id, consume_sid)
+        except Exception:
+            pass
 
     try:
         # ── 调用 _tutor_chat_core 出第一题 ──
@@ -8661,10 +8737,13 @@ async def api_teach_start(request: Request):
             return {
                 "ok": True,
                 "teach_session_id": session.session_id,
+                "dt_session_id": dt_session_id,
                 "first_question": reply,
                 "total_questions": session.total_questions,
                 "source": _source,
                 "current": _cur_qn,
+                "title": _title,
+                "task_type": _task_type,
             }
 
         return {"ok": False, "error": "教学引擎未返回内容"}
@@ -8703,7 +8782,7 @@ async def api_teach_continue(request: Request):
             _saved_ctx = _last_tutor_context.get(learner_id, None)
             _last_tutor_context[learner_id] = _last_tutor_context.pop(_ctx_key, "")
         _msg = message.strip()
-        if session.source in ("child_practice", "webui"):
+        if session.source in ("child_practice", "webui", "web_upload"):
             _msg = "【排版：自然分段，不用分隔线，选项各占一行】\n" + _msg
         result = await _tutor_chat_core(
             message=_msg,
@@ -8718,7 +8797,7 @@ async def api_teach_continue(request: Request):
             return {"ok": False, "error": "教学引擎未返回内容"}
 
         # WebUI源清理格式
-        if session.source in ("child_practice", "webui"):
+        if session.source in ("child_practice", "webui", "web_upload"):
             for sep in ("──", "─", "━", "═", "⎯"):
                 reply = reply.replace(sep, "")
             # 普通化 \r → \n，确保 HTML 渲染正确
@@ -8745,8 +8824,14 @@ async def api_teach_continue(request: Request):
         if _tq_m:
             session.total_questions = int(_tq_m.group(1))
 
+        # Track correct/wrong from AI feedback pattern
+        _reply_head = reply[:300]
+        if re.search(r"✅|[✓✔]|正确[了！!。]|答对了|很棒|做得好|很好[，,。!！]|完全正确|回答正确", _reply_head):
+            session.correct_count += 1
+        elif re.search(r"❌|[✗✘]|不对[了哦]|答错了|不正确|再想想|不准确|不对的|有偏差", _reply_head):
+            session.wrong_count += 1
+
         # 检测是否完成
-        _done = False
         _done = False
         if ("已完成全部" in reply or "全部完成" in reply or "所有题目" in reply
             or "最后一题" in reply
@@ -8768,6 +8853,8 @@ async def api_teach_continue(request: Request):
             "reply": reply,
             "current": session.current_question,
             "total_questions": session.total_questions,
+            "correct_count": session.correct_count,
+            "wrong_count": session.wrong_count,
             "done": _done,
         }
     except Exception as exc:
@@ -8781,23 +8868,26 @@ async def api_teach_continue(request: Request):
 
 @app.get("/api/teach/pending")
 async def api_teach_pending_all():
-    """获取所有学习者的待教学任务列表。"""
+    """获取所有学习者的待教学任务列表（统一视图，含所有来源）。"""
     store = get_teach_store()
     sessions = store.get_all_pending(limit=50)
-    # Only show WeChat-sourced sessions (parent-sent exams).
-    # Web self-uploads ("webui") and auto-generated practice ("child_practice")
-    # are self-initiated by the child — don't show as "待完成试卷" cards.
-    sessions = [s for s in sessions if s.source == "wechat"]
     return {
         "ok": True,
         "sessions": [
             {
                 "session_id": s.session_id,
+                "dt_session_id": s.dt_session_id,
                 "source": s.source,
+                "title": s.title or s.source_file or f"{_get_source_label(s.source)}-{s.task_type or 'task'}",
+                "task_type": s.task_type,
                 "total_questions": s.total_questions,
                 "current_question": s.current_question,
+                "correct_count": s.correct_count,
+                "wrong_count": s.wrong_count,
                 "first_question": s.first_question[:200] if s.first_question else "",
                 "status": s.status,
+                "knowledge_points": s.knowledge_points,
+                "subject": s.subject,
                 "created_at": s.created_at,
                 "expires_at": s.expires_at,
             }
@@ -8809,19 +8899,26 @@ async def api_teach_pending_all():
 
 @app.get("/api/teach/pending/{learner_id}")
 async def api_teach_pending(learner_id: str):
-    """获取学习者的待教学任务列表。"""
+    """获取学习者的待教学任务列表（统一视图，含所有来源）。"""
     store = get_teach_store()
-    sessions = store.get_pending(learner_id, limit=20)
+    sessions = store.get_pending(learner_id, limit=30)
     return {
         "ok": True,
         "sessions": [
             {
                 "session_id": s.session_id,
+                "dt_session_id": s.dt_session_id,
                 "source": s.source,
+                "title": s.title or s.source_file or f"{_get_source_label(s.source)}-{s.task_type or 'task'}",
+                "task_type": s.task_type,
                 "total_questions": s.total_questions,
                 "current_question": s.current_question,
+                "correct_count": s.correct_count,
+                "wrong_count": s.wrong_count,
                 "first_question": s.first_question[:200] if s.first_question else "",
                 "status": s.status,
+                "knowledge_points": s.knowledge_points,
+                "subject": s.subject,
                 "created_at": s.created_at,
                 "expires_at": s.expires_at,
             }
@@ -8846,15 +8943,227 @@ async def api_teach_get_session(session_id: str):
         "session_id": session.session_id,
         "learner_id": session.learner_id,
         "source": session.source,
+        "title": session.title or session.source_file,
+        "task_type": session.task_type,
+        "ocr_text": session.ocr_text,
         "status": session.status,
         "total_questions": session.total_questions,
         "current_question": session.current_question,
+        "correct_count": session.correct_count,
+        "wrong_count": session.wrong_count,
         "first_question": session.first_question,
+        "knowledge_points": session.knowledge_points,
+        "subject": session.subject,
         "created_at": session.created_at,
         "expires_at": session.expires_at,
         "completed_at": session.completed_at,
     }
 
+
+# ═══════════════════════════════════════════════════════════════════
+# Unified Task API (v7.0 — normalizes three entry points)
+# ═══════════════════════════════════════════════════════════════════
+
+
+@app.post("/api/tasks/create")
+async def api_task_create(request: Request):
+    """创建统一任务会话 — Web上传 / AI出题 共用入口。
+
+    请求体:
+      - learner_id: 学习者标识
+      - source: "web_upload" | "auto_generated"
+      - title: 试卷/练习标题
+      - task_type: "exam_paper" | "practice" | "auto_reinforce"
+      - file_base64 (可选): Web上传的base64文件
+      - filename (可选): 原始文件名
+      - ocr_text (可选): 已有的OCR文本（AI出题时传入）
+      - total_questions (可选): 总题数
+      - knowledge_points (可选): 逗号分隔的知识点
+      - subject (可选): 学科
+    返回: { ok, teach_session_id, title, task_type, task_source, total_questions }
+    """
+    trace_id = _extract_trace_id(request)
+    body = await request.json()
+
+    learner_id = str(body.get("learner_id", "default")).strip()
+    source = str(body.get("source", "web_upload")).strip()
+    title = str(body.get("title", "")).strip()
+    task_type = str(body.get("task_type", "")).strip()
+    ocr_text = str(body.get("ocr_text", "")).strip()
+    filename = str(body.get("filename", "")).strip()
+    total_questions = int(body.get("total_questions", 0))
+    knowledge_points = str(body.get("knowledge_points", "")).strip()
+    subject = str(body.get("subject", "")).strip()
+
+    # Auto-derive task_type from source if not provided
+    if not task_type:
+        if source == "auto_generated":
+            task_type = "auto_reinforce"
+        elif source == "web_upload":
+            task_type = "exam_paper"
+        else:
+            task_type = "practice"
+
+    # ── Web upload: base64 → OCR ──
+    file_base64 = str(body.get("file_base64", "")).strip()
+    if file_base64 and not ocr_text:
+        _fn = filename or "upload.bin"
+        ocr_result = await _ocr_file_base64(file_base64, _fn, trace_id)
+        if not ocr_result.get("ok") or not ocr_result.get("content"):
+            return {"ok": False, "error": "文件 OCR 失败"}
+        ocr_text = ocr_result["content"].strip()
+        if not filename:
+            filename = _fn
+
+    # ── Auto-generated: use provided text as context ──
+    if not ocr_text and source == "auto_generated":
+        ocr_text = str(body.get("context_text", "")).strip()
+
+    if not ocr_text and not title:
+        return {"ok": False, "error": "缺少试卷内容或标题"}
+
+    # ── Auto-derive title ──
+    if not title:
+        title = filename or f"{_get_source_label(source)}-{task_type}"
+
+    store = get_teach_store()
+    session = store.create(
+        learner_id=learner_id,
+        source=source,
+        ocr_text=ocr_text,
+        source_file=filename,
+        total_questions=total_questions,
+        title=title,
+        task_type=task_type,
+        knowledge_points=knowledge_points,
+        subject=subject,
+        bypass_guards=True,
+    )
+
+    logger.info("[%s] Task created: %s type=%s source=%s title=%s q=%d",
+                trace_id, session.session_id, task_type, source, title, total_questions)
+
+    return {
+        "ok": True,
+        "teach_session_id": session.session_id,
+        "title": title,
+        "task_type": task_type,
+        "task_source": source,
+        "total_questions": total_questions,
+        "current_question": 0,
+        "status": session.status,
+    }
+
+
+@app.post("/api/tasks/{teach_session_id}/progress")
+async def api_task_update_progress(teach_session_id: str, request: Request):
+    """更新任务进度 — 每次答题后调用。
+
+    请求体:
+      - current_question: 当前题号 (1-based)
+      - correct_count: 累计答对数
+      - wrong_count: 累计答错数
+      - done (可选): 是否完成
+    返回: { ok, current, total, correct, wrong, done }
+    """
+    trace_id = _extract_trace_id(request)
+    body = await request.json()
+
+    store = get_teach_store()
+    session = store.get(teach_session_id)
+    if not session:
+        return {"ok": False, "error": "任务会话不存在"}
+
+    current_q = int(body.get("current_question", session.current_question))
+    correct = int(body.get("correct_count", session.correct_count))
+    wrong = int(body.get("wrong_count", session.wrong_count))
+    is_done = bool(body.get("done", False))
+
+    session.current_question = max(session.current_question, current_q)
+    session.correct_count = max(session.correct_count, correct)
+    session.wrong_count = max(session.wrong_count, wrong)
+
+    if is_done:
+        store.mark_completed(teach_session_id)
+    else:
+        store.save(session)
+
+    logger.info("[%s] Task progress: %s q=%d/%d ✅%d ❌%d done=%s",
+                trace_id, teach_session_id,
+                session.current_question, session.total_questions,
+                session.correct_count, session.wrong_count,
+                "yes" if is_done else "no")
+
+    return {
+        "ok": True,
+        "teach_session_id": teach_session_id,
+        "current": session.current_question,
+        "total": session.total_questions,
+        "correct": session.correct_count,
+        "wrong": session.wrong_count,
+        "done": is_done or session.status == "completed",
+    }
+
+
+@app.get("/api/tasks/pending")
+async def api_task_pending(learner_id: str = "default"):
+    """获取学习者的待完成任务列表（包含完整任务元数据）。
+
+    返回: { ok, tasks: [{ teach_session_id, dt_session_id, title, task_type,
+             task_source, total_questions, current_question, correct_count,
+             wrong_count, status, knowledge_points, subject, ... }], total_pending }
+    """
+    store = get_teach_store()
+    sessions = store.get_pending(learner_id, limit=30)
+
+    tasks = []
+    for s in sessions:
+        tasks.append({
+            "teach_session_id": s.session_id,
+            "dt_session_id": s.dt_session_id,
+            "title": s.title or s.source_file or f"{_get_source_label(s.source)}-{s.task_type or 'task'}",
+            "task_type": s.task_type,
+            "task_source": s.source,
+            "total_questions": s.total_questions,
+            "current_question": s.current_question,
+            "correct_count": s.correct_count,
+            "wrong_count": s.wrong_count,
+            "status": s.status,
+            "knowledge_points": s.knowledge_points,
+            "subject": s.subject,
+            "created_at": s.created_at,
+            "expires_at": s.expires_at,
+        })
+
+    return {"ok": True, "tasks": tasks, "total_pending": len(tasks)}
+
+
+@app.get("/api/tasks/for-sessions")
+async def api_task_for_sessions(session_ids: str = ""):
+    """批量查询：根据聊天 session_id 列表查找对应的任务元数据。
+
+    参数: session_ids=id1,id2 (逗号分隔的 DT chat session IDs)
+    返回: { ok, tasks: { dt_session_id → {...} } }
+    """
+    ids = [s.strip() for s in session_ids.split(",") if s.strip()]
+    if not ids:
+        return {"ok": True, "tasks": {}}
+
+    store = get_teach_store()
+    lookup = store.get_tasks_for_sessions(ids)
+    return {"ok": True, "tasks": lookup}
+
+
+def _get_source_label(source: str) -> str:
+    """来源的可读标签。"""
+    labels = {
+        "wechat": "微信上传",
+        "web_upload": "网页上传",
+        "auto_generated": "AI出题",
+        "webui": "网页上传",
+        "child_practice": "练习",
+    }
+    return labels.get(source, source)
 
 
 def run_provider_api(port: int = 8100):

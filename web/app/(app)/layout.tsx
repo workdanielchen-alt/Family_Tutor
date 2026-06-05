@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { LayoutDashboard, PenLine, User } from "lucide-react";
+import { LayoutDashboard, MessageSquare, User } from "lucide-react";
 import dynamic from "next/dynamic";
 import WorkspaceSidebar from "@/components/sidebar/WorkspaceSidebar";
 import UtilitySidebar from "@/components/sidebar/UtilitySidebar";
@@ -17,7 +17,7 @@ const WORKSPACE_PATHS = ["/", "/chat", "/agents", "/book", "/playground"];
 
 const CHILD_TABS = [
   { key: "dashboard", href: "/space", icon: LayoutDashboard, label: "仪表盘" },
-  { key: "quiz", href: "/practice", icon: PenLine, label: "练习" },
+  { key: "chat", href: "/practice", icon: MessageSquare, label: "对话" },
   { key: "me", href: "/me", icon: User, label: "我的" },
 ];
 

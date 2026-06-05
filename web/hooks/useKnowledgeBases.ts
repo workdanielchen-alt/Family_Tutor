@@ -52,6 +52,10 @@ export function useKnowledgeBases() {
   // insertBefore crashes from interleaved reconciliation.
   const aliveRef = useRef(true);
   useEffect(() => {
+    // Reset for React StrictMode double-mount (dev mode).
+    // StrictMode unmounts then remounts; useRef returns the SAME object
+    // so current stays false from the cleanup unless we reset it.
+    aliveRef.current = true;
     return () => {
       aliveRef.current = false;
     };

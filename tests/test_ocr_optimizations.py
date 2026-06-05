@@ -17,7 +17,7 @@ import cv2
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "docker", "platform"))
 
-from provider_api import _opencv_preprocess_image, _notify_hermes_agent, _TTLock
+from provider_api import preprocess_image_bytes, _notify_hermes_agent, _TTLock
 
 
 # ── Helpers ──
@@ -36,7 +36,7 @@ class TestDownscale:
     def test_large_image_scaled(self):
         """2000x1200 → max dim 1800 → unchanged (already ≤1800), but deskew may swap dims."""
         raw = _make_jpeg(2000, 1200)
-        result = _opencv_preprocess_image(raw)
+        result = preprocess_image_bytes(raw)
         decoded = cv2.imdecode(np.frombuffer(result, np.uint8), cv2.IMREAD_GRAYSCALE)
         h, w = decoded.shape
         # MiniCPM-V 1.8M pixels → _MAX_DIM = 1800; 2000 > 1800 so scale down
@@ -45,7 +45,7 @@ class TestDownscale:
     def test_small_image_unchanged(self):
         """600x800 under 1800 — not resized."""
         raw = _make_jpeg(800, 600)
-        result = _opencv_preprocess_image(raw)
+        result = preprocess_image_bytes(raw)
         decoded = cv2.imdecode(np.frombuffer(result, np.uint8), cv2.IMREAD_GRAYSCALE)
         h, w = decoded.shape
         assert h == 800 and w == 600, f"unchanged expected, got {h}x{w}"
@@ -53,7 +53,7 @@ class TestDownscale:
     def test_square_large(self):
         """2000x2000 → 1800x1800."""
         raw = _make_jpeg(2000, 2000)
-        result = _opencv_preprocess_image(raw)
+        result = preprocess_image_bytes(raw)
         decoded = cv2.imdecode(np.frombuffer(result, np.uint8), cv2.IMREAD_GRAYSCALE)
         h, w = decoded.shape
         assert max(h, w) <= 1800
@@ -61,14 +61,14 @@ class TestDownscale:
     def test_boundary_below_max(self):
         """1200x900 under 1800 — no resize."""
         raw = _make_jpeg(1200, 900)
-        result = _opencv_preprocess_image(raw)
+        result = preprocess_image_bytes(raw)
         decoded = cv2.imdecode(np.frombuffer(result, np.uint8), cv2.IMREAD_GRAYSCALE)
         h, w = decoded.shape
         assert max(h, w) <= 1800
 
     def test_invalid_bytes(self):
         """Non-decodable → returned raw."""
-        result = _opencv_preprocess_image(b"not an image")
+        result = preprocess_image_bytes(b"not an image")
         assert result == b"not an image"
 
 
@@ -85,7 +85,7 @@ class TestCleanScreenshot:
         _, buf = cv2.imencode(".jpg", img)
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         assert gray.std() > 40, f"image std={gray.std():.1f}"
-        result = _opencv_preprocess_image(buf.tobytes())
+        result = preprocess_image_bytes(buf.tobytes())
         assert len(result) > 0
 
     def test_low_contrast_noisy(self):
@@ -94,7 +94,7 @@ class TestCleanScreenshot:
         _, buf = cv2.imencode(".jpg", img)
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         assert gray.std() < 40, f"image std={gray.std():.1f}"
-        result = _opencv_preprocess_image(buf.tobytes())
+        result = preprocess_image_bytes(buf.tobytes())
         assert len(result) > 0
 
     def test_text_image(self):
@@ -103,7 +103,7 @@ class TestCleanScreenshot:
         cv2.putText(img, "Hello OCR 中文测试", (20, 150),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (30, 30, 30), 2)
         _, buf = cv2.imencode(".jpg", img)
-        result = _opencv_preprocess_image(buf.tobytes())
+        result = preprocess_image_bytes(buf.tobytes())
         assert len(result) > 0
 
 

@@ -87,6 +87,21 @@ const nextConfig = {
   output: "standalone",
   distDir: "./.next2",
 
+  // Proxy all backend API calls through the Next.js dev server so the browser
+  // only talks to port 3782 — no CORS, no cross-origin fetch failures.
+  async rewrites() {
+    return [
+      {
+        source: "/api/v1/:path*",
+        destination: `http://localhost:${BACKEND_PORT}/api/v1/:path*`,
+      },
+      {
+        source: "/api/platform/:path*",
+        destination: `http://localhost:${BACKEND_PORT}/api/platform/:path*`,
+      },
+    ];
+  },
+
   // Move dev indicator to bottom-right corner
   devIndicators: {
     position: "bottom-right",

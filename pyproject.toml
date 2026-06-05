@@ -40,6 +40,7 @@ dependencies = [
     "PyMuPDF>=1.26.0",
     "pymupdf4llm>=1.27.0",
     "numpy>=1.24.0,<3.0.0",
+    "opencv-python-headless>=4.5.0",
     "arxiv>=2.0.0",
     "python-docx>=1.1.0",
     "openpyxl>=3.1.0",
@@ -78,6 +79,7 @@ cli = [
     "PyMuPDF>=1.26.0",
     "pymupdf4llm>=1.27.0",
     "numpy>=1.24.0,<3.0.0",
+    "opencv-python-headless>=4.5.0",
     "arxiv>=2.0.0",
     # Document text extraction (chat attachments)
     "python-docx>=1.1.0",

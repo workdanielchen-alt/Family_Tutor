@@ -198,103 +198,16 @@ export async function fetchKnowledgeGraph(
   return apiGet(`/knowledge/graph?subject=${subject}&learner_id=${learnerId}`);
 }
 
-// ── Quiz Session ────────────────────────────────────────────
-
-export interface QuizSessionQuestion {
-  question_id: string;
-  question: string;
-  question_type: string;
-  options?: Record<string, string>;
-  difficulty?: string;
-  knowledge_context?: string;
-}
-
-export interface QuizSessionData {
-  session_id: string;
-  learner_id?: string;
-  status: string;
-  title: string;
-  total_questions: number;
-  completed: number;
-  questions: QuizSessionQuestion[];
-  kp_covered: string[];
-  created_at: number;
-  expires_at: number;
-  completed_at?: number | null;
-}
-
-export interface QuizAnswerResult {
-  ok: boolean;
-  is_correct: boolean;
-  correct_answer: string;
-  explanation: string;
-  completed: number;
-  total: number;
-  session_completed: boolean;
-}
-
-export interface PendingQuizSession {
-  session_id: string;
-  title: string;
-  total_questions: number;
-  completed: number;
-  created_at: number;
-  expires_at: number;
-  source_file: string;
-}
-
-export async function fetchQuizSession(
-  sessionId: string,
-): Promise<QuizSessionData> {
-  return apiGet(`/quiz/session/${sessionId}`);
-}
-
-export async function submitQuizAnswer(
-  sessionId: string,
-  questionId: string,
-  learnerId: string,
-  answer: string,
-): Promise<QuizAnswerResult> {
-  return apiPost("/quiz/answer", {
-    session_id: sessionId,
-    question_id: questionId,
-    learner_id: learnerId,
-    answer,
-  });
-}
-
-export async function completeQuizSession(
-  sessionId: string,
-  learnerId: string,
-): Promise<{ ok: boolean; total: number; completed: number; accuracy: number; weak_kps: string[] }> {
-  return apiPost("/quiz/complete", {
-    session_id: sessionId,
-    learner_id: learnerId,
-  });
-}
-
-export async function fetchPendingQuizSessions(
-  learnerId: string,
-): Promise<{ sessions: PendingQuizSession[]; total_pending: number }> {
-  return apiGet(`/quiz/pending/${learnerId}`);
-}
-
-export async function fetchAllPendingQuizSessions(): Promise<{
-  sessions: PendingQuizSession[];
-  total_pending: number;
-}> {
-  return apiGet("/quiz/pending");
-}
-
-// ── Teach Session ─────────────────────────────────────────────
-
 export interface TeachStartResponse {
   ok: boolean;
   teach_session_id?: string;
+  dt_session_id?: string;
   first_question?: string;
   total_questions?: number;
   source?: string;
   current?: number;
+  title?: string;
+  task_type?: string;
   error?: string;
 }
 
@@ -303,6 +216,8 @@ export interface TeachContinueResponse {
   reply?: string;
   current?: number;
   total_questions?: number;
+  correct_count?: number;
+  wrong_count?: number;
   done?: boolean;
   error?: string;
 }
@@ -314,6 +229,9 @@ export async function startTeach(params: {
   learner_id?: string;
   source_file?: string;
   mode?: string;
+  title?: string;
+  task_type?: string;
+  consume_session_id?: string;
 }): Promise<TeachStartResponse> {
   return apiPost("/teach/start", params);
 }
@@ -324,6 +242,88 @@ export async function continueTeach(params: {
   learner_id?: string;
 }): Promise<TeachContinueResponse> {
   return apiPost("/teach/continue", params);
+}
+
+// ── Unified Tasks (v7.0) ─────────────────────────────────────
+
+export interface PendingTask {
+  teach_session_id: string;
+  dt_session_id: string;
+  title: string;
+  task_type: string;           // "exam_paper" | "practice" | "auto_reinforce"
+  task_source: string;         // "wechat" | "web_upload" | "auto_generated"
+  total_questions: number;
+  current_question: number;
+  correct_count: number;
+  wrong_count: number;
+  status: string;
+  knowledge_points: string;
+  subject: string;
+  created_at: number;
+  expires_at: number;
+}
+
+export interface TaskCreateResponse {
+  ok: boolean;
+  teach_session_id?: string;
+  title?: string;
+  task_type?: string;
+  task_source?: string;
+  total_questions?: number;
+  current_question?: number;
+  status?: string;
+  error?: string;
+}
+
+export async function fetchPendingTasks(
+  learnerId: string,
+): Promise<{ tasks: PendingTask[]; total_pending: number }> {
+  return apiGet(`/tasks/pending?learner_id=${encodeURIComponent(learnerId)}`);
+}
+
+export async function fetchTasksForSessions(
+  sessionIds: string[],
+): Promise<Record<string, PendingTask>> {
+  const ids = sessionIds.filter(Boolean).join(",");
+  if (!ids) return {};
+  const data = await apiGet<{ tasks: Record<string, PendingTask> }>(
+    `/tasks/for-sessions?session_ids=${encodeURIComponent(ids)}`,
+  );
+  return data.tasks || {};
+}
+
+export async function createTask(params: {
+  learner_id: string;
+  source: string;
+  title?: string;
+  task_type?: string;
+  file_base64?: string;
+  filename?: string;
+  ocr_text?: string;
+  total_questions?: number;
+  knowledge_points?: string;
+  subject?: string;
+}): Promise<TaskCreateResponse> {
+  return apiPost("/tasks/create", params);
+}
+
+export async function updateTaskProgress(
+  teachSessionId: string,
+  params: {
+    current_question?: number;
+    correct_count?: number;
+    wrong_count?: number;
+    done?: boolean;
+  },
+): Promise<{
+  ok: boolean;
+  current: number;
+  total: number;
+  correct: number;
+  wrong: number;
+  done: boolean;
+}> {
+  return apiPost(`/tasks/${encodeURIComponent(teachSessionId)}/progress`, params);
 }
 
 // ── Practice / Exam / Report ────────────────────────────────

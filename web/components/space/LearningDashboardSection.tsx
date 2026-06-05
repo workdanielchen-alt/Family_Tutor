@@ -5,6 +5,7 @@ import {
   BarChart3,
   BookOpen,
   ChevronDown,
+  ChevronRight,
   Loader2,
   RefreshCw,
   AlertCircle,
@@ -633,6 +634,25 @@ export default function LearningDashboardSection() {
       setReportModal({ content: "生成失败", type });
     }
   }, [learnerId]);
+  // ── Pending task quick entry ──
+  const [recentTask, setRecentTask] = useState<{
+    teach_session_id: string; title: string; task_source: string;
+    current_question: number; total_questions: number;
+  } | null>(null);
+
+  useEffect(() => {
+    fetch(`/api/platform/tasks/pending?learner_id=${learnerId}`)
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.ok && d.tasks?.length) {
+          // Show the first active task (or most recent)
+          const active = d.tasks.find((t: any) => t.status === "active") || d.tasks[0];
+          setRecentTask(active);
+        }
+      })
+      .catch(() => {});
+  }, [learnerId]);
+
 
   // ── Render ────────────────────────────────────────────────
 
@@ -677,7 +697,6 @@ export default function LearningDashboardSection() {
     );
   }
 
-  // Empty state
   const isEmpty = summary && summary.total_questions === 0;
 
   return (
@@ -711,6 +730,28 @@ export default function LearningDashboardSection() {
           </div>
         }
       />
+
+      {/* ── Continue recent task ── */}
+      {recentTask && (
+        <a
+          href={`/chat?teach=${recentTask.teach_session_id}`}
+          className="mb-4 flex items-center gap-3 rounded-xl border border-[var(--primary)]/20 bg-[var(--primary)]/[0.03] px-4 py-3 transition-colors hover:bg-[var(--primary)]/[0.06]"
+        >
+          <span className="text-lg">
+            {recentTask.task_source === "wechat" ? "📱" :
+             recentTask.task_source === "auto_generated" ? "🤖" : "💻"}
+          </span>
+          <div className="min-w-0 flex-1">
+            <p className="text-[13px] font-medium text-[var(--foreground)]">
+              继续：{recentTask.title}
+            </p>
+            <p className="text-[11px] text-[var(--muted-foreground)]">
+              第 {recentTask.current_question || 1}/{recentTask.total_questions || "?"} 题
+            </p>
+          </div>
+          <ChevronRight size={16} className="shrink-0 text-[var(--primary)]" />
+        </a>
+      )}
 
       {isEmpty ? (
         <div className="flex flex-col items-center gap-4 rounded-xl border-2 border-dashed border-[var(--border)]/60 p-12 text-center">

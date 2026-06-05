@@ -100,13 +100,17 @@ export function resolveBase(): string {
  * @returns Full URL (e.g., 'http://localhost:8001/api/v1/knowledge/list')
  */
 export function apiUrl(path: string): string {
-  // Remove leading slash if present to avoid double slashes
   const normalizedPath = path.startsWith("/") ? path : `/${path}`;
 
-  // Remove trailing slash from base URL if present
+  // Browser: return relative URL so Next.js dev server proxies it via rewrites().
+  // This eliminates cross-origin fetch failures (CORS, connection refused) during dev.
+  if (typeof window !== "undefined") {
+    return normalizedPath;
+  }
+
+  // Server-side (SSR / Node): use the direct backend URL.
   const base = resolveBase();
   const normalizedBase = base.endsWith("/") ? base.slice(0, -1) : base;
-
   return `${normalizedBase}${normalizedPath}`;
 }
 
@@ -116,18 +120,22 @@ export function apiUrl(path: string): string {
  * @returns WebSocket URL (e.g., 'ws://localhost:8001/api/v1/ws')
  */
 export function wsUrl(path: string): string {
-  // Security Hardening: Convert http to ws and https to wss.
-  // In production environments (where API_BASE_URL starts with https), this ensures secure websockets.
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+
+  // Browser: construct relative WS URL so it goes through Next.js dev server.
+  // Note: Next.js rewrites don't handle WebSocket upgrades automatically,
+  // so for WS we must still construct an absolute URL.
+  if (typeof window !== "undefined") {
+    // Use the same host:port as the page, switching protocol to ws/wss
+    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+    return `${proto}//${window.location.host}${normalizedPath}`;
+  }
+
+  // Server-side: rewrite http→ws, https→wss on the backend base URL.
   const base = resolveBase()
     .replace(/^http:/, "ws:")
     .replace(/^https:/, "wss:");
-
-  // Remove leading slash if present to avoid double slashes
-  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
-
-  // Remove trailing slash from base URL if present
   const normalizedBase = base.endsWith("/") ? base.slice(0, -1) : base;
-
   return `${normalizedBase}${normalizedPath}`;
 }
 

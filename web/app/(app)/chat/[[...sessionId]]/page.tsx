@@ -33,6 +33,7 @@ import type { SelectedQuestionEntry } from "@/components/chat/QuestionBankPicker
 import ChatComposer from "@/components/chat/home/ChatComposer";
 import { ChatMessageList } from "@/components/chat/home/ChatMessages";
 import { TeachingChatView, type TeachingMessage } from "@/components/chat/home/TeachingChatView";
+import TaskCreateModal from "@/components/chat/home/TaskCreateModal";
 // Imported eagerly so the drawer shell is always mounted off-screen —
 // clicking a chip becomes a single CSS class flip, no chunk fetch + double
 // render. The heavy renderers inside still load lazily.
@@ -108,8 +109,7 @@ import {
 } from "@/lib/tools-settings";
 import { downloadChatMarkdown } from "@/lib/chat-export";
 import type { SpaceMemoryFile } from "@/lib/space-items";
-import { fetchAllPendingQuizSessions, type PendingQuizSession } from "@/lib/platform-api";
-import { startTeach, continueTeach } from "@/lib/platform-api";
+import { startTeach, continueTeach, updateTaskProgress } from "@/lib/platform-api";
 import {
   selectedBooksToPayload,
   type SelectedBookReference,
@@ -312,25 +312,22 @@ export default function ChatPage() {
 
   // ── 引导式教学：用 ref 避免渲染，纯作路由标记 ──
   const teachSessionIdRef = useRef<string | null>(null);
+  const teachLaunchingRef = useRef<string | null>(null);
   const [teachingMessages, setTeachingMessages] = useState<TeachingMessage[]>([]);
   const [isTeachingWaiting, setIsTeachingWaiting] = useState(false);
 
+  // ── Task create modal ──
+  const [showTaskModal, setShowTaskModal] = useState(false);
+  const [taskModalFile, setTaskModalFile] = useState<{
+    base64: string;
+    filename: string;
+  } | null>(null);
+  const [taskModalLoading, setTaskModalLoading] = useState(false);
+  const [taskModalError, setTaskModalError] = useState<string | null>(null);
 
-  // ── 待处理教学任务列表（仅用于空白页提示） ──
-  const [pendingTasks, setPendingTasks] = useState<
-    { session_id: string; source: "wechat" | "webui"; total_questions: number; current_question: number; first_question: string }[]
-  >([]);
-  useEffect(() => {
-    (async () => {
-      try {
-        const res = await fetch("/api/platform/teach/pending");
-        const data = await res.json();
-        if (data.ok) setPendingTasks(data.sessions ?? []);
-      } catch { /* ignore */ }
-    })();
-  }, []);
 
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBase[]>([]);
+
   const [llmOptions, setLLMOptions] = useState<LLMOption[]>([]);
   const [activeLLMDefault, setActiveLLMDefault] = useState<LLMSelection | null>(
     null,
@@ -624,21 +621,6 @@ export default function ChatPage() {
     }
   }, [capabilityNeedsConfig, ensureActivityPanelOpen]);
   const hasMessages = state.messages.length > 0;
-
-  // ── Pending quiz sessions from WeChat ──────────────────────────
-  const [pendingQuizzes, setPendingQuizzes] = useState<PendingQuizSession[]>([]);
-  const refreshPendingQuizzes = useCallback(async () => {
-    try {
-      const data = await fetchAllPendingQuizSessions();
-      setPendingQuizzes(data.sessions ?? []);
-    } catch { /* ignore */ }
-  }, []);
-  useEffect(() => {
-    void refreshPendingQuizzes();
-    const onVisible = () => { if (document.visibilityState === "visible") void refreshPendingQuizzes(); };
-    document.addEventListener("visibilitychange", onVisible);
-    return () => document.removeEventListener("visibilitychange", onVisible);
-  }, [refreshPendingQuizzes]);
 
   // ── Time-of-day greeting: seeded once on mount from the user's local clock so
   // the heading stays stable while they're on the page. State (not useMemo)
@@ -935,6 +917,57 @@ export default function ChatPage() {
       state.isStreaming,
     ],
   );
+
+  /* ---- start-teach via custom event (same-page) or URL param (cross-route/fresh) ---- */
+  useEffect(() => {
+    const launchTeaching = async (teachId: string) => {
+      // Dedup: skip if already launching this exact teachId
+      if (teachLaunchingRef.current === teachId) return;
+      teachLaunchingRef.current = teachId;
+      const sid = teachId;
+      teachSessionIdRef.current = null;
+      teachSessionIdRef.current = sid;
+      // Show loading message immediately so user sees feedback
+      setTeachingMessages([{ role: "assistant", content: "🔄 正在准备，请稍候..." }]);
+      try {
+        const res = await fetch(`/api/platform/teach/session/${sid}`);
+        const d = await res.json();
+        if (!d.ok) { setTeachingMessages([]); setIsTeachingWaiting(false); return; }
+
+        const data = await startTeach({
+          ocr_text: d.ocr_text || "",
+          learner_id: "default",
+          title: d.title || "",
+          task_type: d.task_type || "exam_paper",
+          consume_session_id: sid,
+        }).catch(() => null);
+
+        if (data?.ok && data.first_question) {
+          setTeachingMessages([{ role: "assistant", content: data.first_question! }]);
+        } else {
+          setTeachingMessages([]);
+          setIsTeachingWaiting(false);
+          return;
+        }
+      } catch { setTeachingMessages([]); }
+      setIsTeachingWaiting(false);
+    };
+
+    // Path 1: same-page — CustomEvent dispatched by PendingTasksBanner
+    const handler = (event: Event) => {
+      const teachId = (event as CustomEvent<string>).detail;
+      if (teachId) launchTeaching(teachId);
+    };
+    window.addEventListener("start-teach", handler);
+
+    // Path 2: cross-route or fresh load — URL param (?teach=ts_xxx)
+    const urlTeach = typeof window !== "undefined"
+      ? new URLSearchParams(window.location.search).get("teach")
+      : null;
+    if (urlTeach) launchTeaching(urlTeach);
+
+    return () => window.removeEventListener("start-teach", handler);
+  }, []);
 
   /* ---- URL-driven session loading ---- */
   useEffect(() => {
@@ -1464,6 +1497,37 @@ export default function ChatPage() {
     [fileToAttachment, filterAndReportFiles],
   );
 
+  const handleTaskConfirm = useCallback(
+    async (title: string) => {
+      if (!taskModalFile) return;
+      setTaskModalLoading(true);
+      setTaskModalError(null);
+      try {
+        const data = await startTeach({
+          file_base64: taskModalFile.base64,
+          filename: taskModalFile.filename,
+          learner_id: "default",
+          title,
+          task_type: "exam_paper",
+        }).catch(() => null);
+        if (data?.ok && data.teach_session_id && data.first_question) {
+          teachSessionIdRef.current = data.teach_session_id;
+          setTeachingMessages([{ role: "assistant", content: data.first_question }]);
+          setTaskModalLoading(false);
+          setShowTaskModal(false);
+          setTaskModalFile(null);
+        } else {
+          setTaskModalError(data?.error || "试卷创建失败，请检查文件格式后重试");
+          setTaskModalLoading(false);
+        }
+      } catch {
+        setTaskModalError("网络异常，请重试");
+        setTaskModalLoading(false);
+      }
+    },
+    [taskModalFile],
+  );
+
   const handleSend = useCallback(
     async (content: string) => {
       if (
@@ -1536,37 +1600,36 @@ export default function ChatPage() {
         }).catch(() => null);
         if (data?.ok && data.reply) {
           injectAssistantMessage(data.reply);
+          // Sync progress to task
+          if (data.current != null) {
+            updateTaskProgress(teachSessionIdRef.current, {
+              current_question: data.current,
+              correct_count: data.correct_count,
+              wrong_count: data.wrong_count,
+              done: data.done,
+            }).catch(() => {});
+          }
           if (data.done) teachSessionIdRef.current = null;
         }
         return;
       }
 
-      // ── 上传文件 → 触发教学 ──
+      // ── 上传文件 → 弹出任务确认弹窗 ──
       if (attachments.length > 0) {
         const fileAttach = attachments[0];
         setAttachments([]);
-        const data = await startTeach({
-          file_base64: fileAttach.base64,
-          filename: fileAttach.filename,
-          learner_id: "default",
-        }).catch(() => null);
-        if (data?.ok && data.teach_session_id && data.first_question) {
-          teachSessionIdRef.current = data.teach_session_id;
-          setTeachingMessages([{ role: "assistant", content: data.first_question }]);
-        } else {
-          // fallback: 教学启动失败，改发普通消息
-          sendMessage(
-            content || t("Please analyze the attached file."),
-            extraAttachments,
-            config,
-            notebookReferencesPayload,
-            historyReferencesPayload,
-            { bookReferences: bookReferencesPayload },
-            questionNotebookReferencesPayload,
-            skillsPayload,
-            memoryPayload,
-          );
-        }
+        // Show modal first — user confirms title before teaching starts
+        const titleFromFile = (fileAttach.filename || "upload")
+          .replace(/\.[^.]+$/, "")
+          .replace(/[_\-\s]+/g, " ")
+          .trim()
+          .slice(0, 50);
+        setTaskModalFile({
+          base64: fileAttach.base64 || "",
+          filename: fileAttach.filename || "upload.bin",
+        });
+        setTaskModalError(null);
+        setShowTaskModal(true);
         return;
       }
 
@@ -1931,6 +1994,15 @@ export default function ChatPage() {
                       ...prev,
                       { role: "assistant", content: data.reply! },
                     ]);
+                    // Sync progress to task
+                    if (data.current != null) {
+                      updateTaskProgress(teachSessionIdRef.current!, {
+                        current_question: data.current,
+                        correct_count: data.correct_count,
+                        wrong_count: data.wrong_count,
+                        done: data.done,
+                      }).catch(() => {});
+                    }
                     if (data.done) {
                       const sid = teachSessionIdRef.current;
                       setTimeout(() => {
@@ -1961,85 +2033,6 @@ export default function ChatPage() {
                   </h1>
                 </div>
 
-                {/* ── Pending quiz sessions from WeChat ── */}
-                {pendingQuizzes.length > 0 && (
-                  <div className="mt-8 w-full max-w-md space-y-3">
-                    <p className="text-center text-[13px] font-medium text-[var(--muted-foreground)]">
-                      来自微信的待完成试卷
-                    </p>
-                    {pendingQuizzes.slice(0, 5).map((s) => (
-                      <button
-                        key={s.session_id}
-                        onClick={() => {
-                          window.location.href = `/chat/quiz/${s.session_id}`;
-                        }}
-                        className="flex w-full items-center justify-between rounded-xl border border-[var(--border)]/60 bg-[var(--card)] px-4 py-3 text-left shadow-sm transition-all hover:border-[var(--primary)]/40 hover:bg-[var(--primary)]/[0.03]"
-                      >
-                        <div className="min-w-0 flex-1">
-                          <p className="truncate text-[14px] font-medium text-[var(--foreground)]">
-                            {s.title || "练习"}
-                          </p>
-                          <p className="text-[12px] text-[var(--muted-foreground)]">
-                            {s.completed}/{s.total_questions} 题已完成
-                          </p>
-                        </div>
-                        <span className="ml-3 shrink-0 rounded-lg bg-[var(--primary)] px-3 py-1.5 text-[12px] font-medium text-white">
-                          {s.completed > 0 ? "继续" : "开始答题"}
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-                )}
-
-                {/* ── Pending teach tasks from WeChat (active teaching sessions) ── */}
-                {pendingTasks.length > 0 && !teachSessionIdRef.current && (
-                  <div className={`${pendingQuizzes.length > 0 ? "mt-4" : "mt-8"} w-full max-w-md space-y-3`}>
-                    <p className="text-center text-[13px] font-medium text-[var(--muted-foreground)]">
-                      📚 来自微信的待完成试卷
-                    </p>
-                    {pendingTasks.slice(0, 5).map((s) => (
-                      <button
-                        key={s.session_id}
-                        onClick={async () => {
-                          try {
-                            const sid = s.session_id;
-                            teachSessionIdRef.current = sid;
-                            setIsTeachingWaiting(true);
-                            if (s.current_question > 0) {
-                              const data = await continueTeach({
-                                teach_session_id: sid,
-                                message: "继续",
-                              }).catch(() => null);
-                              if (data?.ok && data.reply) {
-                                setTeachingMessages([{ role: "assistant", content: data.reply! }]);
-                              }
-                            } else {
-                              const res = await fetch(`/api/platform/teach/session/${sid}`);
-                              const data = await res.json();
-                              if (data.ok && data.first_question) {
-                                setTeachingMessages([{ role: "assistant", content: data.first_question }]);
-                              }
-                            }
-                            setIsTeachingWaiting(false);
-                          } catch { /* ignore */ }
-                        }}
-                        className="flex w-full items-center justify-between rounded-xl border border-[var(--border)]/60 bg-[var(--card)] px-4 py-3 text-left shadow-sm transition-all hover:border-[var(--primary)]/40 hover:bg-[var(--primary)]/[0.03]"
-                      >
-                        <div className="min-w-0 flex-1">
-                          <p className="truncate text-[14px] font-medium text-[var(--foreground)]">
-                            {s.source === "wechat" ? "📸 微信试卷" : "📄 已上传试卷"}
-                          </p>
-                          <p className="text-[12px] text-[var(--muted-foreground)]">
-                            {s.current_question > 0 ? `已开始 · 第${s.current_question}题` : "未开始"}{s.total_questions > 0 ? ` / 共${s.total_questions}题` : ""}
-                          </p>
-                        </div>
-                        <span className="ml-3 shrink-0 rounded-lg bg-[var(--primary)] px-3 py-1.5 text-[12px] font-medium text-white">
-                          {s.current_question > 0 ? "继续" : "开始答题"}
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-                )}
               </div>
             ) : (
               <div
@@ -2231,6 +2224,27 @@ export default function ChatPage() {
           />
         </div>
       </GeogebraTabProvider>
+      {/* ── Task create modal ── */}
+      {showTaskModal && taskModalFile && (
+        <TaskCreateModal
+          initialTitle={
+            (taskModalFile.filename || "upload")
+              .replace(/\.[^.]+$/, "")
+              .replace(/[_\-\s]+/g, " ")
+              .trim()
+              .slice(0, 50)
+          }
+          filename={taskModalFile.filename}
+          onConfirm={handleTaskConfirm}
+          onCancel={() => {
+            setShowTaskModal(false);
+            setTaskModalFile(null);
+            setTaskModalError(null);
+          }}
+          loading={taskModalLoading}
+          error={taskModalError}
+        />
+      )}
     </QuizFollowupProvider>
   );
 }

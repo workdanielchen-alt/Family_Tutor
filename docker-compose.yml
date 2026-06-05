@@ -54,8 +54,6 @@ services:
       - ./data/user:/app/data/user
       - ./data/memory:/app/data/memory
       - ./data/knowledge_bases:/app/data/knowledge_bases
-      # Persist pre-built frontend across container rebuilds
-      - ./web/.next2:/app/web/.next2:ro
       # Production supervisor config (prevents dev config from being used)
       - ./docker/deeptutor-supervisord.conf:/etc/supervisor/conf.d/deeptutor.conf:ro
 

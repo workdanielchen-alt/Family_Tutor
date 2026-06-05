@@ -31,7 +31,7 @@ services:
       - ./web/features:/app/web/features:ro
       - ./web/hooks:/app/web/hooks:ro
       - ./web/i18n:/app/web/i18n:ro
-      - ./web/lib:/app/web/lib:ro
+      - ./web/lib:/app/web/lib
       - ./web/locales:/app/web/locales:ro
       - ./web/public:/app/web/public:ro
       # CSS/Tailwind config — required for Turbopack to compile properly
@@ -45,8 +45,6 @@ services:
       - ./data/user:/app/data/user
       - ./data/memory:/app/data/memory
       - ./data/knowledge_bases:/app/data/knowledge_bases
-      # Next.js dev mode needs write access to .next2 for compilation cache
-      - ./web/.next2:/app/web/.next2:rw
       # Development supervisor config (overrides production mount from base compose)
       - ./docker/deeptutor-supervisord-dev.conf:/etc/supervisor/conf.d/deeptutor.conf:ro
     environment:
@@ -79,6 +77,7 @@ services:
       - ./data/sources:/data/sources
       - ./data/hermes:/data/hermes
       - ./data/quiz_sessions:/data/quiz_sessions
+      - ./data/teach_sessions:/data/teach_sessions
       - /var/run/docker.sock:/var/run/docker.sock:ro
     environment:
       - DEEPTUTOR_ENV=development

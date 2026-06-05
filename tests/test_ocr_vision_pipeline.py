@@ -331,18 +331,22 @@ class TestVisionDiagramIntegration:
     """
 
     @pytest.mark.asyncio
-    @patch("provider_api._ocr_image_file")
+    @patch("provider_api.extract_text", new_callable=MagicMock)
     @patch("provider_api._describe_diagram")
     @patch("provider_api._hash_file")
     async def test_diagram_triggers_vision(
         self,
         mock_hash: MagicMock,
         mock_describe: AsyncMock,
-        mock_ocr: AsyncMock,
+        mock_extract: MagicMock,
         monkeypatch,
         tmp_path,
     ):
-        """OCR output containing '如图' → _describe_diagram is called."""
+        """OCR output containing '如图' → _describe_diagram is called.
+        
+        _handle_inbound_file calls extract_text() internally (not _ocr_image_file),
+        so we patch the actual import used.
+        """
         from provider_api import _handle_inbound_file, _FILE_PROCESS_CACHE
 
         monkeypatch.setenv("OCR_PROVIDER", "rkllama")
@@ -351,8 +355,13 @@ class TestVisionDiagramIntegration:
         img_path = tmp_path / "test_diagram.jpg"
         _write_minimal_jpeg(img_path)
 
-        # Mock OCR to return text containing a diagram keyword
-        mock_ocr.return_value = "如图，AB是⊙O的直径，∠CAB=30°"
+        # Mock extract_text to return > 80 chars (avoids ocr_fallback route)
+        mock_extract.return_value = (
+            "一、选择题（每小题3分，共30分）\n"
+            "如图，AB是⊙O的直径，∠CAB=30°\n"
+            "1. 下列选项中，哪个是正确的？（  ）\n"
+            "A. 选项A  B. 选项B  C. 选项C  D. 选项D"
+        )
         mock_hash.return_value = "fake_hash_001"
         mock_describe.return_value = "[图片中的图形描述] 有一个圆，圆心为O..."
 
@@ -372,14 +381,14 @@ class TestVisionDiagramIntegration:
         mock_describe.assert_awaited_once()
 
     @pytest.mark.asyncio
-    @patch("provider_api._ocr_image_file")
+    @patch("provider_api.extract_text", new_callable=MagicMock)
     @patch("provider_api._describe_diagram")
     @patch("provider_api._hash_file")
     async def test_all_images_force_vision(
         self,
         mock_hash: MagicMock,
         mock_describe: AsyncMock,
-        mock_ocr: AsyncMock,
+        mock_extract: MagicMock,
         monkeypatch,
         tmp_path,
     ):
@@ -391,7 +400,13 @@ class TestVisionDiagramIntegration:
         img_path = tmp_path / "test_plain.jpg"
         _write_minimal_jpeg(img_path)
 
-        mock_ocr.return_value = "小明和小红一起去看电影。"
+        # Return > 80 chars to avoid ocr_fallback path
+        mock_extract.return_value = (
+            "小明和小红一起去看电影，他们买了三张票。"
+            "电影非常精彩，讲述了一个关于勇气的故事。"
+            "看完电影后，他们去了附近的公园散步。"
+            "公园里有很多漂亮的花和树。"
+        )
         mock_describe.return_value = "[图片中的图形描述] 两个小朋友在公园里。"
         mock_hash.return_value = "fake_hash_002"
 

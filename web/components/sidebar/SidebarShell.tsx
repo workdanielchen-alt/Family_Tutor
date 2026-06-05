@@ -91,6 +91,7 @@ interface SidebarShellProps {
   onRenameSession?: (sessionId: string, title: string) => void | Promise<void>;
   onDeleteSession?: (sessionId: string) => void | Promise<void>;
   footerSlot?: ReactNode;
+  pendingTasksSlot?: ReactNode;
 }
 
 export function SidebarShell({
@@ -104,6 +105,7 @@ export function SidebarShell({
   onRenameSession,
   onDeleteSession,
   footerSlot,
+  pendingTasksSlot,
 }: SidebarShellProps) {
   const pathname = usePathname();
   const router = useRouter();
@@ -277,6 +279,9 @@ export function SidebarShell({
             <Plus size={16} strokeWidth={2} />
             <span>{t("New Chat")}</span>
           </button>
+
+          {/* Pending tasks — always visible above session list */}
+          {pendingTasksSlot}
 
           {PRIMARY_NAV.map((item) => {
             const active = pathname.startsWith(item.href);

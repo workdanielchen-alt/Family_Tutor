@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useTranslation } from "react-i18next";
 import { FileText, Loader2, PenLine, Plus, Trash2 } from "lucide-react";
@@ -12,6 +12,10 @@ import {
 } from "@/lib/co-writer-api";
 import { notifyCoWriterChanged } from "@/lib/co-writer-events";
 import { CO_WRITER_SAMPLE_TEMPLATE } from "./sampleTemplate";
+
+// Module-level cache: show previous results immediately on re-mount,
+// then refresh in background so the user never sees a full-page spinner.
+let cachedDocuments: CoWriterDocumentSummary[] | null = null;
 
 function relativeTime(seconds: number): string {
   if (!seconds || Number.isNaN(seconds)) return "";
@@ -31,28 +35,44 @@ function relativeTime(seconds: number): string {
 export default function CoWriterHomePage() {
   const router = useRouter();
   const { t } = useTranslation();
-  const [documents, setDocuments] = useState<CoWriterDocumentSummary[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [documents, setDocuments] = useState<CoWriterDocumentSummary[]>(
+    cachedDocuments ?? [],
+  );
+  const [loading, setLoading] = useState(!cachedDocuments);
+  const mountedRef = useRef(true);
   const [creating, setCreating] = useState(false);
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [error, setError] = useState("");
 
   const refresh = useCallback(async () => {
-    setLoading(true);
     setError("");
+    if (!cachedDocuments) {
+      setLoading(true);
+    }
     try {
       const docs = await listCoWriterDocuments();
-      setDocuments(docs);
+      cachedDocuments = docs;
+      if (mountedRef.current) {
+        setDocuments(docs);
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (mountedRef.current) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
-      setLoading(false);
+      if (mountedRef.current) {
+        setLoading(false);
+      }
     }
   }, []);
 
   useEffect(() => {
+    mountedRef.current = true;
     void refresh();
+    return () => {
+      mountedRef.current = false;
+    };
   }, [refresh]);
 
   const handleCreate = useCallback(
@@ -80,7 +100,11 @@ export default function CoWriterHomePage() {
       setDeletingId(docId);
       try {
         await deleteCoWriterDocument(docId);
-        setDocuments((prev) => prev.filter((doc) => doc.id !== docId));
+        setDocuments((prev) => {
+          const next = prev.filter((doc) => doc.id !== docId);
+          cachedDocuments = next;
+          return next;
+        });
         setPendingDeleteId(null);
         notifyCoWriterChanged();
       } catch (err) {

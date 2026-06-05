@@ -79,6 +79,8 @@ interface QuizViewerProps {
    */
   turnId?: string | null;
   language?: string;
+  /** "exam": full quiz viewer with navigation; "guided": single-question focus for teaching flow */
+  mode?: "exam" | "guided";
 }
 
 type AnswerImage = {
@@ -197,6 +199,7 @@ export default function QuizViewer({
   language = "en",
   autoAdvance = true,
   onComplete,
+  mode = "exam",
 }: QuizViewerProps) {
   const { t } = useTranslation();
   const followupController = useQuizFollowupController();
@@ -785,108 +788,108 @@ export default function QuizViewer({
 
   return (
     <div className="overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--card)]">
-      <div className="flex items-center gap-2 border-b border-[var(--border)] px-3 py-2">
-        <button
-          type="button"
-          onClick={() => setIdx((value) => Math.max(0, value - 1))}
-          disabled={idx === 0}
-          title={t("Previous")}
-          aria-label={t("Previous")}
-          className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-[var(--border)] bg-[var(--muted)]/60 text-[var(--foreground)] shadow-sm transition-colors hover:border-[var(--primary)] hover:bg-[var(--primary)]/10 hover:text-[var(--primary)] disabled:cursor-not-allowed disabled:border-[var(--border)] disabled:bg-transparent disabled:text-[var(--muted-foreground)] disabled:opacity-40 disabled:hover:bg-transparent"
-        >
-          <ChevronLeft size={18} strokeWidth={2.5} />
-        </button>
-        <span className="text-[11px] font-semibold text-[var(--muted-foreground)]">
-          {completedCount}/{total}
-        </span>
-        <div className="flex flex-1 flex-wrap gap-1">
-          {questions.map((question, questionIndex) => {
-            const answer = answers[questionIndex];
-            const isCurrent = questionIndex === idx;
-            const done = answer?.submitted;
-            const hasThread =
-              Boolean(
-                followupThreads[getQuestionKey(question, questionIndex)]
-                  ?.sessionId,
-              ) ||
-              Boolean(
-                followupThreads[getQuestionKey(question, questionIndex)]
-                  ?.messages.length,
-              );
-            // Color the chip by correctness for auto-gradable types
-            // (choice, concept, fill_in_blank). For open-ended types
-            // (short_answer / written / coding) we'd be guessing — keep
-            // the neutral "completed" tint so we don't mark a thoughtful
-            // answer red just because it doesn't match the reference
-            // string verbatim.
-            const autoGradable = isAutoGradable(question);
-            const correctness: "correct" | "incorrect" | null =
-              done && answer && autoGradable
-                ? isAnswerCorrect(question, answer)
-                  ? "correct"
-                  : "incorrect"
-                : null;
-            const baseChip =
-              "flex h-6 w-6 items-center justify-center rounded-full text-[10px] font-semibold transition-all";
-            const chipClass = isCurrent
-              ? `${baseChip} bg-[var(--primary)] text-white shadow-sm`
-              : correctness === "correct"
-                ? `${baseChip} bg-green-100 text-green-700 hover:bg-green-200 dark:bg-green-900/40 dark:text-green-300`
-                : correctness === "incorrect"
-                  ? `${baseChip} bg-red-100 text-red-700 hover:bg-red-200 dark:bg-red-900/40 dark:text-red-300`
-                  : done
-                    ? `${baseChip} bg-[var(--primary)]/15 text-[var(--primary)]`
-                    : `${baseChip} bg-[var(--muted)] text-[var(--muted-foreground)] hover:bg-[var(--border)]`;
-            return (
-              <button
-                key={question.question_id || questionIndex}
-                onClick={() => setIdx(questionIndex)}
-                className={chipClass}
-              >
-                {/* For graded auto-gradable questions we *replace* the ✓
-                    with the sequence number — the color is the
-                    completion signal, and the digit lets the learner
-                    navigate to a specific question by index. The
-                    followup-thread dot still rides along when the
-                    learner asked a follow-up about this question. */}
-                {done && !isCurrent && !autoGradable ? (
-                  hasThread ? (
-                    <span className="relative inline-flex">
-                      <Check size={10} />
-                      <span className="absolute -right-1 -top-1 h-1.5 w-1.5 rounded-full bg-[var(--primary)]" />
-                    </span>
-                  ) : (
-                    <Check size={10} />
-                  )
-                ) : hasThread && done && !isCurrent ? (
-                  <span className="relative inline-flex">
-                    {questionIndex + 1}
-                    <span className="absolute -right-1 -top-1 h-1.5 w-1.5 rounded-full bg-[var(--primary)]" />
-                  </span>
-                ) : (
-                  questionIndex + 1
-                )}
-              </button>
-            );
-          })}
+      {mode === "guided" ? (
+        <div className="flex items-center gap-2 border-b border-[var(--border)] px-4 py-2.5">
+          <span className="text-[12px] font-semibold text-[var(--muted-foreground)]">
+            📝 第 {idx + 1} 题 · 共 {total} 题
+          </span>
+          <div className="flex-1" />
+          <span className="text-[11px] text-[var(--muted-foreground)]/60">
+            {completedCount}/{total} 已完成
+          </span>
         </div>
-        <button
-          type="button"
-          onClick={() => setIdx((value) => Math.min(total - 1, value + 1))}
-          disabled={idx === total - 1}
-          title={t("Next")}
-          aria-label={t("Next")}
-          className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-[var(--border)] bg-[var(--muted)]/60 text-[var(--foreground)] shadow-sm transition-colors hover:border-[var(--primary)] hover:bg-[var(--primary)]/10 hover:text-[var(--primary)] disabled:cursor-not-allowed disabled:border-[var(--border)] disabled:bg-transparent disabled:text-[var(--muted-foreground)] disabled:opacity-40 disabled:hover:bg-transparent"
-        >
-          <ChevronRight size={18} strokeWidth={2.5} />
-        </button>
-      </div>
-      <div className="h-0.5 bg-[var(--muted)]">
-        <div
-          className="h-full bg-[var(--primary)] transition-all duration-300"
-          style={{ width: `${navigationProgress}%` }}
-        />
-      </div>
+      ) : (
+        <>
+          <div className="flex items-center gap-2 border-b border-[var(--border)] px-3 py-2">
+            <button
+              type="button"
+              onClick={() => setIdx((value) => Math.max(0, value - 1))}
+              disabled={idx === 0}
+              title={t("Previous")}
+              aria-label={t("Previous")}
+              className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-[var(--border)] bg-[var(--muted)]/60 text-[var(--foreground)] shadow-sm transition-colors hover:border-[var(--primary)] hover:bg-[var(--primary)]/10 hover:text-[var(--primary)] disabled:cursor-not-allowed disabled:border-[var(--border)] disabled:bg-transparent disabled:text-[var(--muted-foreground)] disabled:opacity-40 disabled:hover:bg-transparent"
+            >
+              <ChevronLeft size={18} strokeWidth={2.5} />
+            </button>
+            <span className="text-[11px] font-semibold text-[var(--muted-foreground)]">
+              {completedCount}/{total}
+            </span>
+            <div className="flex flex-1 flex-wrap gap-1">
+              {questions.map((question, questionIndex) => {
+                const answer = answers[questionIndex];
+                const isCurrent = questionIndex === idx;
+                const done = answer?.submitted;
+                const hasThread = Boolean(
+                  followupThreads[getQuestionKey(question, questionIndex)]
+                    ?.sessionId,
+                ) || Boolean(
+                  followupThreads[getQuestionKey(question, questionIndex)]
+                    ?.messages.length,
+                );
+                const autoGradable = isAutoGradable(question);
+                const correctness: "correct" | "incorrect" | null =
+                  done && answer && autoGradable
+                    ? isAnswerCorrect(question, answer)
+                      ? "correct"
+                      : "incorrect"
+                    : null;
+                const baseChip =
+                  "flex h-6 w-6 items-center justify-center rounded-full text-[10px] font-semibold transition-all";
+                const chipClass = isCurrent
+                  ? `${baseChip} bg-[var(--primary)] text-white shadow-sm`
+                  : correctness === "correct"
+                    ? `${baseChip} bg-green-100 text-green-700 hover:bg-green-200 dark:bg-green-900/40 dark:text-green-300`
+                    : correctness === "incorrect"
+                      ? `${baseChip} bg-red-100 text-red-700 hover:bg-red-200 dark:bg-red-900/40 dark:text-red-300`
+                      : done
+                        ? `${baseChip} bg-[var(--primary)]/15 text-[var(--primary)]`
+                        : `${baseChip} bg-[var(--muted)] text-[var(--muted-foreground)] hover:bg-[var(--border)]`;
+                return (
+                  <button
+                    key={question.question_id || questionIndex}
+                    onClick={() => setIdx(questionIndex)}
+                    className={chipClass}
+                  >
+                    {done && !isCurrent && !autoGradable ? (
+                      hasThread ? (
+                        <span className="relative inline-flex">
+                          <Check size={10} />
+                          <span className="absolute -right-1 -top-1 h-1.5 w-1.5 rounded-full bg-[var(--primary)]" />
+                        </span>
+                      ) : (
+                        <Check size={10} />
+                      )
+                    ) : hasThread && done && !isCurrent ? (
+                      <span className="relative inline-flex">
+                        {questionIndex + 1}
+                        <span className="absolute -right-1 -top-1 h-1.5 w-1.5 rounded-full bg-[var(--primary)]" />
+                      </span>
+                    ) : (
+                      questionIndex + 1
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+            <button
+              type="button"
+              onClick={() => setIdx((value) => Math.min(total - 1, value + 1))}
+              disabled={idx === total - 1}
+              title={t("Next")}
+              aria-label={t("Next")}
+              className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-[var(--border)] bg-[var(--muted)]/60 text-[var(--foreground)] shadow-sm transition-colors hover:border-[var(--primary)] hover:bg-[var(--primary)]/10 hover:text-[var(--primary)] disabled:cursor-not-allowed disabled:border-[var(--border)] disabled:bg-transparent disabled:text-[var(--muted-foreground)] disabled:opacity-40 disabled:hover:bg-transparent"
+            >
+              <ChevronRight size={18} strokeWidth={2.5} />
+            </button>
+          </div>
+          <div className="h-0.5 bg-[var(--muted)]">
+            <div
+              className="h-full bg-[var(--primary)] transition-all duration-300"
+              style={{ width: `${navigationProgress}%` }}
+            />
+          </div>
+        </>
+      )}
 
       <div className="px-4 py-3">
         <div className="mb-2 flex items-center justify-between gap-2">
