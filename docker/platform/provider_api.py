@@ -8784,7 +8784,10 @@ async def api_teach_pending_all():
     """获取所有学习者的待教学任务列表。"""
     store = get_teach_store()
     sessions = store.get_all_pending(limit=50)
-    sessions = [s for s in sessions if s.source != "child_practice"]
+    # Only show WeChat-sourced sessions (parent-sent exams).
+    # Web self-uploads ("webui") and auto-generated practice ("child_practice")
+    # are self-initiated by the child — don't show as "待完成试卷" cards.
+    sessions = [s for s in sessions if s.source == "wechat"]
     return {
         "ok": True,
         "sessions": [
