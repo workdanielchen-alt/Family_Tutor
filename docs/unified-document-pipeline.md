@@ -1,6 +1,6 @@
 # DeepTutor 统一文档处理架构
 
-> 版本: 2.0 | 最后更新: 2026-06-04
+> 版本: 2.1 | 最后更新: 2026-06-05
 
 ## 目录
 
@@ -231,6 +231,8 @@ pymupdf4llm 检测到需 OCR 的区域
 ```
 
 **关键：No Tesseract。** OCR 全程走现有 MiniCPM-V / rkllama 基建。
+
+> **生产路径说明**: 当前生产代码中，扫描 PDF 的 OCR 不走 pymupdf4llm 的 `ocr_function` 回调（v1.27+ 存在合并 bug，结果 silent-drop），而是使用 `_handle_pdf()` 中的 `_pdf_manual_ocr_fallback()` — fitz 逐页渲染后 asyncio.gather 并发送 MiniCPM-V，见 §5.4。`MinicpmOCRFunc` 类保留以备 pymupdf4llm 修复后切换。
 
 ---
 
@@ -485,13 +487,17 @@ ExamPaper → JSON 序列化 → .exam.json sidecar
 
 | 端点 | 触发方式 | 触发函数 | 触发场景 |
 |------|---------|---------|---------|
-| `POST /api/kb/ingest-file` | 同步调用 | `_handle_inbound_file()` | Web UI KB 同步 |
-| `POST /api/ingest/file` | 同步调用 | `_handle_inbound_file()` | MCP 工具上传 |
-| `POST /api/process/file` | 同步调用 | `_handle_inbound_file()` | WeChat 文件上传 |
-| `POST /api/ingest/proxy/{kb}` | 同步调用 | `_handle_inbound_file()` | Web 代理上传 |
-| `POST /api/kb/sync-from-dt` | 同步调用(批量) | `_handle_inbound_file()` per file | DT 重建索引 |
-| `POST /api/extract` | 同步调用 | `_handle_inbound_file()` | 轻量提取 |
-| `POST /api/ingest/text` | 直接入库 | `provider.ingest_text()` | MCP 文本入库 (不经提取) |
+| `POST /api/process/file` | 同步调用 | `_handle_inbound_file()` | WeChat 文件 / MCP 工具上传 |
+| `POST /api/kb/ingest-file` | 同步调用 | `_handle_inbound_file()` | Web UI KB 上传后同步 |
+| `POST /api/ingest/file` | 同步调用 | `_handle_inbound_file()` | MCP 工具上传 (已废弃，统一用 process/file) |
+| `POST /api/ingest/proxy/{kb}` | 同步调用 | `_handle_inbound_file()` | Web 代理上传 (DT 内部) |
+| `POST /api/ingest/proxy` | 同步调用 | `_handle_inbound_file()` | Create KB + Ingest (新建 KB 同时上传) |
+| `POST /api/kb/sync-from-dt` | 同步调用(批量) | `_handle_inbound_file()` per file | DT 重建索引后全量同步 |
+| `POST /api/teach/start` | 同步调用 | `_ocr_file_base64()` → `_handle_inbound_file()` | Practice/WebUI 上传文件触发教学 |
+| `POST /api/extract` | 同步调用 | `_handle_inbound_file()` | 轻量提取 (无入库) |
+| `POST /api/ingest/text` | 直接入库 | `provider.ingest_text()` | MCP 文本入库 (不经文件提取) |
+| `POST /api/ocr` | 同步调用 | `provider.ocr()` | 直接 OCR 调用 (无文件归档) |
+| `POST /api/vision` | 同步调用 | `provider.vision()` | 图片描述/解题 (无文件归档) |
 
 所有文件入口额外触发 `_spawn_unified_pipeline_bg()` — fire-and-forget 后台任务，产生 `.md` / `.exam.json` sidecar。`/api/ingest/proxy/{kb}` 也已补全此调用。
 
@@ -512,7 +518,7 @@ Web UI KB 上传 scanned.pdf
        │       ① ChromaDB (平台向量库)
        │       ② DT LlamaIndex (创建 .txt → upload API 回写)
        │
-       └─ route == "text" (文字层 PDF, DT 已有完整文本)
+       └─ route == "text_extract" (文字层 PDF, DT 已有完整文本)
             → 仅写 ChromaDB (不重复写 DT)
 ```
 
@@ -520,7 +526,7 @@ Web UI KB 上传 scanned.pdf
 |------|---------|----------|--------------|------|
 | `ocr` | 图片文件 | ✅ | ✅ 双写 | OCR 出正文，DT 没有 |
 | `document_extract` | 扫描 PDF / Office | ✅ | ✅ 双写 | OCR/markitdown 出正文，DT 没有 |
-| `text` | 文字层 PDF / 纯文本 | ✅ | ❌ 不写 | DT 已有完整文本层索引 |
+| `text_extract` | 文字层 PDF / 纯文本 | ✅ | ❌ 不写 | DT 已有完整文本层索引 |
 | `ocr_fallback` | OCR 部分失败 | ❌ | ❌ | 质量不足不入库 |
 
 **`_ingest_to_kb()` 双写流程**（`provider_api.py:2039`）:
@@ -542,6 +548,8 @@ content = _enrich_with_sidecar_content(content, file_path)
 ```python
 {"doc_subtype": "text_pdf"}  # 来自 classify_file() → DocType
 ```
+
+> **关联文档**: `docs/ingestion-index-architecture.md` — 归一化入库索引方案：完整入口矩阵、格式→提取器→路由→双写决策表、ChromaDB 存储规范、Metadata Schema — 与本文档互补阅读。
 
 ---
 
