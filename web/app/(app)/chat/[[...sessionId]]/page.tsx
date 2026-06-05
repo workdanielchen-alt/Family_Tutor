@@ -32,6 +32,7 @@ import type { SelectedHistorySession } from "@/components/chat/HistorySessionPic
 import type { SelectedQuestionEntry } from "@/components/chat/QuestionBankPicker";
 import ChatComposer from "@/components/chat/home/ChatComposer";
 import { ChatMessageList } from "@/components/chat/home/ChatMessages";
+import { TeachingChatView, type TeachingMessage } from "@/components/chat/home/TeachingChatView";
 // Imported eagerly so the drawer shell is always mounted off-screen —
 // clicking a chip becomes a single CSS class flip, no chunk fetch + double
 // render. The heavy renderers inside still load lazily.
@@ -311,6 +312,8 @@ export default function ChatPage() {
 
   // ── 引导式教学：用 ref 避免渲染，纯作路由标记 ──
   const teachSessionIdRef = useRef<string | null>(null);
+  const [teachingMessages, setTeachingMessages] = useState<TeachingMessage[]>([]);
+  const [isTeachingWaiting, setIsTeachingWaiting] = useState(false);
 
 
   // ── 待处理教学任务列表（仅用于空白页提示） ──
@@ -1549,7 +1552,7 @@ export default function ChatPage() {
         }).catch(() => null);
         if (data?.ok && data.teach_session_id && data.first_question) {
           teachSessionIdRef.current = data.teach_session_id;
-          injectAssistantMessage(data.first_question);
+          setTeachingMessages([{ role: "assistant", content: data.first_question }]);
         } else {
           // fallback: 教学启动失败，改发普通消息
           sendMessage(
@@ -1909,7 +1912,40 @@ export default function ChatPage() {
             </div>
           </div>
           <div className="mx-auto flex w-full max-w-[960px] flex-1 min-h-0 flex-col overflow-hidden px-6">
-            {!hasMessages ? (
+            {teachingMessages.length > 0 && teachSessionIdRef.current ? (
+              <TeachingChatView
+                messages={teachingMessages}
+                onSendAnswer={async (answer) => {
+                  if (!teachSessionIdRef.current) return;
+                  setIsTeachingWaiting(true);
+                  setTeachingMessages((prev) => [
+                    ...prev,
+                    { role: "user", content: answer },
+                  ]);
+                  const data = await continueTeach({
+                    teach_session_id: teachSessionIdRef.current,
+                    message: answer,
+                  }).catch(() => null);
+                  if (data?.ok && data.reply) {
+                    setTeachingMessages((prev) => [
+                      ...prev,
+                      { role: "assistant", content: data.reply! },
+                    ]);
+                    if (data.done) {
+                      const sid = teachSessionIdRef.current;
+                      setTimeout(() => {
+                        if (teachSessionIdRef.current === sid) {
+                          teachSessionIdRef.current = null;
+                          setTeachingMessages([]);
+                        }
+                      }, 4000);
+                    }
+                  }
+                  setIsTeachingWaiting(false);
+                }}
+                isWaiting={isTeachingWaiting}
+              />
+            ) : !hasMessages ? (
               <div className="flex flex-1 min-h-0 flex-col items-center justify-end pb-14 animate-fade-in">
                 <div className="flex items-center justify-center gap-4">
                   <img
@@ -1966,13 +2002,25 @@ export default function ChatPage() {
                         key={s.session_id}
                         onClick={async () => {
                           try {
-                            const res = await fetch(`/api/platform/teach/session/${s.session_id}`);
-                            const data = await res.json();
-                            if (data.ok && data.first_question) {
-                              teachSessionIdRef.current = s.session_id;
-                              if (!state.sessionId) newSession();
-                              injectAssistantMessage(data.first_question);
+                            const sid = s.session_id;
+                            teachSessionIdRef.current = sid;
+                            setIsTeachingWaiting(true);
+                            if (s.current_question > 0) {
+                              const data = await continueTeach({
+                                teach_session_id: sid,
+                                message: "继续",
+                              }).catch(() => null);
+                              if (data?.ok && data.reply) {
+                                setTeachingMessages([{ role: "assistant", content: data.reply! }]);
+                              }
+                            } else {
+                              const res = await fetch(`/api/platform/teach/session/${sid}`);
+                              const data = await res.json();
+                              if (data.ok && data.first_question) {
+                                setTeachingMessages([{ role: "assistant", content: data.first_question }]);
+                              }
                             }
+                            setIsTeachingWaiting(false);
                           } catch { /* ignore */ }
                         }}
                         className="flex w-full items-center justify-between rounded-xl border border-[var(--border)]/60 bg-[var(--card)] px-4 py-3 text-left shadow-sm transition-all hover:border-[var(--primary)]/40 hover:bg-[var(--primary)]/[0.03]"
