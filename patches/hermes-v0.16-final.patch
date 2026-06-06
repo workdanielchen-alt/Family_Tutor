@@ -1,0 +1,819 @@
+--- a/vendor/hermes-agent/gateway/platforms/weixin.py
++++ b/vendor/hermes-agent/gateway/platforms/weixin.py
+@@ -37,6 +37,7 @@
+ 
+ try:
+     import aiohttp
++    from aiohttp import web
+ 
+     AIOHTTP_AVAILABLE = True
+ except ImportError:  # pragma: no cover - dependency gate
+@@ -378,16 +379,12 @@
+ ) -> Dict[str, Any]:
+     body = _json_dumps({**payload, "base_info": _base_info()})
+     url = f"{base_url.rstrip('/')}/{endpoint}"
+-    # Use asyncio.wait_for() instead of aiohttp ClientTimeout to avoid
+-    # "Timeout context manager should be used inside a task" errors when
+-    # invoked via asyncio.run_coroutine_threadsafe() from cron jobs.
+-    async def _do() -> Dict[str, Any]:
+-        async with session.post(url, data=body, headers=_headers(token, body)) as response:
+-            raw = await response.text()
+-            if not response.ok:
+-                raise RuntimeError(f"iLink POST {endpoint} HTTP {response.status}: {raw[:200]}")
+-            return json.loads(raw)
+-    return await asyncio.wait_for(_do(), timeout=timeout_ms / 1000)
++    timeout = aiohttp.ClientTimeout(total=timeout_ms / 1000)
++    async with session.post(url, data=body, headers=_headers(token, body), timeout=timeout) as response:
++        raw = await response.text()
++        if not response.ok:
++            raise RuntimeError(f"iLink POST {endpoint} HTTP {response.status}: {raw[:200]}")
++        return json.loads(raw)
+ 
+ 
+ async def _api_get(
+@@ -402,16 +399,12 @@
+         "iLink-App-Id": ILINK_APP_ID,
+         "iLink-App-ClientVersion": str(ILINK_APP_CLIENT_VERSION),
+     }
+-    # Use asyncio.wait_for() instead of aiohttp ClientTimeout to avoid
+-    # "Timeout context manager should be used inside a task" errors when
+-    # invoked via asyncio.run_coroutine_threadsafe() from cron jobs.
+-    async def _do() -> Dict[str, Any]:
+-        async with session.get(url, headers=headers) as response:
+-            raw = await response.text()
+-            if not response.ok:
+-                raise RuntimeError(f"iLink GET {endpoint} HTTP {response.status}: {raw[:200]}")
+-            return json.loads(raw)
+-    return await asyncio.wait_for(_do(), timeout=timeout_ms / 1000)
++    timeout = aiohttp.ClientTimeout(total=timeout_ms / 1000)
++    async with session.get(url, headers=headers, timeout=timeout) as response:
++        raw = await response.text()
++        if not response.ok:
++            raise RuntimeError(f"iLink GET {endpoint} HTTP {response.status}: {raw[:200]}")
++        return json.loads(raw)
+ 
+ 
+ async def _get_updates(
+@@ -664,6 +657,52 @@
+     if row.endswith("|"):
+         row = row[:-1]
+     return [cell.strip() for cell in row.split("|")]
++
++
++def _rewrite_headers_for_weixin(line: str) -> str:
++    match = _HEADER_RE.match(line)
++    if not match:
++        return line.rstrip()
++    level = len(match.group(1))
++    title = match.group(2).strip()
++    if level == 1:
++        return f"【{title}】"
++    return f"**{title}**"
++
++
++def _rewrite_table_block_for_weixin(lines: List[str]) -> str:
++    if len(lines) < 2:
++        return "\n".join(lines)
++    headers = _split_table_row(lines[0])
++    body_rows = [_split_table_row(line) for line in lines[2:] if line.strip()]
++    if not headers or not body_rows:
++        return "\n".join(lines)
++
++    formatted_rows: List[str] = []
++    for row in body_rows:
++        pairs = []
++        for idx, header in enumerate(headers):
++            if idx >= len(row):
++                break
++            label = header or f"Column {idx + 1}"
++            value = row[idx].strip()
++            if value:
++                pairs.append((label, value))
++        if not pairs:
++            continue
++        if len(pairs) == 1:
++            label, value = pairs[0]
++            formatted_rows.append(f"- {label}: {value}")
++            continue
++        if len(pairs) == 2:
++            label, value = pairs[0]
++            other_label, other_value = pairs[1]
++            formatted_rows.append(f"- {label}: {value}")
++            formatted_rows.append(f"  {other_label}: {other_value}")
++            continue
++        summary = " | ".join(f"{label}: {value}" for label, value in pairs)
++        formatted_rows.append(f"- {summary}")
++    return "\n".join(formatted_rows) if formatted_rows else "\n".join(lines)
+ 
+ 
+ def _normalize_markdown_blocks(content: str) -> str:
+@@ -1156,6 +1195,23 @@
+         self._poll_task: Optional[asyncio.Task] = None
+         self._dedup = MessageDeduplicator(ttl_seconds=MESSAGE_DEDUP_TTL_SECONDS)
+ 
++        # ==== HERMES PATCH 2026-05-22: teaching session tracking for DT follow-up ====
++        # _is_child: 子网关(学生)走教学流程, 父网关(家长)走 HA agent
++        self._is_child = hermes_home.endswith("/child")
++        # _teaching_sessions: chat_id → {state, started_at, last_active, question_num, total_questions}
++        self._teaching_sessions: dict[str, dict] = {}
++        self._auto_processing_senders: set[str] = set()
++        self._teaching_sessions_path = Path(hermes_home) / "weixin" / "teaching_sessions.json"
++        self._load_teaching_sessions()
++        # ==== END HERMES PATCH ====
++
++        # ==== HERMES PATCH 2026-05-28: report notification consumer ====
++        self._report_notif_task: Optional[asyncio.Task] = None
++        # ==== END HERMES PATCH ====
++        # ==== HERMES PATCH 2026-05-30: per-learner teaching concurrency guard ====
++        self._running_teachings: set[str] = set()
++        # ==== END HERMES PATCH ====
++
+         self._account_id = str(extra.get("account_id") or os.getenv("WEIXIN_ACCOUNT_ID", "")).strip()
+         self._token = str(config.token or extra.get("token") or os.getenv("WEIXIN_TOKEN", "")).strip()
+         self._base_url = str(extra.get("base_url") or os.getenv("WEIXIN_BASE_URL", ILINK_BASE_URL)).strip().rstrip("/")
+@@ -1188,47 +1244,11 @@
+             default=False,
+         )
+ 
+-        # Text debounce batching (mirrors Telegram adapter pattern).
+-        # iLink delivers messages individually, so rapid multi-message
+-        # bursts (forwarded batches, paste-splits) each trigger a
+-        # separate agent invocation.  Default 3s delay / 5s split delay
+-        # are tuned for iLink's typical delivery cadence.  Tunable via
+-        # config.yaml under
+-        # ``gateway.platforms.weixin.extra.text_batch_delay_seconds`` /
+-        # ``text_batch_split_delay_seconds``.
+-        self._text_batch_delay_seconds = self._coerce_float_extra(
+-            "text_batch_delay_seconds", 3.0
+-        )
+-        self._text_batch_split_delay_seconds = self._coerce_float_extra(
+-            "text_batch_split_delay_seconds", 5.0
+-        )
+-        self._pending_text_batches: Dict[str, MessageEvent] = {}
+-        self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+-
+         if self._account_id and not self._token:
+             persisted = load_weixin_account(hermes_home, self._account_id)
+             if persisted:
+                 self._token = str(persisted.get("token") or "").strip()
+                 self._base_url = str(persisted.get("base_url") or self._base_url).strip().rstrip("/")
+-
+-    def _coerce_float_extra(self, key: str, default: float) -> float:
+-        """Read a float from ``config.extra``, guarding against bad/non-finite values.
+-
+-        The result is fed directly to ``asyncio.sleep()``, so NaN/Inf and
+-        unparseable values fall back to ``default``.
+-        """
+-        import math
+-
+-        value = self.config.extra.get(key) if getattr(self.config, "extra", None) else None
+-        if value is None:
+-            return float(default)
+-        try:
+-            parsed = float(value)
+-        except (TypeError, ValueError):
+-            return float(default)
+-        if not math.isfinite(parsed) or parsed < 0:
+-            return float(default)
+-        return parsed
+ 
+     @staticmethod
+     def _coerce_list(value: Any) -> List[str]:
+@@ -1272,6 +1292,11 @@
+         self._send_session = aiohttp.ClientSession(trust_env=True, connector=_make_ssl_connector(), timeout=_no_aiohttp_timeout)
+         self._token_store.restore(self._account_id)
+         self._poll_task = asyncio.create_task(self._poll_loop(), name="weixin-poll")
++        # ==== HERMES PATCH 2026-05-28: report notification consumer ====
++        self._report_notif_task = asyncio.create_task(
++            self._consume_report_notifications(), name="weixin-report"
++        )
++        # ==== END HERMES PATCH ====
+         self._mark_connected()
+         _LIVE_ADAPTERS[self._token] = self
+         logger.info("[%s] Connected account=%s base=%s", self.name, _safe_id(self._account_id), self._base_url)
+@@ -1291,11 +1316,6 @@
+     async def disconnect(self) -> None:
+         _LIVE_ADAPTERS.pop(self._token, None)
+         self._running = False
+-        for task in self._pending_text_batch_tasks.values():
+-            if not task.done():
+-                task.cancel()
+-        self._pending_text_batches.clear()
+-        self._pending_text_batch_tasks.clear()
+         if self._poll_task and not self._poll_task.done():
+             self._poll_task.cancel()
+             try:
+@@ -1303,6 +1323,29 @@
+             except asyncio.CancelledError:
+                 pass
+         self._poll_task = None
++        # ==== HERMES PATCH 2026-05-28: callback server cleanup ====
++        if self._callback_runner:
++            try:
++                await self._callback_runner.cleanup()
++            except Exception:
++                pass
++            self._callback_runner = None
++            self._callback_site = None
++        if self._callback_task and not self._callback_task.done():
++            self._callback_task.cancel()
++            try:
++                await self._callback_task
++            except (asyncio.CancelledError, Exception):
++                pass
++        self._callback_task = None
++        if self._report_notif_task and not self._report_notif_task.done():
++            self._report_notif_task.cancel()
++            try:
++                await self._report_notif_task
++            except (asyncio.CancelledError, Exception):
++                pass
++        self._report_notif_task = None
++        # ==== END HERMES PATCH ====
+         if self._poll_session and not self._poll_session.closed:
+             await self._poll_session.close()
+         self._poll_session = None
+@@ -1444,10 +1487,34 @@
+             timestamp=datetime.now(),
+         )
+         logger.info("[%s] inbound from=%s type=%s media=%d", self.name, _safe_id(sender_id), source.chat_type, len(media_paths))
+-        if event.message_type == MessageType.TEXT:
+-            self._enqueue_text_event(event)
++
++        # ==== HERMES PATCH: Acquire LLM lock before OCR (best-effort, no wait) ====
++        _lock_held = False
++        try:
++            platform_url = os.getenv("PLATFORM_API_URL", "http://platform:8100")
++            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as _lock_session:
++                async with _lock_session.post(
++                    f"{platform_url}/api/llm/acquire",
++                    params={"timeout": "0"},
++                ) as _lock_resp:
++                    if _lock_resp.status == 200:
++                        _lock_held = True
++        except Exception:
++            logger.debug("[%s] LLM lock acquire failed (non-fatal)", self.name)
++        # ==== END HERMES PATCH ====
++
++        # ==== HERMES PATCH: Dual-gateway routing + three-state teaching ====
++        if self._is_child:
++            # 子网关 → 完整教学路由（三态会话引擎）
++            await self._route_child_message(event, text, media_paths, effective_chat_id, sender_id)
++            return
+         else:
+-            await self.handle_message(event)
++            # 父网关 → 简化路由（不教学）
++            await self._route_parent_message(event, text, media_paths, effective_chat_id)
++            return
++        # ==== END HERMES PATCH ====
++
++        await self.handle_message(event)
+ 
+     def _is_dm_allowed(self, sender_id: str) -> bool:
+         if self._dm_policy == "disabled":
+@@ -1455,76 +1522,6 @@
+         if self._dm_policy == "allowlist":
+             return sender_id in self._allow_from
+         return True
+-
+-    @property
+-    def enforces_own_access_policy(self) -> bool:
+-        """Weixin gates DM/group access at intake via dm_policy/group_policy."""
+-        return True
+-
+-    # ------------------------------------------------------------------
+-    # Text debounce batching
+-    # ------------------------------------------------------------------
+-
+-    _SPLIT_THRESHOLD = 1800  # iLink chunks at ~2048 chars
+-
+-    def _text_batch_key(self, event: MessageEvent) -> str:
+-        """Session-scoped key for text message batching."""
+-        from gateway.session import build_session_key
+-        return build_session_key(
+-            event.source,
+-            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+-            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+-        )
+-
+-    def _enqueue_text_event(self, event: MessageEvent) -> None:
+-        """Buffer a text event and reset the flush timer.
+-
+-        When users forward multiple messages or send rapid-fire texts
+-        via WeChat, each arrives as a separate iLink message. This
+-        concatenates them and waits for a short quiet period before
+-        dispatching the combined message.
+-        """
+-        key = self._text_batch_key(event)
+-        existing = self._pending_text_batches.get(key)
+-        chunk_len = len(event.text or "")
+-        if existing is None:
+-            event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
+-            self._pending_text_batches[key] = event
+-        else:
+-            if event.text:
+-                existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
+-            existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
+-            if event.media_urls:
+-                existing.media_urls.extend(event.media_urls)
+-                existing.media_types.extend(event.media_types)
+-
+-        prior_task = self._pending_text_batch_tasks.get(key)
+-        if prior_task and not prior_task.done():
+-            prior_task.cancel()
+-        self._pending_text_batch_tasks[key] = asyncio.create_task(
+-            self._flush_text_batch(key)
+-        )
+-
+-    async def _flush_text_batch(self, key: str) -> None:
+-        """Wait for quiet period then dispatch aggregated text."""
+-        current_task = asyncio.current_task()
+-        try:
+-            pending = self._pending_text_batches.get(key)
+-            last_len = getattr(pending, "_last_chunk_len", 0) if pending else 0
+-            if last_len >= self._SPLIT_THRESHOLD:
+-                delay = self._text_batch_split_delay_seconds
+-            else:
+-                delay = self._text_batch_delay_seconds
+-            await asyncio.sleep(delay)
+-            if self._pending_text_batch_tasks.get(key) is not current_task:
+-                return
+-            event = self._pending_text_batches.pop(key, None)
+-            if not event:
+-                return
+-            await self.handle_message(event)
+-        finally:
+-            if self._pending_text_batch_tasks.get(key) is current_task:
+-                self._pending_text_batch_tasks.pop(key, None)
+ 
+     async def _collect_media(self, item: Dict[str, Any], media_paths: List[str], media_types: List[str]) -> None:
+         item_type = item.get("type")
+@@ -2145,6 +2142,468 @@
+             return ""
+         return _wrap_copy_friendly_lines_for_weixin(_normalize_markdown_blocks(content))
+ 
++    # ==== HERMES PATCH 2026-05-28: report notification consumer ====
++    async def _consume_report_notifications(self) -> None:
++        """Poll for report-push notifications from the platform API."""
++        _notif_dir = Path(self._hermes_home) / "weixin" / "notifications"
++        _notif_dir.mkdir(parents=True, exist_ok=True)
++        while self._running:
++            try:
++                for f in sorted(_notif_dir.glob("*.json"), key=lambda p: p.stat().st_mtime):
++                    if f.suffix != ".json":
++                        continue
++                    if f.name.endswith(".consumed"):
++                        continue
++                    try:
++                        with open(f, encoding="utf-8") as fh:
++                            notif = json.load(fh)
++                        if notif.get("type") != "report_push":
++                            continue
++                        if notif.get("target") and notif["target"] != self._account_id:
++                            continue
++                        _content = notif.get("content", "")
++                        _chat_id = notif.get("chat_id", "")
++                        if _chat_id and _content:
++                            await self.send(content=_content, chat_id=_chat_id)
++                        consumed = f.with_suffix(".consumed")
++                        f.rename(consumed)
++                    except Exception:
++                        logger.debug("[%s] Report notification check failed", self.name)
++            except Exception:
++                logger.debug("[%s] Report notification check failed", self.name)
++            await asyncio.sleep(3)
++    # ==== END HERMES PATCH ====
++
++    # _start_callback_server / _handle_tutor_callback / _deliver_tutor_reply 已删除
++    # (Path 2 HTTP 回调路径). 教学回复统一走 _run_teaching_flow 同步路径.
++    # 报告推送走 _consume_report_notifications 文件轮询路径.
++
++    async def _run_teaching_flow(
++        self,
++        effective_chat_id: str,
++        message: str,
++        platform_url: str,
++        is_new_file: bool,
++        media_paths: Optional[List[str]] = None,
++        is_image: bool = False,
++    ) -> None:
++        """Fire-and-forget teaching flow."""
++        if effective_chat_id in self._running_teachings:
++            # Stale guard (120s TTL): if previous flow hung, force-clear and retry
++            _now_ts = time.time()
++            if _now_ts - getattr(self, "_teaching_start", {}).get(effective_chat_id, 0) > 120:
++                logger.warning("[%s] Stale teaching guard for %s (>120s), force-clearing", self.name, effective_chat_id)
++                self._running_teachings.discard(effective_chat_id)
++            else:
++                logger.debug("[%s] Teaching already running for %s, skipping", self.name, effective_chat_id)
++                try:
++                    await self.send(content=" 正在处理，请稍候...", chat_id=effective_chat_id)
++                except Exception:
++                    pass
++                return
++        self._running_teachings.add(effective_chat_id)
++        if not hasattr(self, "_teaching_start"):
++            self._teaching_start: dict[str, float] = {}
++        self._teaching_start[effective_chat_id] = time.time()
++        _start = time.time()
++        try:
++            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=180)) as session:
++                # ── File path: extract text from ALL pages, then teach ──
++                # Handles images (OCR), Office docs, PDFs — any file type.
++                _teach_context = ""
++                _page_count = 0
++                if media_paths:
++                    _page_texts: list[str] = []
++                    for _idx, _fp in enumerate(media_paths):
++                        _filename = os.path.basename(_fp)
++                        try:
++                            with open(_fp, "rb") as f:
++                                form = aiohttp.FormData()
++                                form.add_field("file", f, filename=_filename)
++                                form.add_field("learner_id", effective_chat_id)
++                                form.add_field("suppress_auto_teach", "1")
++                                resp = await session.post(
++                                    f"{platform_url}/api/process/file",
++                                    data=form,
++                                )
++                            if resp.status == 200:
++                                data = await resp.json()
++                                if data.get("ok") and data.get("content"):
++                                    # Skip passthrough (fallback placeholder) — it's a system
++                                    # error message, not teachable content.
++                                    if data.get("route") == "passthrough":
++                                        logger.info(
++                                            "[%s] File extraction failed for %s: %s",
++                                            self.name, _filename, data.get("content", "")[:100],
++                                        )
++                                        continue
++                                    _txt = data["content"].strip()
++                                    if _txt:
++                                        _page_texts.append(f"--- 第{_idx+1}页 ---\n{_txt}")
++                                        _page_count += 1
++                                        logger.info(
++                                            "[%s] OCR page %d: %d chars for %s",
++                                            self.name, _idx + 1, len(_txt), effective_chat_id,
++                                        )
++                                        # Per-page progress skipped — keep "1 card" UX per user feedback
++                        except Exception as exc:
++                            logger.warning(
++                                "[%s] OCR failed for page %d (%s): %s",
++                                self.name, _idx + 1, _filename, exc,
++                            )
++                    if _page_texts:
++                        _teach_context = "\n\n".join(_page_texts)
++
++                # ── Keep total_questions init; skip "preparing questions" msg (1-card UX) ──
++                if _page_count > 0:
++                    _cur = self._teaching_sessions.get(effective_chat_id)
++                    if isinstance(_cur, dict):
++                        _cur["total_questions"] = 0
++                        self._save_teaching_sessions()
++
++                # ── Build the teaching message ──
++                # Initialize defaults for both OCR-success and text-only paths
++                _teach_msg = message if (
++                    message and not message.startswith("请分析这份")
++                ) else ""
++                _teach_ctx = ""
++
++                if media_paths and not _teach_context:
++                    # All file extractions failed — send fallback reply directly.
++                    # Never call tutor/chat with empty context — that would reuse
++                    # stale cached exam text from a previous session.
++                    self._running_teachings.discard(effective_chat_id)
++                    try:
++                        await asyncio.wait_for(
++                            self.send(
++                                content=(
++                                    "收到您的文件，但系统未能成功提取其中的文字内容"
++                                    "（可能是扫描件或图片格式）。请检查文件是否清晰，"
++                                    "或重新发送一份可复制的文字版试题，我会立即为您开始出题和辅导。"
++                                ),
++                                chat_id=effective_chat_id,
++                            ),
++                            timeout=15,
++                        )
++                    except asyncio.TimeoutError:
++                        logger.warning(
++                            "[%s] Fallback reply send timed out for %s",
++                            self.name, effective_chat_id,
++                        )
++                    return
++
++                if _teach_context:
++                    # Image with OCR: use extracted text as context
++                    _teach_ctx = _teach_context
++
++                # Pass total_questions from session so platform can detect completion
++                _tq = 0
++                _cur_s = self._teaching_sessions.get(effective_chat_id)
++                if isinstance(_cur_s, dict):
++                    _tq = _cur_s.get("total_questions", 0)
++                resp = await asyncio.wait_for(
++                    session.post(
++                        f"{platform_url}/api/tutor/chat",
++                        json={
++                            "message": _teach_msg,
++                            "learner_id": effective_chat_id,
++                            "context": _teach_ctx,
++                            "mode": "guide",
++                            "total_questions": _tq,
++                        },
++                    ),
++                    timeout=90,
++                )
++                if resp.status == 200:
++                    data = await resp.json()
++                    reply = data.get("content", "") if data.get("ok") else ""
++                    if reply:
++                        # Release the concurrency guard BEFORE iLink send
++                        # (5-10s).  Otherwise a fast student follow-up during
++                        # the send window gets blocked with no feedback.
++                        self._running_teachings.discard(effective_chat_id)
++                        try:
++                            await asyncio.wait_for(
++                                self.send(content=reply, chat_id=effective_chat_id),
++                                timeout=15,
++                            )
++                        except asyncio.TimeoutError:
++                            logger.warning(
++                                "[%s] WeChat send timed out for %s (rate limited?)",
++                                self.name, effective_chat_id,
++                            )
++                        # Update session (don't overwrite with timestamp)
++                        _cur = self._teaching_sessions.get(effective_chat_id)
++                        if isinstance(_cur, dict):
++                            _cur["last_active"] = time.time()
++                            # Extract question number from reply
++                            _qn_m = re.search(r"第\s*(\d+)\s*[题/]", reply)
++                            if _qn_m:
++                                _cur["question_num"] = int(_qn_m.group(1))
++                            # Detect total questions
++                            _tq_m = re.search(r"第\d+[题/]\s*(\d+)", reply)
++                            if _tq_m:
++                                _cur["total_questions"] = int(_tq_m.group(1))
++                        else:
++                            # Fallback: create new session
++                            self._teaching_sessions[effective_chat_id] = self._new_session("active")
++                        self._save_teaching_sessions()
++                        logger.info(
++                            "[%s] Tutor reply sent to %s (%d chars, %.1fs)",
++                            self.name, effective_chat_id, len(reply), time.time() - _start,
++                        )
++                        return
++
++                # Fallback: if tutor_chat returned no content, try agent
++                logger.warning("[%s] Tutor chat returned empty, falling back", self.name)
++        except Exception as exc:
++            logger.warning("[%s] Tutor chat failed, falling back to agent: %s", self.name, exc)
++        finally:
++            self._running_teachings.discard(effective_chat_id)
++            if hasattr(self, "_teaching_start"):
++                self._teaching_start.pop(effective_chat_id, None)
++
++        # Teaching session is preserved so the next student message retries
++        # automatically.
++        try:
++            await self.send(
++                content=" 教学未响应，请重试",
++                chat_id=effective_chat_id,
++            )
++        except Exception:
++            pass
++        logger.warning(
++            "[%s] Tutor flow failed for %s, session preserved for retry",
++            self.name, effective_chat_id,
++        )
++
++    def _build_dummy_event(self, chat_id: str, text: str) -> "MessageEvent":
++        """Build a minimal MessageEvent for fallback agent processing."""
++        from gateway.platforms.base import MessageEvent, MessageType
++        source = self.build_source(chat_id=chat_id, chat_type="dm", user_id=chat_id, user_name=chat_id)
++        return MessageEvent(
++            text=text, message_type=MessageType.TEXT, source=source,
++            message_id="", raw_message={}, timestamp=datetime.now(),
++        )
++
++    @staticmethod
++    def _new_session(state: str = "active", question_num: int = 0,
++                     total_questions: int = 0, trace_id: str = "") -> dict:
++        _now = time.time()
++        return {
++            "state": state,
++            "started_at": _now,
++            "last_active": _now,
++            "question_num": question_num,
++            "total_questions": total_questions,
++            "trace_id": trace_id,
++            "answered_count": 0,
++        }
++
++    def _load_teaching_sessions(self) -> None:
++        """Load persisted teaching sessions from disk.
++        
++        ɢ Supports both old (timestamp) and new (dict) disk formats.
++        """
++        try:
++            if self._teaching_sessions_path.exists():
++                data = json.loads(self._teaching_sessions_path.read_text(encoding="utf-8"))
++                now = time.time()
++                for k, v in data.items():
++                    if isinstance(v, (int, float)):
++                        # Old format: timestamp → migrate to dict
++                        if now - v < 7200:
++                            self._teaching_sessions[k] = self._new_session("active")
++                            self._teaching_sessions[k]["last_active"] = v
++                    elif isinstance(v, dict):
++                        # New format: dict with state
++                        _state = v.get("state", "active")
++                        _last = v.get("last_active", v.get("started_at", now))
++                        if now - _last < 7200:
++                            self._teaching_sessions[k] = v
++        except Exception:
++            pass
++
++    def _save_teaching_sessions(self) -> None:
++        """Persist teaching sessions to disk."""
++        try:
++            self._teaching_sessions_path.write_text(
++                json.dumps(self._teaching_sessions, ensure_ascii=False), encoding="utf-8"
++            )
++        except Exception:
++            pass
++
++    # ── 子网关路由：三态会话教学引擎 ────────────────────────────
++    # P1-5: Extended pause/resume signals for child-friendly expressions
++    _PAUSE_SIGNALS = {"累了", "休息一下", "聊会天", "想聊天",
++                      "不学了", "先不学了", "休息", "歇会",
++                      "先休息", "不想学了", "聊聊天", "说会话",
++                      "等一下", "妈妈叫我", "吃饭了", "要走了",
++                      "下次再做", "先不做了", "先放这", "等会儿",
++                      "先去", "有事", "待会", "先不学了",
++                      "不想做了", "太累了", "困了", "歇会",
++                      "离开一下"}
++    _RESUME_SIGNALS = {"继续", "接着", "回来", "好了",
++                       "继续做题", "接着学", "开始学习",
++                       "回来做题", "继续学习", "开始做题",
++                       "回来了", "来了", "做完了", "我好了",
++                       "我又来了", "继续吧", "开始吧", "来吧",
++                       "我回来了", "好了继续"}
++
++    async def _route_child_message(
++        self, event, text: str, media_paths: list,
++        chat_id: str, sender_id: str,
++    ) -> None:
++        """子网关：三态会话路由（教学 ↔ 暂停 ↔ 无会话）"""
++        _session = self._teaching_sessions.get(chat_id) or \
++                   self._teaching_sessions.get(sender_id)
++        _is_file = bool(media_paths)
++        _now = time.time()
++
++        # ── 1. 新文件 → 总是重置教学 ──
++        if _is_file:
++            self._teaching_sessions[chat_id] = self._new_session("active")
++            self._save_teaching_sessions()
++            platform_url = os.getenv("PLATFORM_API_URL", "http://platform:8100")
++            # P0-1: Staged feedback — immediate acknowledgment
++            try:
++                _ack = "📎 收到！正在读题"
++                if len(media_paths) > 1:
++                    _ack += f"（共{len(media_paths)}页）"
++                _ack += "..."
++                await self.send(content=_ack, chat_id=chat_id)
++            except Exception:
++                pass
++            asyncio.create_task(self._run_teaching_flow(
++                chat_id, "", platform_url, True, media_paths, False,
++            ))
++            return
++
++        # ── 2. 教学态（Active）──
++        if _session and _session.get("state") == "active":
++            # 检查过期
++            if _now - _session.get("last_active", _now) > 7200:
++                self._teaching_sessions.pop(chat_id, None)
++                self._teaching_sessions.pop(sender_id, None)
++                self._save_teaching_sessions()
++                await self.handle_message(event)
++                return
++
++            # 暂停信号 → 切换暂停态
++            if text.strip() in self._PAUSE_SIGNALS or \
++               any(text.strip().startswith(kw) for kw in ("累了", "休息", "聊")):
++                _session["state"] = "paused"
++                _session["last_active"] = _now
++                self._save_teaching_sessions()
++                logger.info("[%s] Teaching paused for %s", self.name, chat_id)
++                try:
++                    await self.send(
++                        content=" 好的，休息一下~ 随时说「继续做题」回来学习！",
++                        chat_id=chat_id,
++                    )
++                except Exception:
++                    pass
++                return
++
++            # P2-9: Idle detection — only after student has answered at least once
++            _idle = _now - _session.get("last_active", _now)
++            if _idle > 600 and _session.get("answered_count", 0) > 0:
++                # 10+ minutes idle → auto pause, let student resume explicitly
++                _session["state"] = "paused"
++                _session["last_active"] = _now
++                self._save_teaching_sessions()
++                try:
++                    await self.send(
++                        content=" 你很久没回复了，先休息一下~ 说「继续做题」回来继续！",
++                        chat_id=chat_id,
++                    )
++                except Exception:
++                    pass
++                return
++            elif _idle > 300 and _session.get("answered_count", 0) > 0:
++                # 5-10 minutes idle → gentle nudge
++                try:
++                    await self.send(
++                        content=" 还在吗？需要提示的话告诉老师哦~",
++                        chat_id=chat_id,
++                    )
++                except Exception:
++                    pass
++                # Continue to tutor_chat — don't return
++
++            # Increment answered_count for idle detection (skip for "继续" placeholder)
++            _answered = _session.get("answered_count", 0)
++            if text.strip() and text.strip() != "继续":
++                _session["answered_count"] = _answered + 1
++                self._save_teaching_sessions()
++
++            # 其他所有消息（答案、问问题、请求讲解、闲聊）→ tutor_chat
++            _msg = text.strip() if text.strip() else "继续"
++            platform_url = os.getenv("PLATFORM_API_URL", "http://platform:8100")
++            self._teaching_sessions[chat_id] = _session
++            self._save_teaching_sessions()
++            asyncio.create_task(self._run_teaching_flow(
++                chat_id, _msg, platform_url, False, [], False,
++            ))
++            return
++
++        # ── 3. 暂停态（Paused）──
++        if _session and _session.get("state") == "paused":
++            # 检查过期
++            if _now - _session.get("last_active", _now) > 7200:
++                self._teaching_sessions.pop(chat_id, None)
++                self._teaching_sessions.pop(sender_id, None)
++                self._save_teaching_sessions()
++                await self.handle_message(event)
++                return
++
++            # 恢复信号 → 切回教学态
++            if text.strip() in self._RESUME_SIGNALS or \
++               any(text.strip().startswith(kw) for kw in ("继续", "接着", "回来", "好了继续")):
++                _session["state"] = "active"
++                _session["last_active"] = _now
++                self._save_teaching_sessions()
++                _qn = _session.get("question_num", 0)
++                try:
++                    await self.send(
++                        content=f" 好，回来了！继续学习！",
++                        chat_id=chat_id,
++                    )
++                except Exception:
++                    pass
++                logger.info("[%s] Teaching resumed for %s (q%d)", self.name, chat_id, _qn)
++                platform_url = os.getenv("PLATFORM_API_URL", "http://platform:8100")
++                asyncio.create_task(self._run_teaching_flow(
++                    chat_id, text.strip() or "继续", platform_url, False, [], False,
++                ))
++                return
++
++            # 暂停态其他消息 → HA 闲聊
++            await self.handle_message(event)
++            return
++
++        # ── 4. 无会话 → HA agent（默认）──
++        await self.handle_message(event)
++
++    # ── 父网关路由：简化消息处理 ─────────────────────────────
++    async def _route_parent_message(
++        self, event, text: str, media_paths: list, chat_id: str,
++    ) -> None:
++        """父网关：不教学，文件提示+文字走 HA agent（MCP 工具处理）"""
++        if media_paths:
++            try:
++                await self.send(
++                    content=" 这是孩子的学习功能哦，让孩子直接发给我吧~\n"
++                            "您可以发「出练习题」给孩子布置作业，"
++                            "或发「学习报告」查看学习情况。",
++                    chat_id=chat_id,
++                )
++            except Exception:
++                pass
++            return
++        await self.handle_message(event)
++    # ==== END HERMES PATCH ====
++
+ 
+ async def send_weixin_direct(
+     *,
