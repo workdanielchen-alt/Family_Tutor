@@ -98,6 +98,13 @@ services:
       - ./config/hermes_child_config.yaml:/opt/data/child/config.yaml:ro
       - ./vendor/hermes-agent/run_agent.py:/opt/hermes/run_agent.py:ro
       - ./vendor/hermes-agent/gateway/platforms/weixin.py:/opt/hermes/gateway/platforms/weixin.py:ro
+      - ./vendor/hermes-agent/gateway/platforms/base.py:/opt/hermes/gateway/platforms/base.py:ro
+      - ./vendor/hermes-agent/gateway/config.py:/opt/hermes/gateway/config.py:ro
+      - ./vendor/hermes-agent/gateway/delivery.py:/opt/hermes/gateway/delivery.py:ro
+      - ./vendor/hermes-agent/gateway/run.py:/opt/hermes/gateway/run.py:ro
+      - ./vendor/hermes-agent/gateway/session.py:/opt/hermes/gateway/session.py:ro
+      - ./vendor/hermes-agent/gateway/session_context.py:/opt/hermes/gateway/session_context.py:ro
+      - ./vendor/hermes-agent/gateway/status.py:/opt/hermes/gateway/status.py:ro
       - ./docker/platform/gateway_start.sh:/opt/hermes/docker/gateway_start.sh:ro
     networks:
       - deeptutor-network
