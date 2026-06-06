@@ -1,0 +1,22 @@
+# WSL2 Global Configuration
+# Applied to all WSL2 distros, effective after wsl --shutdown
+
+[wsl2]
+# Memory limit for WSL 2 VM
+memory=4GB
+
+# Number of processors
+processors=4
+
+# Swap size
+swap=2GB
+
+# Reclaim cached memory via Linux kernel
+kernelCommandLine=reclaim_managed_pages=1
+
+[experimental]
+# Automatically release unused memory back to host
+autoMemoryReclaim=gradual
+
+# Automatically mark VHDX as sparse — freed space inside WSL is returned to host
+sparseVhd=true

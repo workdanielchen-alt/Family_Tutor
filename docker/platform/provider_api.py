@@ -1458,10 +1458,9 @@ async def _handle_pdf(file_path: str, trace_id: str, kb_name: str = "", filename
 async def _pdf_manual_ocr_fallback(file_path: str, trace_id: str, kb_name: str = "", filename: str = "") -> str:
     """Manual PDF OCR: fitz render each page → OpenCV preprocess → OCR.
 
-    When ``kb_name`` is provided (incremental/resumable mode):
-      - Before OCRing a page, checks ChromaDB for existing results (by filename + page_number).
-      - After each 5-page batch, writes OCR results to ChromaDB immediately.
-      - Interrupted runs can resume by re-invoking with the same ``kb_name`` / ``filename``.
+    Uses file-based checkpoints (JSON in /data/ocr_checkpoints/) for resume
+    on container restart.  Checkpoints never touch ChromaDB — only the final
+    chunked+embedded index goes there via ``_sync_kb_from_dt``.
     """
     try:
         import fitz
@@ -1475,34 +1474,35 @@ async def _pdf_manual_ocr_fallback(file_path: str, trace_id: str, kb_name: str =
 
     num_pages = min(len(doc), 200)  # cap at 200 pages
     pages_text: list[str] = [""] * num_pages  # pre-allocate, fill by index
-    _chroma_kb = _chromadb_kb_name(kb_name) if kb_name else ""
 
-    # ── Pre-check: skip pages already in ChromaDB (resume from last checkpoint) ──
-    if _chroma_kb:
-        try:
-            import chromadb as _ch
-            from chromadb.config import Settings as _CS
-            _c = _ch.PersistentClient(path=os.environ.get("CHROMA_PERSIST_DIR", "/data/chromadb"), settings=_CS(anonymized_telemetry=False))
-            _coll = _c.get_or_create_collection(name=_chroma_kb)
-            _existing = _coll.get(
-                where={"filename": filename},
-                include=["metadatas"],
-            )
-            for _m in (_existing.get("metadatas") or []):
-                _pn = _m.get("page_number")
-                if _pn is not None and 0 <= _pn < num_pages:
-                    pages_text[_pn] = f"--- Page {_pn + 1} ---\n[resumed]"
-            _already = sum(1 for t in pages_text if t)
-            if _already:
-                logger.info("[%s] Resuming OCR: %d/%d pages already in ChromaDB, %d remaining",
-                            trace_id, _already, num_pages, num_pages - _already)
-        except Exception as _e:
-            logger.warning("[%s] Resume pre-check failed (non-fatal): %s", trace_id, _e)
+    # ── File-based checkpoint: resume from last successful run ──
+    import hashlib as _hl
+    _ckpt_dir = os.path.join(
+        os.environ.get("CHROMA_PERSIST_DIR", "/data/chromadb"), "..", "ocr_checkpoints",
+    )
+    _ckpt_key = _hl.sha256((filename or Path(file_path).name).encode("utf-8")).hexdigest()[:16]
+    _ckpt_path = os.path.join(_ckpt_dir, f"{_ckpt_key}.json")
+    _done_pages: set[int] = set()
+    try:
+        if os.path.isfile(_ckpt_path):
+            with open(_ckpt_path, encoding="utf-8") as _cf:
+                _ckpt_data = json.loads(_cf.read())
+            _page_texts = _ckpt_data.get("page_texts", {})
+            for _k, _t in _page_texts.items():
+                _pn = int(_k)
+                if 0 <= _pn < num_pages and _t:
+                    _done_pages.add(_pn)
+                    pages_text[_pn] = f"--- Page {_pn + 1} ---\n{_t}"
+        if _done_pages:
+            logger.info("[%s] Resuming OCR from checkpoint: %d/%d pages, %d remaining",
+                        trace_id, len(_done_pages), num_pages, num_pages - len(_done_pages))
+    except Exception as _e:
+        _done_pages.clear()
+        logger.warning("[%s] Checkpoint load failed (non-fatal), starting fresh: %s", trace_id, _e)
 
     # ── Batch processing: render 5 pages → OCR with semaphore(1) concurrency ──
     BATCH = 5
     for batch_start in range(0, num_pages, BATCH):
-        # Filter out already-done pages in this batch (resume mode)
         batch_pages = [
             i for i in range(batch_start, min(batch_start + BATCH, num_pages))
             if not pages_text[i]
@@ -1534,23 +1534,27 @@ async def _pdf_manual_ocr_fallback(file_path: str, trace_id: str, kb_name: str =
             sum(1 for t in pages_text[batch_start:min(batch_start + BATCH, num_pages)] if t),
         )
 
-        # ── Incremental write: persist this batch to ChromaDB immediately ──
-        if _chroma_kb and any(pages_text[i] for i in range(batch_start, min(batch_start + BATCH, num_pages))):
-            try:
-                _batch_indices = [i for i in range(batch_start, min(batch_start + BATCH, num_pages)) if pages_text[i]]
-                # Use deterministic IDs: filename+page_number → same ID every run → ChromaDB auto-upsert, never duplicates
-                import hashlib as _hl
-                _fp = (filename or Path(file_path).name).encode("utf-8")
-                _ids = [f"{_hl.sha256(_fp + str(i).encode()).hexdigest()[:16]}_p{i}" for i in _batch_indices]
-                _md = [{"filename": filename, "kb_name": kb_name, "source": "ocr_batch", "page_number": i} for i in _batch_indices]
-                _docs = [pages_text[i] for i in _batch_indices]
-                from tutor_platform.unified_provider import get_provider_instance
-                _p = get_provider_instance()
-                await _p.add_documents(kb_name=_chroma_kb, documents=_docs, metadatas=_md, ids=_ids)
-                logger.info("[%s] Saved batch %d-%d (%d pages) to ChromaDB",
-                            trace_id, batch_start + 1, min(batch_start + BATCH, num_pages), len(_docs))
-            except Exception as _e:
-                logger.warning("[%s] Incremental write failed (non-fatal): %s", trace_id, _e)
+        # ── Save checkpoint to file (stores actual OCR text, never ChromaDB) ──
+        _page_texts = {}
+        for i in range(num_pages):
+            if pages_text[i] and pages_text[i] != f"--- Page {i + 1} ---\n":
+                # Strip the page header to save space
+                _raw = pages_text[i]
+                if _raw.startswith(f"--- Page {i + 1} ---\n"):
+                    _raw = _raw[len(f"--- Page {i + 1} ---\n"):]
+                _page_texts[str(i)] = _raw
+        try:
+            os.makedirs(_ckpt_dir, exist_ok=True)
+            with open(_ckpt_path + ".tmp", "w", encoding="utf-8") as _tf:
+                json.dump({
+                    "filename": filename or Path(file_path).name,
+                    "page_texts": _page_texts,
+                    "total_pages": num_pages,
+                    "updated_at": time.time(),
+                }, _tf, ensure_ascii=False)
+            os.replace(_ckpt_path + ".tmp", _ckpt_path)
+        except Exception as _e:
+            logger.warning("[%s] Checkpoint save failed (non-fatal): %s", trace_id, _e)
 
     # ── Retry failed pages once (ollama 500 / timeout under load) ──
     _failed = [i for i in range(num_pages) if not pages_text[i]]
@@ -1570,21 +1574,26 @@ async def _pdf_manual_ocr_fallback(file_path: str, trace_id: str, kb_name: str =
                 await asyncio.sleep(1)  # brief backoff
             except Exception as exc:
                 logger.warning("[%s] Retry page %d failed: %s", trace_id, idx + 1, exc)
-        # Save retried pages
-        _retried = [i for i in _failed if pages_text[i]]
-        if _retried and _chroma_kb:
-            try:
-                import hashlib as _hl
-                _fp = (filename or Path(file_path).name).encode("utf-8")
-                _ids = [f"{_hl.sha256(_fp + str(i).encode()).hexdigest()[:16]}_r_p{i}" for i in _retried]
-                _md = [{"filename": filename, "kb_name": kb_name, "source": "ocr_retry", "page_number": i} for i in _retried]
-                _docs = [pages_text[i] for i in _retried]
-                from tutor_platform.unified_provider import get_provider_instance
-                _p = get_provider_instance()
-                await _p.add_documents(kb_name=_chroma_kb, documents=_docs, metadatas=_md, ids=_ids)
-                logger.info("[%s] Saved %d retried pages to ChromaDB", trace_id, len(_retried))
-            except Exception as _e:
-                logger.warning("[%s] Retry save failed (non-fatal): %s", trace_id, _e)
+        # Update checkpoint after retries
+        _page_texts = {}
+        for i in range(num_pages):
+            if pages_text[i] and pages_text[i] != f"--- Page {i + 1} ---\n":
+                _raw = pages_text[i]
+                if _raw.startswith(f"--- Page {i + 1} ---\n"):
+                    _raw = _raw[len(f"--- Page {i + 1} ---\n"):]
+                _page_texts[str(i)] = _raw
+        try:
+            os.makedirs(_ckpt_dir, exist_ok=True)
+            with open(_ckpt_path + ".tmp", "w", encoding="utf-8") as _tf:
+                json.dump({
+                    "filename": filename or Path(file_path).name,
+                    "page_texts": _page_texts,
+                    "total_pages": num_pages,
+                    "updated_at": time.time(),
+                }, _tf, ensure_ascii=False)
+            os.replace(_ckpt_path + ".tmp", _ckpt_path)
+        except Exception as _e:
+            logger.warning("[%s] Checkpoint save failed (non-fatal): %s", trace_id, _e)
 
     doc.close()
 
@@ -2412,12 +2421,17 @@ async def _maybe_ingest_result(
         docs = _split_content_for_ingest(content, filename)
         ids = [f"{_content_hash}_{i}" for i in range(len(docs))]
         _chroma_kb = _chromadb_kb_name(kb_name)
+        _detected_subject = _detect_exam_subject(content)
+        _detected_grade = _infer_grade(content)
         metadatas = [
             {
                 "filename": filename,
                 "learner_id": learner_id,
                 "source": source,
                 "trace_id": trace_id,
+                "type": "raw_text",
+                "subject": _detected_subject,
+                "grade": _detected_grade,
                 "kb_name": kb_name,
             }
             for _ in docs
@@ -2990,6 +3004,50 @@ async def _session_cleanup_loop():
             await asyncio.sleep(3600)
 
 
+async def _startup_kb_sync():
+    """Background: ensure KB ChromaDB index is complete on every startup.
+
+    First purges old ocr_batch records from the previous ChromaDB-checkpoint
+    era, then re-syncs each KB from DT.  Scanned PDFs use file-based checkpoints
+    (/data/ocr_checkpoints/) so container restarts resume without re-doing pages.
+    """
+    await asyncio.sleep(5)  # let provider + other services stabilize
+
+    # ── Purge stale ocr_batch records (leftovers from old ChromaDB-checkpoint path) ──
+    for kb_name in ["初中教材"]:
+        try:
+            _chroma_kb = _chromadb_kb_name(kb_name)
+            import chromadb as _ch
+            from chromadb.config import Settings as _CS
+            _c = _ch.PersistentClient(
+                path=os.environ.get("CHROMA_PERSIST_DIR", "/data/chromadb"),
+                settings=_CS(anonymized_telemetry=False),
+            )
+            _coll = _c.get_or_create_collection(name=_chroma_kb)
+            _existing = _coll.get(where={"source": {"$in": ["ocr_batch", "ocr_retry"]}})
+            _stale_ids = _existing.get("ids") or []
+            if _stale_ids:
+                _coll.delete(ids=_stale_ids)
+                logger.info("[startup-kb-sync] Purged %d stale ocr_batch records from %s",
+                            len(_stale_ids), _chroma_kb)
+        except Exception as _e:
+            logger.debug("[startup-kb-sync] Purge check skipped: %s", _e)
+
+    kb_names = ["初中教材"]  # extend here when more KBs are added
+    for kb_name in kb_names:
+        try:
+            logger.info("[startup-kb-sync] Checking KB '%s'...", kb_name)
+            result = await _sync_kb_from_dt(kb_name, trace_id="startup-kb-sync")
+            logger.info(
+                "[startup-kb-sync] KB '%s' done: %d files, %d chunks",
+                kb_name,
+                result.get("files_processed", 0),
+                result.get("total_chunks", 0),
+            )
+        except Exception as e:
+            logger.warning("[startup-kb-sync] KB '%s' failed: %s", kb_name, e)
+
+
 async def lifespan(app: FastAPI):
     # Legacy: UPLOADS_DIR no longer used by process_file/ingest endpoints (direct SOURCES_DIR write).
     # Keep _ensure_uploads_dir for backward compat with any external code writing there.
@@ -3015,6 +3073,12 @@ async def lifespan(app: FastAPI):
     cleanup_task = asyncio.create_task(_session_cleanup_loop())
     dt_session_cleanup_task = asyncio.create_task(_dt_session_cleanup_loop())
     periodic_task = asyncio.create_task(_periodic_task_loop())
+
+    # ── Startup: ensure KB ChromaDB index is complete ──
+    # Scanned PDFs use file-based OCR checkpoints now; old ocr_batch
+    # records from the previous ChromaDB-checkpoint era are purged.
+    # After cleanup, _startup_kb_sync rebuilds the index from scratch.
+    asyncio.create_task(_startup_kb_sync())
 
     # Phase B: initialize FastMCP session manager (task group)
     _mcp_lifespan_task: asyncio.Task | None = None
@@ -3584,17 +3648,14 @@ async def api_kb_ingest_file(
             pass
 
 
-@app.post("/api/kb/sync-from-dt")
-async def api_kb_sync_from_dt(
-    kb_name: str = Form("初中教材"),
-    request: Request = None,
-):
-    """从 DT 知识库同步全部文件到平台 ChromaDB（重建索引后调用）。
+async def _sync_kb_from_dt(kb_name: str, trace_id: str = "") -> dict:
+    """从 DT 知识库同步全部文件到平台 ChromaDB（幂等，内容哈希防重复）。
 
-    Web UI 重建索引后调用：读取 DT 的文件列表，下载每个文件，
-    提取文本后入库平台 ChromaDB。
+    扫描 PDF 使用文件 checkpoint（/data/ocr_checkpoints/），容器重启自动 resume。
+    全册 OCR 完成后一次性 chunk + embed 入库。
     """
-    trace_id = _extract_trace_id(request) if request else _generate_trace_id()
+    if not trace_id:
+        trace_id = _generate_trace_id()
     import urllib.parse
 
     _safe_kb = urllib.parse.quote(kb_name, safe="")
@@ -3672,11 +3733,16 @@ async def api_kb_sync_from_dt(
             _content_hash = hashlib.sha256(extracted.encode("utf-8")).hexdigest()[:16]
             docs = _split_content_for_ingest(extracted, filename)
             ids = [f"{_content_hash}_{i}" for i in range(len(docs))]
+            _detected_subject = _detect_exam_subject(extracted)
+            _detected_grade = _infer_grade(extracted)
             metadatas = [
                 {
                     "filename": filename,
                     "source": "web_ui_reindex",
                     "trace_id": trace_id,
+                    "type": "raw_text",
+                    "subject": _detected_subject,
+                    "grade": _detected_grade,
                     "kb_name": kb_name,
                 }
                 for _ in docs
@@ -3707,6 +3773,16 @@ async def api_kb_sync_from_dt(
         "total_chunks": total_chunks,
         "trace_id": trace_id,
     }
+
+
+@app.post("/api/kb/sync-from-dt")
+async def api_kb_sync_from_dt(
+    kb_name: str = Form("初中教材"),
+    request: Request = None,
+):
+    """HTTP wrapper — 从 DT 知识库同步到平台 ChromaDB（Web UI 触发）."""
+    trace_id = _extract_trace_id(request) if request else _generate_trace_id()
+    return await _sync_kb_from_dt(kb_name, trace_id)
 
 
 @app.post("/api/ingest/proxy/{kb_name}")
@@ -3905,6 +3981,7 @@ async def api_process_file(request: Request):
         file_path = body.get("file_path", "")
         kb_name = body.get("kb_name", "初中教材")
         learner_id = body.get("learner_id", "default")
+        suppress_auto_teach = body.get("suppress_auto_teach", "")
         file = None
     elif "multipart/form-data" in content_type:
         form = await request.form()
@@ -3912,6 +3989,7 @@ async def api_process_file(request: Request):
         file_path = form.get("file_path", "")
         kb_name = form.get("kb_name", "初中教材")
         learner_id = form.get("learner_id", "default")
+        suppress_auto_teach = form.get("suppress_auto_teach", "")
     else:
         return {"ok": False, "error": "Unsupported content-type; use JSON or multipart/form-data"}
 
@@ -3976,9 +4054,9 @@ async def api_process_file(request: Request):
     )
 
     # Write extracted content to ChromaDB + DT if a KB is requested.
-    # WeChat sends files for OCR+teaching (no kb_name), so ingestion is optional.
+    # WeChat sends suppress_auto_teach=1 — skip auto-ingest for tutoring files.
     _proc_filename = file.filename if file and file.filename else os.path.basename(file_path_ref)
-    if kb_name and kb_name.strip():
+    if kb_name and kb_name.strip() and not (suppress_auto_teach and str(suppress_auto_teach).strip() == "1"):
         await _maybe_ingest_result(
             provider,
             result,
@@ -4756,7 +4834,7 @@ async def _build_teaching_persona(
     try:
         logger.debug("KB section ENTERED for %s", learner_id)
         provider = await _get_provider()
-        _kb_results = await provider.query("初中教材", [_exam], n_results=10)
+        _kb_results = await provider.query(_chromadb_kb_name("初中教材"), [_exam], n_results=10)
         _kb_found = []
         if _exam:
             # Pass 1: prefer teaching_summary entries matching current subject.
