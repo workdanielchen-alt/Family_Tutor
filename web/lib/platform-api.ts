@@ -1,5 +1,7 @@
 // ── Types ────────────────────────────────────────────────────
 
+import type { TeachQuestion, TeachEvaluation, KnowledgePointSummary } from "./quiz-types";
+
 export interface MasterySummary {
   total_questions: number;
   accuracy: number;
@@ -198,27 +200,49 @@ export async function fetchKnowledgeGraph(
   return apiGet(`/knowledge/graph?subject=${subject}&learner_id=${learnerId}`);
 }
 
+export interface PastQuestionEntry {
+  question: TeachQuestion;
+  evaluation: TeachEvaluation;
+  user_answer: string;
+}
+
 export interface TeachStartResponse {
   ok: boolean;
   teach_session_id?: string;
   dt_session_id?: string;
-  first_question?: string;
+  /** v2: structured TeachQuestion object; v1: string (legacy fallback) */
+  first_question?: TeachQuestion | string;
   total_questions?: number;
   source?: string;
   current?: number;
   title?: string;
   task_type?: string;
   error?: string;
+  /** Resume: past Q&A entries */
+  past_questions?: PastQuestionEntry[];
+  /** Resume: current question to display */
+  current_question?: TeachQuestion;
+  /** Resume: flag */
+  resumed?: boolean;
+  correct_count?: number;
+  wrong_count?: number;
 }
 
 export interface TeachContinueResponse {
   ok: boolean;
+  /** v1: legacy text reply (always present for backward compat) */
   reply?: string;
+  /** v2: structured evaluation result */
+  evaluation?: TeachEvaluation;
+  /** v2: next question object (null = all done) */
+  next_question?: TeachQuestion | null;
   current?: number;
   total_questions?: number;
   correct_count?: number;
   wrong_count?: number;
   done?: boolean;
+  /** v2: knowledge-point summary (only when done=true) */
+  summary?: KnowledgePointSummary;
   error?: string;
 }
 

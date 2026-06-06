@@ -57,6 +57,7 @@ class TeachSession:
     wrong_count: int = 0              # 已答错题数
     knowledge_points: str = ""        # 关联知识点，逗号分隔
     subject: str = ""                 # 学科 (math/physics/chemistry/english)
+    past_questions: str = ""          # JSON: [{q_json, evaluation_json, user_answer}, ...] 已答题目缓存
 
     @property
     def is_expired(self) -> bool:

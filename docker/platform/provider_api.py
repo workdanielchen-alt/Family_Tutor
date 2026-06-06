@@ -60,6 +60,16 @@ from domains.tutoring.mastery import (
 from tutor_platform.rag.extractors import extract_text, extract_pdf_text, has_pdf_text_layer
 from tutor_platform.teach_session import get_store as get_teach_store
 from tutor_platform.teach_session import TeachSessionStore
+from tutor_platform.teach_question import (
+    JSON_BLOCK_RE,
+    TeachEvaluation,
+    TeachQuestion,
+    strip_options_from_content,
+    parse_evaluation_from_json,
+    parse_question_from_json,
+    parse_teach_response,
+    validate_teach_response,
+)
 from tutor_platform.quiz_sync import sync_quiz_to_mastery
 from tutor_platform.storage import validate_provider_config
 from tutor_platform.tools.preprocess import preprocess_image_bytes
@@ -4999,6 +5009,12 @@ async def _update_soul_with_context(
     _last_persona[learner_id] = _persona
 
 
+# Regex patterns to strip old free-text format sections from _TEACHER_SOUL
+# before the Direct DeepSeek path — replaced by JSON schema override.
+_re_phase1 = re.compile(r'### \[PHASE:FIRST_QUESTION\].*?(?=### \[PHASE:|\Z)', re.DOTALL)
+_re_phase2 = re.compile(r'### \[PHASE:EVALUATE_ANSWER\].*?(?=## 标记指令|\Z)', re.DOTALL)
+_re_markers = re.compile(r'## 标记指令.*?(?=## 微信格式|\Z)', re.DOTALL)
+
 # Correct-answer key marker: [ANSWER_KEY:X] — hidden marker DT appends
 # when asking a new question so the platform can store the correct answer.
 _ANSWER_KEY_RE = re.compile(r"\s*\[ANSWER_KEY:([^\]]+)\]")
@@ -5516,6 +5532,135 @@ def _detect_total_questions(content: str) -> int:
     return max(nums) if nums else 0
 
 
+def _build_display_text(parsed: dict, phase: str) -> str:
+    """Build human-readable WeChat display text from a structured JSON response.
+
+    Extracts the question content (and evaluation for EVALUATE_ANSWER) into
+    a clean text format suitable for WeChat display.
+    """
+    lines: list[str] = []
+    if phase == "FIRST_QUESTION":
+        q = parsed.get("question", {})
+        if isinstance(q, dict):
+            idx = q.get("index", 1)
+            total = q.get("total", 1)
+            # Strip inline options from content before display
+            content = strip_options_from_content(q.get("content", ""))
+            lines.append(f"【第{idx}题】")
+            if content:
+                lines.append(content)
+            opts = q.get("options")
+            if isinstance(opts, dict) and opts:
+                for k, v in opts.items():
+                    lines.append(f"{k}. {v}")
+            kp = q.get("knowledge_point", "")
+            if kp:
+                lines.append(f"【知识点：{kp}】")
+    elif phase == "EVALUATE_ANSWER":
+        ev = parsed.get("evaluation", {})
+        if isinstance(ev, dict):
+            feedback = ev.get("feedback", "")
+            is_correct = ev.get("is_correct", False)
+            if is_correct:
+                lines.append("✅ " + (feedback or "回答正确！"))
+            else:
+                lines.append("❌ " + (feedback or "回答有误"))
+            if not is_correct:
+                explanation = ev.get("explanation", "")
+                if explanation:
+                    lines.append(explanation)
+        nq = parsed.get("next_question")
+        if isinstance(nq, dict):
+            idx = nq.get("index", "")
+            total = nq.get("total", "")
+            # Strip inline options from content
+            content = strip_options_from_content(nq.get("content", ""))
+            lines.append(f"\n【第{idx}题】")
+            if content:
+                lines.append(content)
+            opts = nq.get("options")
+            if isinstance(opts, dict) and opts:
+                for k, v in opts.items():
+                    lines.append(f"{k}. {v}")
+            kp = nq.get("knowledge_point", "")
+            if kp:
+                lines.append(f"【知识点：{kp}】")
+    return "\n".join(lines)
+
+
+def _derive_title_from_ocr(text: str) -> str:
+    """Extract a human-readable title from OCR text."""
+
+    if not text or not text.strip():
+        return ""
+
+    lines = text.strip().split("\n")
+    candidates: list[str] = []
+    title_keywords: list[str] = []
+
+    for line in lines:
+        s = line.strip()
+        if not s:
+            continue
+        # --- SKIP metadata and noise ---
+        if re.match(r"^[-─═━]{2,}\s*第?\d+\s*页\s*[-─═━]{0,}$", s):
+            continue
+        if re.match(r"^(考试时间|满分|可能用到的|注意事项|答题前|请用|考生"
+                     r"|第[ⅠⅤⅣⅢⅡⅠ]|（|\(|本大题|每小题|可能用|注：|注意)", s):
+            continue
+        # Question lines: number + dot/paren
+        if re.match(r"^\d{1,2}[\.、．\)]\s*", s):
+            continue
+        # Answer-key lines
+        if re.match(r"^[A-F][\.、．\s]", s):
+            continue
+        # Table rows
+        if s.count("|") >= 2:
+            continue
+        # Long sentences with scientific units / temperatures / percentages
+        # are question bodies, not titles
+        if (re.search(r"\d+(?:\.\d+)?\s*[℃°]", s) or           # 1.1℃ or 3.5℃
+            re.search(r"\d+\s*cm\s*[~～]\s*\d+\s*cm", s) or     # 18 cm~59 cm
+            re.search(r"\d+%", s)) and len(s) > 15:             # 40%~70%
+            continue
+        # Lines that look like full sentences (>30 chars, starts with Chinese)
+        # and contain question-typical patterns are likely question text
+        if len(s) > 30 and re.search(r"[?？。]|上升|下降|增加|减少|导致|根据|下列", s):
+            continue
+        # Pure formatting separators
+        if re.match(r"^[\s\u3000]*$", s):
+            continue
+
+        cleaned = re.sub(r"^[-─═━\s]+", "", s)
+        if not cleaned or len(cleaned) <= 3:
+            continue
+
+        candidates.append(cleaned[:50])
+
+        # Prefer lines that look like exam titles
+        if re.search(r"考试|试卷|测试|试题|入学|招生|统[一考]|期中|期末|模拟|毕业|中考|高考|竞赛", cleaned):
+            title_keywords.append(cleaned[:50])
+
+    # Heuristic: if we found lines with title keywords, return the FIRST one
+    # (the title usually appears near the top of the page)
+    if title_keywords:
+        return title_keywords[0][:50]
+
+    # Otherwise return the first candidate (not the longest —
+    # the longest is often a question body like "全球气温本世纪...")
+    if candidates:
+        return candidates[0][:50]
+
+    # Fallback: first non-empty, non-question, non-data line
+    for s in (l.strip() for l in lines if l.strip() and len(l.strip()) > 2):
+        if re.match(r"^\d{1,2}[\.、．\)]\s*", s):
+            continue
+        if re.search(r"\d+(?:\.\d+)?\s*[℃°]", s) or re.search(r"\d+%", s) or re.search(r"cm\s*[~～]", s):
+            continue
+        return s[:50]
+    return ""
+
+
 async def _direct_deepseek_teach(
     phase: str,
     learner_id: str,
@@ -5545,10 +5690,22 @@ async def _direct_deepseek_teach(
     # Build rich system prompt: use caller-provided persona when available,
     # otherwise build inline (legacy path).  The persona already contains
     # exam context, KB, curriculum, weak points, due reviews.
-    if system_content is None:
-        system_content = _TEACHER_SOUL
+    #
+    # CRITICAL: _TEACHER_SOUL describes the OLD free-text format
+    # (【第X题】... [ANSWER_KEY:X]).  Strip those conflicting sections
+    # and replace with JSON schema so the LLM has no alternative format.
+    _base = system_content if system_content else _TEACHER_SOUL
+    # 1. Strip old [PHASE:FIRST_QUESTION] format section
+    _base = _re_phase1.sub('', _base)
+    # 2. Strip old [PHASE:EVALUATE_ANSWER] format section
+    _base = _re_phase2.sub('', _base)
+    # 3. Strip old [ANSWER_KEY] marker instructions
+    _base = _re_markers.sub('', _base)
+
+    # Add exam context + review / weak point info (only when persona not provided)
+    if not system_content:
         if context.strip():
-            system_content += (
+            _base += (
                 f"\n\n### 当前教学内容（优先级最高）\n"
                 f"学生当前正在做以下试卷中的题目，之前的试卷已全部结束、全部作废。\n"
                 f"请完全专注于以下内容：\n\n{context[:3000]}\n"
@@ -5561,7 +5718,7 @@ async def _direct_deepseek_teach(
                     _name = r["kp_id"].split("/")[-1]
                     _pct = int(r["level"] * 100)
                     _lines.append(f"- {_name}（掌握度 {_pct}%，上次复习 {r['due_date']}）")
-                system_content += "\n" + "\n".join(_lines) + "\n"
+                _base += "\n" + "\n".join(_lines) + "\n"
         except Exception:
             pass
         try:
@@ -5572,34 +5729,79 @@ async def _direct_deepseek_teach(
                     _name = w["kp_id"].split("/")[-1]
                     _pct = int(w["level"] * 100)
                     _lines.append(f"- {_name}（正确率 {_pct}%，已答 {w['total']} 题）")
-                system_content += "\n" + "\n".join(_lines) + "\n"
+                _base += "\n" + "\n".join(_lines) + "\n"
         except Exception:
             pass
 
-    # Phase-specific user message
-    _constraint = (
-        "\n\n【硬性规则】\n"
-        "🔴 题号必须用阿拉伯数字「第1题」「第2题」——禁止中文数字。\n"
-        "🔴 每次只能出一道题。\n"
-        "🔴 回复末尾必须包含 [ANSWER_KEY:X] 和 [KP_ID:学科/章/节] 标记。\n"
+    # Phase-specific user message (JSON structured format)
+
+    # ── JSON output format override ─────────────────────────────────────
+    # Prepended to system_content so it takes priority over any remaining
+    # old-format instructions.  Combined with the stripping above, the LLM
+    # now sees ONLY the JSON schema as the output format.
+    _json_override = (
+        "\n\n# 🚨 输出格式覆盖 — 本指令优先级高于下方所有格式说明\n\n"
+        "从本消息开始，**必须且只能**输出 JSON 格式。忽略下方 [ANSWER_KEY:X] 等旧格式标记说明。\n\n"
+        "## FIRST_QUESTION 阶段 JSON schema:\n"
+        "```json\n"
+        "{\n"
+        '  "phase": "FIRST_QUESTION",\n'
+        '  "question": {\n'
+        '    "index": <题号>,\n'
+        '    "total": <总题数>,\n'
+        '    "question_type": "choice|fill_blank|short_answer|written",\n'
+        '    "content": "<题目正文，支持 Markdown 数学公式>",\n'
+        '    "options": {"A": "...", "B": "...", "C": "...", "D": "..."},\n'
+        '    "answer_key": "<正确答案>",\n'
+        '    "explanation": "<step-by-step 解题步骤>",\n'
+        '    "knowledge_point": "学科/章/节",\n'
+        '    "hints": ["<L1 概念引导（不问答案）>", "<L2 关键步骤>", "<L3 完整思路>"],\n'
+        '    "difficulty": "easy|medium|hard"\n'
+        '  }\n'
+        "}\n"
+        "```\n\n"
+        "## EVALUATE_ANSWER 阶段 JSON schema:\n"
+        "```json\n"
+        "{\n"
+        '  "phase": "EVALUATE_ANSWER",\n'
+        '  "evaluation": {\n'
+        '    "is_correct": true|false,\n'
+        '    "score": 1.0|0.5|0.0,\n'
+        '    "feedback": "<评语>",\n'
+        '    "answer_key": "<正确答案>",\n'
+        '    "explanation": "<解题步骤>"\n'
+        '  },\n'
+        '  "next_question": { <同 question schema> } 或 null（全部完成时）\n'
+        "}\n"
+        "```\n\n"
+        "🔴 只输出 ```json 代码块，不输出任何其他文字。\n"
+        "🔴 hints 严格三级递增：L1 概念引导（不问答案）→ L2 关键步骤 → L3 完整思路。\n"
+        "🔴 answer_key 只存在于 JSON 字段中，不要在 content 里出现 [ANSWER_KEY] 标记。\n"
+        "🔴 knowledge_point 格式：「学科/章/节」。\n"
     )
+    system_content = _json_override + "\n" + _base
+
     if phase == "FIRST_QUESTION":
-        _constraint += (
-            "🔴 本次回复只能出一道题！从试卷中选编号最小的未做题输出。\n"
-            "✅ 只输出题目 + 一个引导问题。\n"
+        _constraint = (
+            "\n\n【输出格式 - 严格 JSON】\n"
+            "你必须且只能输出一个 JSON 代码块（用 ```json 包裹）。\n"
+            "格式详见系统指令中的 JSON schema 定义。\n\n"
+            "🔴 从试卷中选编号最小的未做题输出。\n"
+            "🔴 绝对禁止输出两道或以上题目。\n"
+            "🔴 即使某题 OCR 只有 [pic] 或乱码，也要输出该题，content=「此题为图表题」。\n"
+            "✅ hints 严格三级递增。\n"
         )
         user_content = f"[PHASE:{phase}]{_constraint}\n{context}"
     else:
         _qnum = _last_question_num.get(learner_id, 0)
-        _next_q = _qnum + 1
-        _prev_answer = _answer_keys.get(learner_id, "")
-        _constraint += (
-            "🔴 按试卷原本的题号顺序出题，保持试卷本身的章节和题号体系（如「一、1.」「二、1.」），不要重新编号。\n"
-            "🔴 评判当前题后必须立即出下一道题，评判与下一题在一轮回复中完成。\n"
-            f"🔴 请用「第{_next_q}题」开头输出下一题。\n"
+        _constraint = (
+            "\n\n【输出格式 - 严格 JSON】\n"
+            "你必须且只能输出一个 JSON 代码块（用 ```json 包裹）。\n"
+            "格式详见系统指令中的 JSON schema 定义。\n\n"
+            "🔴 先评改当前学生答案（evaluation），再出下一题（next_question）。\n"
+            "🔴 严格遵循试卷题号顺序，禁止跳题。即使某题 OCR 只有 [pic] 或乱码，也要输出该题。\n"
+            "🔴 如果所有题已出完，next_question 设为 null。\n"
         )
-        _answer_context = ""
-        # _answer_context 不注入，_prev_answer 指向上一题答案键，用户当前答的题号已通过「学生正在回答第X题」标明
         user_content = f"[PHASE:{phase}] [学生正在回答第{_qnum}题] {_constraint}\n{message}"
         _exam_ctx = context.strip() or _last_tutor_context.get(learner_id, "")
         if _exam_ctx:
@@ -5909,13 +6111,8 @@ async def _tutor_chat_core(
         try:
             _existing = get_teach_store().get_pending(learner_id, limit=1)
             if not _existing:
-                # Derive title from OCR first line
-                _title = ""
-                _raw = context.strip()
-                if _raw:
-                    _first_line = _raw.split("\n")[0].strip()
-                    _candidate = re.sub(r"^\s*[#\d一二三四五六七八九十]+[.、．）\)\s]+", "", _first_line)
-                    _title = _candidate[:50]
+                # Derive title from OCR — skip headers/footers/prefixes
+                _title = _derive_title_from_ocr(context.strip())
                 if not _title:
                     _title = "微信试卷"
                 _ts = get_teach_store().create(
@@ -5927,8 +6124,8 @@ async def _tutor_chat_core(
                 )
                 _teach_session_id = _ts.session_id
                 logger.info("[%s] Auto-created TeachSession %s for %s", trace_id, _teach_session_id, learner_id)
-        except Exception:
-            pass
+        except Exception as _ae:
+            logger.warning("[%s] Auto-create session failed: %s", trace_id, _ae)
 
     # 1a. Fatigue check: "累了/休息" resets session timer.
     _msg_lower = message.strip().lower()
@@ -6036,15 +6233,43 @@ async def _tutor_chat_core(
         _last_question_num[learner_id] = 1  # ensure tracking starts at 1
         _session_answered_count[learner_id] = 0  # reset counter for new session
         _constraint = (
-            "\n\n【硬性规则】\n"
-            "🔴 本次回复只能出一道题！从试卷中选编号最小的未做题输出。\n"
+            "\n\n【输出格式 - 严格 JSON】\n"
+            "你必须且只能输出一个 JSON 代码块（用 ```json 包裹），格式如下：\n\n"
+            "```json\n"
+            "{\n"
+            '  "phase": "FIRST_QUESTION",\n'
+            '  "question": {\n'
+            '    "index": 1,\n'
+            '    "total": <从试卷中统计的总题数>,\n'
+            '    "question_type": "choice|fill_blank|short_answer|written",\n'
+            '    "content": "<题目正文，支持 Markdown + LaTeX>",\n'
+            '    "options": {"A": "选项文本", "B": "...", "C": "...", "D": "..."},\n'
+            '    "answer_key": "B",\n'
+            '    "explanation": "<step-by-step 解题步骤>",\n'
+            '    "knowledge_point": "学科/章/节",\n'
+            '    "hints": [\n'
+            '      "<L1 概念引导：指向解题思路而非答案>",\n'
+            '      "<L2 关键步骤：给出关键公式或中间步骤>",\n'
+            '      "<L3 完整思路：展示完整推导过程>"\n'
+            '    ],\n'
+            '    "difficulty": "easy|medium|hard"\n'
+            '  }\n'
+            "}\n"
+            "```\n\n"
+            "【硬性规则】\n"
+            "🔴 本题必须从试卷中选编号最小的未做题输出。\n"
             "🔴 绝对禁止在一条回复中出现两道或以上的题目。\n"
-            "🔴 即使两道题紧邻，也必须分两次输出。\n"
-            "🔴 题号必须用阿拉伯数字格式「第1题」「第2题」——禁止使用「第一题」「第二题」等中文数字。\n"
-            "✅ 只输出题目 + 一个引导问题。\n"
-            "🔴 引导问题严禁直接问答案（如\"x等于多少？\"\"选哪个？\"\"结果是？\"）。\n"
-            "✅ 引导问题应指向解题思路或概念理解，而非答案本身。\n"
-            "🔴 必须在回复末尾添加 [ANSWER_KEY:X] 和 [KP_ID:学科/章/节] 标记。\n"
+            "🔴 题号必须用阿拉伯数字格式（index=1,2,3...），禁止使用中文数字。\n"
+            "🔴 即使某题 OCR 只有 [pic] 或乱码，也要输出该题，content 写「此题为图表题，请查看原卷」。\n"
+            "🔴 绝对禁止在一条回复中讨论其他题目。\n"
+            "✅ hints 严格三级递增——L1 概念引导 → L2 关键步骤 → L3 完整思路。\n"
+            "🔴 L1 严禁直接问答案，应指向解题思路（如'想一想：对称轴和系数有什么关系？'）。\n"
+            "🔴 answer_key 只存在于 JSON 字段中，不要在 content 里出现 [ANSWER_KEY] 标记。\n\n"
+            "【教学风格】\n"
+            "✅ 第1题：content 中加入简短开场鼓励：我们先从一道基础题热身吧！🔥\n"
+            "✅ 中间题：直接出题，不废话。\n"
+            "✅ 最后一题（index==total）：content 中加入提示：这是最后一道题了，坚持住！🏁\n"
+            "✅ explanation 采用 step-by-step 分解（Plan → Solve），参考分步教学法。\n"
         )
         payload = f"[PHASE:{_phase}]{_constraint}\n{context}"
     else:
@@ -6053,15 +6278,47 @@ async def _tutor_chat_core(
         _next_q = _qnum + 1
         _prev_answer = _answer_keys.get(learner_id, "")
         _constraint = (
-            "\n\n【硬性规则】\n"
-            "🔴 按试卷原本的题号顺序出题，保持试卷本身的章节和题号体系（如「一、1.」「二、1.」），不要重新编号。\n"
+            "\n\n【输出格式 - 严格 JSON】\n"
+            "你必须且只能输出一个 JSON 代码块（用 ```json 包裹），格式如下：\n\n"
+            "```json\n"
+            "{\n"
+            '  "phase": "EVALUATE_ANSWER",\n'
+            '  "evaluation": {\n'
+            '    "is_correct": true|false,\n'
+            '    "score": 1.0|0.5|0.0,\n'
+            '    "feedback": "<鼓励或温和纠正的评语>",\n'
+            '    "answer_key": "正确答案",\n'
+            '    "explanation": "<step-by-step 解题步骤>"\n'
+            '  },\n'
+            '  "next_question": {\n'
+            '    "index": <下一题号>,\n'
+            '    "total": <总题数>,\n'
+            '    "question_type": "choice|fill_blank|short_answer|written",\n'
+            '    "content": "<题目正文>",\n'
+            '    "options": {"A": "...", "B": "..."},\n'
+            '    "answer_key": "正确答案",\n'
+            '    "explanation": "<解题步骤>",\n'
+            '    "knowledge_point": "学科/章/节",\n'
+            '    "hints": ["<L1>", "<L2>", "<L3>"],\n'
+            '    "difficulty": "easy|medium|hard"\n'
+            '  }\n'
+            "}\n"
+            "```\n\n"
+            "【硬性规则】\n"
+            "🔴 先评改当前学生答案（evaluation），再出下一题（next_question）。\n"
+            "🔴 evaluation.feedback 语气温暖鼓励：答对夸具体的思路，答错指路不指责。\n"
+            "🔴 绝对禁止在 evaluation.feedback 中讨论其他题目。只能讨论「学生正在回答」的那一道题。\n"
+            "🔴 严格遵循试卷题号体系，禁止跳题或重新编号。\n"
+            "🔴 即使某题 OCR 只有 [pic] 或乱码，也要输出该题，content 写「此题为图表题，请查看原卷」。\n"
             "🔴 绝对禁止在一条回复中出现两道或以上的题目。\n"
-            "🔴 不要提前展示更后面的题。\n"
-            "✅ 只输出一道题 + 讲解 + 一个引导问题。\n"
-            "🔴 引导问题严禁直接问答案（如\"x等于多少？\"\"选哪个？\"\"结果是？\"）。\n"
-            "✅ 引导问题应指向解题思路或概念理解，而非答案本身。\n"
-            f"🔴 请用「第{_next_q}题」开头输出下一题。\n"
-            "🔴 必须在回复末尾添加 [ANSWER_KEY:X] 和 [KP_ID:学科/章/节] 标记。\n"
+            "🔴 如果下一题不存在（所有题已出完），next_question 字段设为 null。\n"
+            "🔴 explanation 采用保守式 deep-dive：只展开学生答错或部分正确的题目的完整解析。\n"
+            "🔴 answer_key 只存在于 JSON 字段中，不要在 content 里出现 [ANSWER_KEY] 标记。\n\n"
+            "【教学风格融入】\n"
+            "✅ 答对：简洁肯定 + 可选知识点延伸（1-2 句）。\n"
+            "✅ 答错或部分正确：温和鼓励 + 展开解题步骤 + 指出关键卡点。\n"
+            "✅ 引导问题严禁直接问答案，应指向解题思路或概念理解。\n"
+            "✅ 最后一题评改后，evaluation.feedback 增加阶段总结。\n"
         )
         # Inject stored answer key so the LLM knows the correct answer.
         # The LLM should use this to provide accurate feedback, not to judge.
@@ -6240,72 +6497,132 @@ async def _tutor_chat_core(
     if result.get("ok"):
         content: str = str(result.get("content") or "")
 
-        # Parse and store [ANSWER_KEY:] marker (for future use if LLM outputs it)
-        _ak_m = _ANSWER_KEY_RE.search(content)
-        if _ak_m:
-            _answer_keys[learner_id] = _ak_m.group(1).strip()
+        # ── 6a. Try JSON structured parse (v2 guided teaching) ──
+        #     If the LLM returned valid JSON, use it directly for answer keys,
+        #     knowledge points, evaluation, and question tracking — skipping
+        #     all regex-based marker parsing below.
+        _parsed_json = parse_teach_response(content)
+        _json_phase = ""
+        _json_question: dict | None = None
+        _json_evaluation: dict | None = None
+        if _parsed_json:
+            _json_phase = _parsed_json.get("phase", "")
+            _json_question = _parsed_json.get("question") or _parsed_json.get("next_question")
+            _json_evaluation = _parsed_json.get("evaluation")
             logger.info(
-                "[%s] Stored answer key for %s: %s",
-                trace_id,
-                learner_id,
-                _answer_keys[learner_id],
+                "[%s] JSON parse succeeded (phase=%s, has_question=%s, has_eval=%s)",
+                trace_id, _json_phase,
+                bool(_json_question), bool(_json_evaluation),
             )
-        content = _ANSWER_KEY_RE.sub("", content).strip()
 
-        # Parse and store [KP_ID:] marker
-        _kp_m = _KP_ID_RE.search(content)
-        if _kp_m:
-            _kp_names[learner_id] = _kp_m.group(1).strip()
+        if _json_question:
+            # Store answer_key from JSON for future evaluation turns
+            _ak = _json_question.get("answer_key", "")
+            if _ak:
+                _answer_keys[learner_id] = str(_ak).strip()
+                logger.info("[%s] Stored answer key from JSON: %s", trace_id, _answer_keys[learner_id])
+            # Store knowledge_point
+            _kp = _json_question.get("knowledge_point", "")
+            if _kp:
+                _kp_names[learner_id] = str(_kp).strip()
+                logger.info("[%s] Stored KP from JSON: %s", trace_id, _kp_names[learner_id])
+            # Advance question tracking — BUT guard against OCR-induced skips.
+            # If the LLM jumps from Q10 to Q12 (garbled Q11), accept the skip
+            # but cap the jump at +2 to prevent feedback/answer mismatch later.
+            _qidx = int(_json_question.get("index", 0))
+            _current_qnum = _last_question_num.get(learner_id, 0)
+            if _qidx > _current_qnum:
+                # Cap: never jump more than 2 questions at a time
+                _cap = _current_qnum + 2
+                _safe_qidx = min(_qidx, _cap)
+                if _safe_qidx != _qidx:
+                    logger.info(
+                        "[%s] Question jump capped: %d → %d (LLM output %d — probable OCR skip)",
+                        trace_id, _current_qnum, _safe_qidx, _qidx,
+                    )
+                _last_question_num[learner_id] = _safe_qidx
+                logger.info("[%s] Advanced question num to %d from JSON", trace_id, _safe_qidx)
+
+        if _json_evaluation:
+            # Use JSON evaluation directly — no regex, no guesswork
+            _score_json = float(_json_evaluation.get("score", 0.0))
+            _is_correct_json = bool(_json_evaluation.get("is_correct", _score_json >= 1.0))
+            _correct_answer_json = str(_json_evaluation.get("answer_key", ""))
+            _eval_kp_json = _kp_names.get(learner_id, "")
+
+            # Override _mastery_eval with JSON data so the evaluation block below
+            # (which checks _mastery_eval first) uses the structured result.
+            _mastery_eval = {
+                "score": _score_json,
+                "is_correct": _is_correct_json,
+                "student_answer": message.strip(),
+                "correct_answer": _correct_answer_json,
+            }
+            _eval_kp = _eval_kp_json
             logger.info(
-                "[%s] Stored KP for %s: %s",
-                trace_id,
-                learner_id,
-                _kp_names[learner_id],
+                "[%s] JSON evaluation: correct=%s score=%s kp=%s",
+                trace_id, _is_correct_json, _score_json, _eval_kp_json,
             )
-        content = _KP_ID_RE.sub("", content).strip()
-        # Parse old-style [ANSWER:correct|wrong:kp_id] markers BEFORE stripping.
-        # DT may still output these (its own evaluation); capture for path 2 below.
-        _dt_eval_result = ""
-        _dt_eval_kp = ""
-        _dt_eval_m = _ANSWER_CLEAN_RE.search(content)
-        if _dt_eval_m:
-            _dt_eval_result = _dt_eval_m.group(1)  # "correct" or "wrong"
-            _dt_eval_kp = _dt_eval_m.group(2).strip()
-            logger.info(
-                "[%s] DT self-eval: %s kp=%s",
-                trace_id,
-                _dt_eval_result,
-                _dt_eval_kp,
-            )
-        content = _ANSWER_CLEAN_RE.sub("", content).strip()
 
-        # Fallback: parse KP name from 【知识点：XXX】 if no [KP_ID:] marker
-        if _kp_m is None:
-            _zp = re.search(r"【知识点：([^】]+)】", content)
-            if _zp:
-                _kp_names[learner_id] = _zp.group(1).strip()
-
-        # Extract question number from reply and advance tracking.
-        # WS path already does this in _DTTutorSession.send_and_recv,
-        # but Direct API/NPU paths skip that method entirely.  This
-        # ensures _last_question_num is updated for ALL three paths.
-        #
-        # CRITICAL: use finditer and take the LAST match.  LLM replies
-        # in EVALUATE_ANSWER phase contain BOTH "第1题" (reference to
-        # the just-evaluated question) AND "第2题" (the new question).
-        # re.search finds only the FIRST ("第1题"), which equals the
-        # current value — the advancement never happens.  Always take
-        # the last occurrence to get the newest question number.
-        _qn_normalized = _normalize_qnum(content)
-        _all_qn = list(re.finditer(r"第\s*(\d+)\s*题", _qn_normalized))
-        if _all_qn:
-            _parsed_qnum = int(_all_qn[-1].group(1))
-            if _parsed_qnum > _last_question_num.get(learner_id, 0):
-                _last_question_num[learner_id] = _parsed_qnum
+        # ── Legacy marker parsing (only when JSON eval is unavailable) ──
+        if not _json_evaluation:
+            # Parse and store [ANSWER_KEY:] marker (for future use if LLM outputs it)
+            _ak_m = _ANSWER_KEY_RE.search(content)
+            if _ak_m:
+                _answer_keys[learner_id] = _ak_m.group(1).strip()
                 logger.info(
-                    "[%s] Advanced question num to %d for %s",
-                    trace_id, _parsed_qnum, learner_id,
+                    "[%s] Stored answer key for %s: %s",
+                    trace_id,
+                    learner_id,
+                    _answer_keys[learner_id],
                 )
+            content = _ANSWER_KEY_RE.sub("", content).strip()
+
+            # Parse and store [KP_ID:] marker
+            _kp_m = _KP_ID_RE.search(content)
+            if _kp_m:
+                _kp_names[learner_id] = _kp_m.group(1).strip()
+                logger.info(
+                    "[%s] Stored KP for %s: %s",
+                    trace_id,
+                    learner_id,
+                    _kp_names[learner_id],
+                )
+            content = _KP_ID_RE.sub("", content).strip()
+
+            # Parse old-style [ANSWER:correct|wrong:kp_id] markers.
+            # DT may still output these (its own evaluation); capture for path 2 below.
+            _dt_eval_result = ""
+            _dt_eval_kp = ""
+            _dt_eval_m = _ANSWER_CLEAN_RE.search(content)
+            if _dt_eval_m:
+                _dt_eval_result = _dt_eval_m.group(1)  # "correct" or "wrong"
+                _dt_eval_kp = _dt_eval_m.group(2).strip()
+                logger.info(
+                    "[%s] DT self-eval: %s kp=%s",
+                    trace_id,
+                    _dt_eval_result,
+                    _dt_eval_kp,
+                )
+            content = _ANSWER_CLEAN_RE.sub("", content).strip()
+
+            # Fallback: parse KP name from 【知识点：XXX】 if no [KP_ID:] marker
+            if _kp_m is None:
+                _zp = re.search(r"【知识点：([^】]+)】", content)
+                if _zp:
+                    _kp_names[learner_id] = _zp.group(1).strip()
+
+            # Extract question number from reply and advance tracking.
+            _qn_normalized = _normalize_qnum(content)
+            _all_qn = list(re.finditer(r"第\s*(\d+)\s*题", _qn_normalized))
+            if _all_qn:
+                _parsed_qnum = int(_all_qn[-1].group(1))
+                if _parsed_qnum > _last_question_num.get(learner_id, 0):
+                    _last_question_num[learner_id] = _parsed_qnum
+                    logger.info(
+                        "[%s] Advanced question num to %d for %s",
+                        trace_id, _parsed_qnum, learner_id,
+                    )
 
         # === Platform Evaluation ===
         # Three paths, in priority order:
@@ -6554,7 +6871,18 @@ async def _tutor_chat_core(
                     )
                 except Exception:
                     pass
-        result["content"] = html.unescape(content)
+        # ── Split path: WeChat display vs Web structured storage ──
+        # WeChat: return clean human-readable text via result["content"]
+        # Web:    stash the raw parsed JSON so api_teach_start can read it
+        #         directly without re-parsing the display text.
+        if _parsed_json and (_json_question or _json_evaluation):
+            result["_parsed_json"] = _parsed_json
+            _display_content = _build_display_text(_parsed_json, _phase)
+            if not _display_content:
+                _display_content = JSON_BLOCK_RE.sub("", content).strip()
+            result["content"] = html.unescape(_display_content)
+        else:
+            result["content"] = html.unescape(content)
         # Extract and store question text for the next turn's mastery recording.
         _q = _extract_question_text(content)
         if _q:
@@ -6570,19 +6898,25 @@ async def _tutor_chat_core(
             _ts_store = get_teach_store()
             _ts = _ts_store.get(_teach_session_id)
             if _ts and _ts.status == "pending" and result.get("content"):
-                _ts.first_question = result["content"]
                 _ts.status = "active"
-                _tq_m = re.search(r"(?:共|/)\s*(\d+)\s*题", result["content"])
-                if _tq_m:
-                    _ts.total_questions = int(_tq_m.group(1))
+                # Web path: store the raw parsed JSON so api_teach_start
+                # (consume_session_id) picks it up as V2 structured data.
+                if _json_question:
+                    _ts.first_question = json.dumps(_json_question, ensure_ascii=False)
+                    _ts.total_questions = _json_question.get("total", _ts.total_questions)
                 else:
-                    _detected = _detect_total_questions(_last_tutor_context.get(learner_id, ""))
-                    if _detected:
-                        _ts.total_questions = _detected
+                    _ts.first_question = result["content"]
+                    _tq_m = re.search(r"(?:共|/)\s*(\d+)\s*题", result["content"])
+                    if _tq_m:
+                        _ts.total_questions = int(_tq_m.group(1))
+                    else:
+                        _detected = _detect_total_questions(_last_tutor_context.get(learner_id, ""))
+                        if _detected:
+                            _ts.total_questions = _detected
                 _ts_store.save(_ts)
                 logger.info("[%s] TeachSession %s updated (q=%d/%d)", trace_id, _teach_session_id, 1, _ts.total_questions)
-        except Exception:
-            pass
+        except Exception as _ae:
+            logger.warning("[%s] Auto-create session failed: %s", trace_id, _ae)
 
     logger.info(
         "[%s] tutor_chat timing: bot_setup=%.2fs total=%.2fs msg=%s profile_switched=%s",
@@ -8667,18 +9001,23 @@ async def api_teach_start(request: Request):
             source_file = _fn
         _source = "web_upload"
         if not _title:
-            _title = _fn.rsplit(".", 1)[0] if "." in _fn else _fn
+            _title = _derive_title_from_ocr(ocr_text)
+            # Fallback: if title still looks like a question, use filename
+            if not _title or re.match(r"^\d{1,2}[\.、．\)]", _title):
+                _title = _fn.rsplit(".", 1)[0] if "." in _fn else _fn
         if not _task_type:
             _task_type = "exam_paper"
     else:
         _source = "wechat"
+        if not _title and ocr_text:
+            _title = _derive_title_from_ocr(ocr_text)
         if not _task_type:
             _task_type = "exam_paper"
 
     dt_session_id = str(body.get("dt_session_id", "")).strip()
     consume_sid = str(body.get("consume_session_id", "")).strip()
 
-    if not ocr_text:
+    if not ocr_text and not consume_sid:
         return {"ok": False, "error": "OCR 文本为空，无法开始教学"}
 
     # ── 获取或创建 TeachSession ──
@@ -8705,6 +9044,83 @@ async def api_teach_start(request: Request):
         _source = session.source
         store.mark_active(consume_sid)
         logger.info("[%s] Reusing pending session %s for learner %s", trace_id, consume_sid, learner_id)
+
+        # ── Resume: if past questions exist, return cached state ──
+        _past_questions = []
+        if session.past_questions:
+            try:
+                _past_questions = json.loads(session.past_questions)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        # ── First visit: session has V2 JSON but no past_questions yet ──
+        # Return the stored question directly, don't call LLM again.
+        _cached_q = None
+        if not _past_questions and session.first_question:
+            try:
+                _cached_q = json.loads(session.first_question)
+                if isinstance(_cached_q, dict) and "question_type" in _cached_q:
+                    _cached_q = TeachQuestion.from_dict(_cached_q)
+                else:
+                    _cached_q = None
+            except (json.JSONDecodeError, TypeError, KeyError):
+                pass
+
+        if _past_questions:
+            # Already answered some questions — resume without calling LLM
+            _resume_q = None
+            if session.first_question:
+                try:
+                    _resume_q = json.loads(session.first_question)
+                    if isinstance(_resume_q, dict):
+                        _resume_q = TeachQuestion.from_dict(_resume_q)
+                except (json.JSONDecodeError, TypeError, KeyError):
+                    pass
+            # Only include current question if it's NOT already in past_questions
+            _past_indices = {p["question"]["index"] for p in _past_questions if "question" in p}
+            if _resume_q and _resume_q.index not in _past_indices:
+                _cur_q_dict = _resume_q.to_dict()
+            else:
+                _cur_q_dict = None
+
+            _resp = {
+                "ok": True,
+                "teach_session_id": session.session_id,
+                "dt_session_id": dt_session_id,
+                "first_question": _past_questions[0]["question"],
+                "past_questions": _past_questions,
+                **({"current_question": _cur_q_dict} if _cur_q_dict else {}),
+                "total_questions": session.total_questions,
+                "source": _source,
+                "current": session.current_question,
+                "title": _title,
+                "task_type": _task_type,
+                "correct_count": session.correct_count,
+                "wrong_count": session.wrong_count,
+                "resumed": True,
+            }
+            return _resp
+
+        # ── Single visit shortcut: cached V2 JSON, no past answers ──
+        if _cached_q:
+            # Seed the context so follow-up continueTeach calls work.
+            # Without this, _tutor_chat_core has no exam content to work from.
+            _last_tutor_context[learner_id] = ocr_text
+            _last_question_num[learner_id] = _cached_q.index
+            _resp = {
+                "ok": True,
+                "teach_session_id": session.session_id,
+                "dt_session_id": dt_session_id,
+                "first_question": _cached_q.to_dict(),
+                "total_questions": session.total_questions,
+                "source": _source,
+                "current": session.current_question,
+                "title": _title,
+                "task_type": _task_type,
+                "correct_count": session.correct_count,
+                "wrong_count": session.wrong_count,
+            }
+            return _resp
+
     else:
         session = store.create(
             learner_id=learner_id,
@@ -8734,34 +9150,48 @@ async def api_teach_start(request: Request):
         if dt_session_id:
             _isolated_key = f"{learner_id}:{dt_session_id}"
             _last_tutor_context[_isolated_key] = _last_tutor_context.get(learner_id, "")
-        if reply:
-            # 缓存第一题到 session
-            session.first_question = reply
+        # ── Prefer the stashed parsed JSON from _tutor_chat_core ──
+        # When the LLM returned structured JSON, _build_display_text
+        # already converted result["content"] to WeChat text.  Use the
+        # saved raw JSON to drive V2 structured rendering on Web.
+        _stashed = result.get("_parsed_json")
+        _parsed = _stashed if isinstance(_stashed, dict) else parse_teach_response(reply)
+        _question = parse_question_from_json(_parsed) if _parsed else None
 
-            # 估算总题数（LLM 输出中有则取，无则从 OCR 文本检测）
-            import re
-            _tq_m = re.search(r"(?:共|/)\s*(\d+)\s*题", reply)
-            if _tq_m:
-                session.total_questions = int(_tq_m.group(1))
+        if reply:
+            if _question:
+                # Structured mode: use TeachQuestion for total / current tracking
+                session.total_questions = _question.total
+                session.current_question = _question.index
+                session.first_question = json.dumps(_question.to_dict(), ensure_ascii=False)
             else:
-                _detected = _detect_total_questions(ocr_text)
-                if _detected:
-                    session.total_questions = _detected
-            _cur_qn = 1
-            session.current_question = _cur_qn
+                # Legacy text mode: regex-based fallback
+                session.first_question = reply
+                _tq_m = re.search(r"(?:共|/)\s*(\d+)\s*题", reply)
+                if _tq_m:
+                    session.total_questions = int(_tq_m.group(1))
+                else:
+                    _detected = _detect_total_questions(ocr_text)
+                    if _detected:
+                        session.total_questions = _detected
+                session.current_question = 1
             store.save(session)
 
-            return {
+            _resp = {
                 "ok": True,
                 "teach_session_id": session.session_id,
                 "dt_session_id": dt_session_id,
-                "first_question": reply,
                 "total_questions": session.total_questions,
                 "source": _source,
-                "current": _cur_qn,
+                "current": session.current_question,
                 "title": _title,
                 "task_type": _task_type,
             }
+            if _question:
+                _resp["first_question"] = _question.to_dict()
+            else:
+                _resp["first_question"] = reply  # legacy string fallback
+            return _resp
 
         return {"ok": False, "error": "教学引擎未返回内容"}
     except Exception as exc:
@@ -8813,13 +9243,113 @@ async def api_teach_continue(request: Request):
         if not reply:
             return {"ok": False, "error": "教学引擎未返回内容"}
 
+        # ── Try structured JSON parse (v2) ──
+        # Prefer the stashed parsed JSON from _tutor_chat_core (set when
+        # _build_display_text strips the raw JSON from the reply text).
+        _stashed = result.get("_parsed_json")
+        _parsed = _stashed if isinstance(_stashed, dict) else parse_teach_response(reply)
+        _eval = parse_evaluation_from_json(_parsed) if _parsed else None
+        _next_q = parse_question_from_json(_parsed) if _parsed else None
+        _done = _parsed is not None and _parsed.get("next_question") is None
+
+        if _eval:
+            # Structured mode: use JSON evaluation directly
+            if _eval.is_correct:
+                session.correct_count += 1
+            elif _eval.score < 1.0:
+                session.wrong_count += 1
+
+            # ── Cache past Q&A for resume ──
+            _past = []
+            if session.past_questions:
+                try:
+                    _past = json.loads(session.past_questions)
+                except (json.JSONDecodeError, TypeError):
+                    _past = []
+            # The question being answered is stored in first_question
+            _last_q_json = None
+            if session.first_question:
+                try:
+                    _last_q_json = json.loads(session.first_question)
+                except (json.JSONDecodeError, TypeError):
+                    _last_q_json = None
+            if _last_q_json and isinstance(_last_q_json, dict):
+                _past.append({
+                    "question": _last_q_json,
+                    "evaluation": _eval.to_dict(),
+                    "user_answer": message.strip(),
+                })
+            session.past_questions = json.dumps(_past, ensure_ascii=False)
+
+            if _next_q:
+                # ── Auto-correct skipped questions ──
+                # When OCR garbles a question (e.g. Q6 has a picture),
+                # the LLM may skip to the next readable question.  Force
+                # the index to be _qnum + 1 so the sequence stays intact.
+                _expected_idx = (_last_question_num.get(learner_id, 0) or _qnum) + 1
+                if _next_q.index != _expected_idx:
+                    logger.info(
+                        "[%s] Correcting next_q index: %d → %d (OCR skip detected)",
+                        trace_id, _next_q.index, _expected_idx,
+                    )
+                    _next_q.index = _expected_idx
+                    # Also fix _last_question_num: it was polluted by the LLM's
+                    # skipped output during _tutor_chat_core post-processing.
+                    # Without this, the next EVALUATE_ANSWER phase uses the wrong
+                    # question number, causing feedback/answer mismatch.
+                    _last_question_num[learner_id] = _expected_idx
+                    logger.info(
+                        "[%s] Fixed _last_question_num to %d for %s",
+                        trace_id, _expected_idx, learner_id,
+                    )
+                session.current_question = _next_q.index
+                session.total_questions = _next_q.total
+                # Store this as the "current" question for next turn
+                session.first_question = json.dumps(_next_q.to_dict(), ensure_ascii=False)
+                if _next_q.total > 0 and _next_q.index > _next_q.total:
+                    _done = True
+            elif _done:
+                # next_question is null → all done
+                pass
+
+            # Also check completion: index > total means done
+            if session.total_questions > 0 and session.current_question > session.total_questions:
+                _done = True
+
+            if _done:
+                store.mark_completed(teach_session_id)
+            else:
+                store.save(session)
+
+            # Build response
+            _resp = {
+                "ok": True,
+                "evaluation": _eval.to_dict(),
+                "next_question": _next_q.to_dict() if _next_q else None,
+                "current": session.current_question,
+                "total_questions": session.total_questions,
+                "correct_count": session.correct_count,
+                "wrong_count": session.wrong_count,
+                "done": _done,
+            }
+            # Legacy compatibility: strip JSON block from raw reply so old
+            # clients (practice page, WeChat) don't render ```json cruft.
+            _clean_reply = JSON_BLOCK_RE.sub("", reply).strip()
+            _resp["reply"] = _clean_reply or reply
+
+            # Context isolation restore
+            if session.dt_session_id and _saved_ctx is not None:
+                _last_tutor_context[f"{learner_id}:{session.dt_session_id}"] = _last_tutor_context.pop(learner_id, "")
+                if _saved_ctx:
+                    _last_tutor_context[learner_id] = _saved_ctx
+            return _resp
+
+        # ── Legacy text mode fallback ──
         # WebUI源清理格式
         if session.source in ("child_practice", "webui", "web_upload"):
             for sep in ("──", "─", "━", "═", "⎯"):
                 reply = reply.replace(sep, "")
-            # 普通化 \r → \n，确保 HTML 渲染正确
             reply = reply.replace("\r", "")
-            # 双换行：每行之间确保有空行（HTML 需要 \n\n 才能断行）
             rlines = reply.split("\n")
             rlines2 = []
             for rl in rlines:
@@ -8833,7 +9363,6 @@ async def api_teach_continue(request: Request):
             reply = "\n".join(rlines2)
 
         # 更新进度
-        import re
         _qn_m = re.search(r"第\s*(\d+)\s*[题/]", reply)
         if _qn_m:
             session.current_question = int(_qn_m.group(1))
@@ -8854,7 +9383,7 @@ async def api_teach_continue(request: Request):
             or "最后一题" in reply
             or "练习结束" in reply):
             _done = True
-        elif session.total_questions > 0 and session.current_question >= session.total_questions:
+        elif session.total_questions > 0 and session.current_question > session.total_questions:
             _done = True
         if _done:
             store.mark_completed(teach_session_id)

@@ -25,22 +25,27 @@ export default function PendingTasksBanner() {
   const [tasks, setTasks] = useState<PendingTask[]>([]);
 
   useEffect(() => {
-    fetchPendingTasks()
-      .then((data) => setTasks(data.tasks || []))
-      .catch(() => { /* silent */ });
+    const load = () =>
+      fetchPendingTasks()
+        .then((data) => setTasks(data.tasks || []))
+        .catch(() => {});
+    load();
+    // Poll every 5 seconds so newly-uploaded tasks appear without a
+    // page refresh.  The interval is cheap (a tiny JSON payload) and
+    // keeps the sidebar accurate even when the task was created in
+    // another tab or via WeChat.
+    const id = setInterval(load, 5000);
+    return () => clearInterval(id);
   }, []);
 
   if (tasks.length === 0) return null;
 
   const handleStartTask = (task: PendingTask) => {
-    // Dispatch CustomEvent so the chat page picks it up even when
-    // already mounted (same-page nav via router.push may not remount).
     if (typeof window !== "undefined") {
       window.dispatchEvent(
         new CustomEvent("start-teach", { detail: task.teach_session_id }),
       );
     }
-    // Also navigate — handles cross-page case (user on /co-writer etc.)
     if (task.dt_session_id) {
       router.push(`/chat/${task.dt_session_id}`);
     } else {

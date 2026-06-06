@@ -465,7 +465,7 @@ stderr_logfile_maxbytes=0
 environment=PYTHONPATH="/app:/tutor_platform",PYTHONUNBUFFERED="1"
 
 [program:frontend]
-command=/bin/bash -c "cd /app/web && node node_modules/next/dist/bin/next dev -H 0.0.0.0 -p ${FRONTEND_PORT:-3783}"
+command=/bin/bash -c "rm -rf /app/web/.next2 && cd /app/web && node node_modules/next/dist/bin/next dev --turbo -H 0.0.0.0 -p ${FRONTEND_PORT:-3783}"
 directory=/app/web
 autostart=true
 autorestart=true
@@ -475,6 +475,7 @@ stdout_logfile_maxbytes=0
 stderr_logfile=/dev/fd/2
 stderr_logfile_maxbytes=0
 environment=NODE_ENV="development",FRONTEND_PORT="3783"
+startretries=3
 
 [program:proxy]
 command=/usr/local/bin/node /app/scripts/frontend-proxy.mjs

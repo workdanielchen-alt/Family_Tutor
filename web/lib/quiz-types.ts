@@ -53,6 +53,48 @@ export interface QuizQuestion {
   knowledge_context?: string;
 }
 
+// ── Guided Teaching v2 types ──────────────────────────────────────────
+
+/** Structured question model for the guided-teaching flow (v2).
+ *  Mirrors tutor_platform.teach_question.TeachQuestion. */
+export interface TeachQuestion {
+  index: number;
+  total: number;
+  question_type: "choice" | "fill_blank" | "short_answer" | "written";
+  content: string;
+  options?: Record<string, string> | null;
+  answer_key: string;
+  explanation: string;
+  knowledge_point: string;
+  hints: string[];             // [L1, L2, L3] progressive hints
+  difficulty: "easy" | "medium" | "hard";
+}
+
+/** AI evaluation result for one student answer. */
+export interface TeachEvaluation {
+  is_correct: boolean;
+  score: number;               // 0.0 | 0.5 | 1.0
+  feedback: string;
+  answer_key: string;
+  explanation: string;
+}
+
+/** Tracks the learner's answer state for one question. */
+export interface TeachAnswerState {
+  submitted: boolean;
+  userAnswer: string;
+  selectedOption: string | null;   // for choice/concept questions
+  isCorrect: boolean | null;       // null = not auto-gradable
+}
+
+/** Per-knowledge-point summary for the completion panel. */
+export interface KnowledgePointSummary {
+  [kpId: string]: {
+    correct: number;
+    total: number;
+  };
+}
+
 export interface QuizFollowupContext {
   parent_quiz_session_id?: string;
   question_id: string;

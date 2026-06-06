@@ -32,7 +32,9 @@ import type { SelectedHistorySession } from "@/components/chat/HistorySessionPic
 import type { SelectedQuestionEntry } from "@/components/chat/QuestionBankPicker";
 import ChatComposer from "@/components/chat/home/ChatComposer";
 import { ChatMessageList } from "@/components/chat/home/ChatMessages";
-import { TeachingChatView, type TeachingMessage } from "@/components/chat/home/TeachingChatView";
+import { TeachingChatView, type TeachingMessage } from "@/components/chat/home/TeachingChatView";  // legacy fallback
+import GuidedQuizFlow from "@/components/quiz/GuidedQuizFlow";
+import type { TeachQuestion, TeachEvaluation, TeachAnswerState, KnowledgePointSummary } from "@/lib/quiz-types";
 import TaskCreateModal from "@/components/chat/home/TaskCreateModal";
 // Imported eagerly so the drawer shell is always mounted off-screen —
 // clicking a chip becomes a single CSS class flip, no chunk fetch + double
@@ -315,6 +317,33 @@ export default function ChatPage() {
   const teachLaunchingRef = useRef<string | null>(null);
   const [teachingMessages, setTeachingMessages] = useState<TeachingMessage[]>([]);
   const [isTeachingWaiting, setIsTeachingWaiting] = useState(false);
+
+  // v2: structured guided-teaching state
+  const [teachQuestions, setTeachQuestions] = useState<TeachQuestion[]>([]);
+  const [teachCurrentIndex, setTeachCurrentIndex] = useState(0);
+  const [teachAnswers, setTeachAnswers] = useState<Record<number, TeachAnswerState>>({});
+  const [teachEvaluations, setTeachEvaluations] = useState<Record<number, TeachEvaluation>>({});
+  const [teachTitle, setTeachTitle] = useState("");
+  const [teachCorrectCount, setTeachCorrectCount] = useState(0);
+  const [teachWrongCount, setTeachWrongCount] = useState(0);
+  const [teachSummary, setTeachSummary] = useState<KnowledgePointSummary | undefined>();
+  const [teachDone, setTeachDone] = useState(false);
+  const [teachTotalQuestions, setTeachTotalQuestions] = useState(0);
+
+  // ── Reset teach state (called on completion or return-home) ──
+  const resetTeachState = useCallback(() => {
+    teachSessionIdRef.current = null;
+    setTeachQuestions([]);
+    setTeachCurrentIndex(0);
+    setTeachAnswers({});
+    setTeachEvaluations({});
+    setTeachTitle("");
+    setTeachCorrectCount(0);
+    setTeachWrongCount(0);
+    setTeachSummary(undefined);
+    setTeachDone(false);
+    setTeachTotalQuestions(0);
+  }, []);
 
   // ── Task create modal ──
   const [showTaskModal, setShowTaskModal] = useState(false);
@@ -943,13 +972,55 @@ export default function ChatPage() {
         }).catch(() => null);
 
         if (data?.ok && data.first_question) {
-          // The consumed original session is now marked completed.
-          // Use the NEW teach session id returned by api_teach_start
-          // so continueTeach targets the active session, not the consumed one.
           if (data.teach_session_id) {
             teachSessionIdRef.current = data.teach_session_id;
           }
-          setTeachingMessages([{ role: "assistant", content: data.first_question! }]);
+          // ── v2: structured question ──
+          const fq = data.first_question;
+          if (typeof fq === "object" && "index" in fq) {
+            const q1 = fq as TeachQuestion;
+            // ── Resume: past_questions exist → restore full state ──
+            const past = data.past_questions;
+
+            if (past && past.length > 0) {
+              // Build question list: past Q&As + current question if not stale
+              const allQs: TeachQuestion[] = past.map((p) => p.question);
+              const curQ = data.current_question;
+              if (curQ) allQs.push(curQ);
+              const activeIndex = curQ ? past.length : past.length - 1;
+              const answerMap: Record<number, TeachAnswerState> = {};
+              const evalMap: Record<number, TeachEvaluation> = {};
+              past.forEach((p, i) => {
+                answerMap[i] = {
+                  submitted: true,
+                  userAnswer: p.user_answer || "",
+                  selectedOption: null,
+                  isCorrect: p.evaluation?.is_correct ?? null,
+                };
+                evalMap[i] = p.evaluation;
+              });
+              setTeachQuestions(allQs);
+              setTeachCurrentIndex(activeIndex);
+              setTeachAnswers(answerMap);
+              setTeachEvaluations(evalMap);
+              setTeachTotalQuestions(data.total_questions || 0);
+            } else {
+              setTeachQuestions([q1]);
+              setTeachCurrentIndex(0);
+              setTeachTitle(data.title || "");
+              setTeachCorrectCount(0);
+              setTeachWrongCount(0);
+              setTeachDone(false);
+              setTeachTotalQuestions(data.total_questions || 0);
+              setTeachAnswers({});
+              setTeachEvaluations({});
+            }
+            setTeachingMessages([]);  // clear legacy
+          } else {
+            // ── v1: legacy text fallback ──
+            setTeachQuestions([]);
+            setTeachingMessages([{ role: "assistant", content: String(fq) }]);
+          }
         } else {
           setTeachingMessages([]);
           setIsTeachingWaiting(false);
@@ -1526,10 +1597,31 @@ export default function ChatPage() {
         }).catch(() => null);
         if (data?.ok && data.teach_session_id && data.first_question) {
           teachSessionIdRef.current = data.teach_session_id;
-          setTeachingMessages([{ role: "assistant", content: data.first_question }]);
+          // ── v2: structured question ──
+          const fq = data.first_question;
+          if (typeof fq === "object" && "index" in fq) {
+            const q = fq as TeachQuestion;
+            setTeachQuestions([q]);
+            setTeachCurrentIndex(0);
+            setTeachTitle(data.title || title);
+            setTeachCorrectCount(0);
+            setTeachWrongCount(0);
+            setTeachDone(false);
+            setTeachTotalQuestions(data.total_questions || 0);
+            setTeachAnswers({});
+            setTeachEvaluations({});
+            setTeachingMessages([]);
+          } else {
+            setTeachQuestions([]);
+            setTeachingMessages([{ role: "assistant", content: String(fq) }]);
+          }
           setTaskModalLoading(false);
           setShowTaskModal(false);
           setTaskModalFile(null);
+          // Notify sidebar to refresh pending task list
+          if (typeof window !== "undefined") {
+            window.dispatchEvent(new CustomEvent("task-created"));
+          }
         } else {
           setTaskModalError(data?.error || "试卷创建失败，请检查文件格式后重试");
           setTaskModalLoading(false);
@@ -1612,18 +1704,58 @@ export default function ChatPage() {
           message: content || t("Please continue."),
           learner_id: "default",
         }).catch(() => null);
-        if (data?.ok && data.reply) {
-          injectAssistantMessage(data.reply);
-          // Sync progress to task
-          if (data.current != null) {
-            updateTaskProgress(teachSessionIdRef.current, {
-              current_question: data.current,
-              correct_count: data.correct_count,
-              wrong_count: data.wrong_count,
-              done: data.done,
-            }).catch(() => {});
+        if (data?.ok) {
+          // ── v2: structured evaluation + next_question ──
+          if (data.evaluation && teachQuestions.length > 0) {
+            const currentIdx = teachCurrentIndex;
+            // Store evaluation
+            setTeachEvaluations((prev) => ({
+              ...prev,
+              [currentIdx]: data.evaluation!,
+            }));
+            // Store answer state
+            setTeachAnswers((prev) => ({
+              ...prev,
+              [currentIdx]: {
+                submitted: true,
+                userAnswer: content || "",
+                selectedOption: null,
+                isCorrect: data.evaluation?.is_correct ?? null,
+              },
+            }));
+            // Update counts
+            if (data.correct_count != null) setTeachCorrectCount(data.correct_count);
+            if (data.wrong_count != null) setTeachWrongCount(data.wrong_count);
+            // Append next question
+            if (data.next_question && teachCurrentIndex + 1 >= teachQuestions.length) {
+              setTeachQuestions((prev) => [...prev, data.next_question!]);
+            }
+            // Update task progress
+            if (data.current != null) {
+              updateTaskProgress(teachSessionIdRef.current, {
+                current_question: data.current,
+                correct_count: data.correct_count,
+                wrong_count: data.wrong_count,
+                done: data.done,
+              }).catch(() => {});
+            }
+            if (data.done) {
+              if (data.summary) setTeachSummary(data.summary);
+              setTeachDone(true);
+            }
+          } else if (data.reply) {
+            // ── v1 legacy fallback ──
+            injectAssistantMessage(data.reply);
+            if (data.current != null) {
+              updateTaskProgress(teachSessionIdRef.current, {
+                current_question: data.current,
+                correct_count: data.correct_count,
+                wrong_count: data.wrong_count,
+                done: data.done,
+              }).catch(() => {});
+            }
+            if (data.done) teachSessionIdRef.current = null;
           }
-          if (data.done) teachSessionIdRef.current = null;
         }
         return;
       }
@@ -1694,6 +1826,8 @@ export default function ChatPage() {
       state.isStreaming,
       t,
       visualizeConfig,
+      teachQuestions.length,
+      teachCurrentIndex,
     ],
   );
 
@@ -1989,7 +2123,143 @@ export default function ChatPage() {
             </div>
           </div>
           <div className="mx-auto flex w-full max-w-[960px] flex-1 min-h-0 flex-col overflow-hidden px-6">
-            {teachingMessages.length > 0 && teachSessionIdRef.current ? (
+            {teachQuestions.length > 0 && teachSessionIdRef.current ? (
+              <GuidedQuizFlow
+                questions={teachQuestions}
+                currentIndex={teachCurrentIndex}
+                answers={teachAnswers}
+                evaluations={teachEvaluations}
+                teachSessionId={teachSessionIdRef.current}
+                title={teachTitle}
+                correctCount={teachCorrectCount}
+                wrongCount={teachWrongCount}
+                isWaiting={isTeachingWaiting}
+                isComplete={teachDone}
+                totalQuestions={teachTotalQuestions}
+                summary={teachSummary}
+                onAnswer={async (answer, selectedOption) => {
+                  if (!teachSessionIdRef.current) return;
+
+                  const currentIdx = teachCurrentIndex;
+                  // ── Retry: already submitted, evaluation exists ──
+                  const existingEval = teachEvaluations[currentIdx];
+                  if (teachAnswers[currentIdx]?.submitted && existingEval) {
+                    // Don't call the API again — reuse the existing evaluation
+                    // but re-grade locally against the correct answer.
+                    const q = teachQuestions[currentIdx];
+                    let reCorrect: boolean | null = null;
+                    if (q) {
+                      const correctKey = q.answer_key.trim().charAt(0).toUpperCase();
+                      const userKey = (selectedOption || answer).trim().charAt(0).toUpperCase();
+                      reCorrect = userKey === correctKey;
+                    }
+                    setTeachAnswers((prev) => ({
+                      ...prev,
+                      [currentIdx]: {
+                        submitted: true,
+                        userAnswer: answer,
+                        selectedOption: selectedOption,
+                        isCorrect: reCorrect,
+                      },
+                    }));
+                    // Update counts: wrong → correct or correct → wrong
+                    if (reCorrect != null) {
+                      const wasCorrect = teachAnswers[currentIdx]?.isCorrect;
+                      if (reCorrect && !wasCorrect) {
+                        setTeachCorrectCount((c) => c + 1);
+                        setTeachWrongCount((c) => Math.max(0, c - 1));
+                      } else if (!reCorrect && wasCorrect) {
+                        setTeachCorrectCount((c) => Math.max(0, c - 1));
+                        setTeachWrongCount((c) => c + 1);
+                      }
+                    }
+                    return;
+                  }
+
+                  setIsTeachingWaiting(true);
+
+                  // ── Immediate feedback: set answer state now so the
+                  //     UI shows "submitted" instantly.  Client-side
+                  //     pre-judge and AI evaluation arrive async.
+                  const q = teachQuestions[currentIdx];
+                  const correctKey = q?.answer_key?.trim().charAt(0).toUpperCase() ?? "";
+                  const userKey = (selectedOption || answer).trim().charAt(0).toUpperCase();
+                  const clientCorrect = (q?.question_type === "choice")
+                    ? userKey === correctKey
+                    : null;
+                  setTeachAnswers((prev) => ({
+                    ...prev,
+                    [currentIdx]: {
+                      submitted: true,
+                      userAnswer: answer,
+                      selectedOption: selectedOption,
+                      isCorrect: clientCorrect,
+                    },
+                  }));
+
+                  const data = await continueTeach({
+                    teach_session_id: teachSessionIdRef.current,
+                    message: answer,
+                  }).catch(() => null);
+                  if (data?.ok) {
+                    const currentIdx = teachCurrentIndex;
+                    // Handle structured response
+                    if (data.evaluation) {
+                      // Evaluation is new; answer state was already set above.
+                      setTeachEvaluations((prev) => ({ ...prev, [currentIdx]: data.evaluation! }));
+                      // Refine the isCorrect flag from AI (falls back to client pre-judge)
+                      if (data.evaluation?.is_correct != null) {
+                        setTeachAnswers((prev) => ({
+                          ...prev,
+                          [currentIdx]: {
+                            ...(prev[currentIdx] ?? { submitted: true, userAnswer: answer, selectedOption: selectedOption, isCorrect: null }),
+                            isCorrect: data.evaluation!.is_correct,
+                          },
+                        }));
+                      }
+                      if (data.correct_count != null) setTeachCorrectCount(data.correct_count);
+                      if (data.wrong_count != null) setTeachWrongCount(data.wrong_count);
+                      // Only append the next question once — retries on the same
+                      // question update the evaluation but not the question list.
+                      if (data.next_question && currentIdx + 1 >= teachQuestions.length) {
+                        setTeachQuestions((prev) => [...prev, data.next_question!]);
+                      }
+                      if (data.current != null) {
+                        updateTaskProgress(teachSessionIdRef.current!, {
+                          current_question: data.current,
+                          correct_count: data.correct_count,
+                          wrong_count: data.wrong_count,
+                          done: data.done,
+                        }).catch(() => {});
+                      }
+                      if (data.done) {
+                        if (data.summary) setTeachSummary(data.summary);
+                        setTeachDone(true);
+                      }
+                    } else if (data.reply) {
+                      // Legacy fallback
+                      setTeachingMessages((prev) => [
+                        ...prev,
+                        { role: "assistant", content: data.reply! },
+                      ]);
+                    }
+                  }
+                  setIsTeachingWaiting(false);
+                }}
+                onNavigate={(newIdx) => {
+                  // Clamp: never navigate past the end of loaded questions
+                  const safeIdx = Math.min(newIdx, teachQuestions.length - 1);
+                  setTeachCurrentIndex(Math.max(0, safeIdx));
+                }}
+                onComplete={() => {
+                  // Completion panel will show; reset when user navigates away.
+                }}
+                onReturnHome={() => {
+                  resetTeachState();
+                  router.push("/chat");
+                }}
+              />
+            ) : teachingMessages.length > 0 && teachSessionIdRef.current ? (
               <TeachingChatView
                 messages={teachingMessages}
                 onSendAnswer={async (answer) => {
@@ -2008,7 +2278,6 @@ export default function ChatPage() {
                       ...prev,
                       { role: "assistant", content: data.reply! },
                     ]);
-                    // Sync progress to task
                     if (data.current != null) {
                       updateTaskProgress(teachSessionIdRef.current!, {
                         current_question: data.current,
@@ -2097,7 +2366,7 @@ export default function ChatPage() {
               </div>
             )}
 
-            {teachingMessages.length === 0 || !teachSessionIdRef.current ? (
+            {(teachingMessages.length === 0 && teachQuestions.length === 0) || !teachSessionIdRef.current ? (
             <ChatComposer
               composerRef={composerRef}
               capMenuRef={capMenuRef}
