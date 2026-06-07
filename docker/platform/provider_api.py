@@ -6402,6 +6402,12 @@ async def _direct_deepseek_teach(
         _exam_ctx = context.strip() or _last_tutor_context.get(learner_id, "")
         if _exam_ctx:
             user_content += f"\n\n# 当前试卷（下一题必须从此试卷中选取）\n{_exam_ctx[:6000]}"
+            # 列出已答题目，帮助 LLM 知道从哪题继续
+            _answered_list = []
+            for _i in range(1, _qnum):
+                _answered_list.append(f"第{_i}题")
+            if _answered_list:
+                user_content += "\n# 已完成（不允许重复出这些题）\n" + ", ".join(_answered_list) + "\n"
 
     payload = {
         "model": llm_model,
