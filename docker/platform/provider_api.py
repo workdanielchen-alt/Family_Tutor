@@ -6152,6 +6152,9 @@ def _build_display_text(parsed: dict, phase: str) -> str:
             kp = q.get("knowledge_point", "")
             if kp:
                 lines.append(f"【知识点：{kp}】")
+            hints = q.get("hints", [])
+            if hints and len(hints) > 0:
+                lines.append(f"\n💡 {hints[0]}")
     elif phase == "EVALUATE_ANSWER":
         ev = parsed.get("evaluation", {})
         if isinstance(ev, dict):
