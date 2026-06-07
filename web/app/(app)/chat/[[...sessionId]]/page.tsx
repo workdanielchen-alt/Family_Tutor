@@ -2262,6 +2262,29 @@ export default function ChatPage() {
             ) : teachingMessages.length > 0 && teachSessionIdRef.current ? (
               <TeachingChatView
                 messages={teachingMessages}
+                onSkip={async () => {
+                  if (!teachSessionIdRef.current) return;
+                  setIsTeachingWaiting(true);
+                  try {
+                    const res = await fetch("/api/platform/teach/skip", {
+                      method: "POST",
+                      headers: {"Content-Type": "application/json"},
+                      body: JSON.stringify({teach_session_id: teachSessionIdRef.current}),
+                    });
+                    const data = await res.json();
+                    if (data?.ok) {
+                      setTeachingMessages((prev) => [
+                        ...prev,
+                        {role: "assistant", content: "⏭️ 已跳过此题"},
+                      ]);
+                      if (data.done) {
+                        setTeachDone(true);
+                        teachSessionIdRef.current = null;
+                      }
+                    }
+                  } catch {}
+                  setIsTeachingWaiting(false);
+                }}
                 onSendAnswer={async (answer) => {
                   if (!teachSessionIdRef.current) return;
                   setIsTeachingWaiting(true);

@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useTranslation } from "react-i18next";
 import { useAppShell } from "@/context/AppShellContext";
-import { fetchPendingTasks, type PendingTask } from "@/lib/platform-api";
+import { fetchPendingTasks, deletePendingTask, type PendingTask } from "@/lib/platform-api";
 
 const SOURCE_ICONS: Record<string, string> = {
   wechat: "📱",
@@ -39,6 +39,13 @@ export default function PendingTasksBanner() {
   }, []);
 
   if (tasks.length === 0) return null;
+
+  const handleDeleteTask = async (e: React.MouseEvent, task: PendingTask) => {
+    e.stopPropagation();
+    if (!window.confirm("删除「" + task.title + "」？")) return;
+    await deletePendingTask(task.teach_session_id);
+    setTasks((prev) => prev.filter((t) => t.teach_session_id !== task.teach_session_id));
+  };
 
   const handleStartTask = (task: PendingTask) => {
     if (typeof window !== "undefined") {
@@ -126,6 +133,13 @@ export default function PendingTasksBanner() {
                 </div>
               )}
             </div>
+            <span
+              onClick={(e) => handleDeleteTask(e, task)}
+              className="shrink-0 px-1 text-[13px] text-[var(--muted-foreground)]/30 opacity-0 transition-opacity group-hover:opacity-100 hover:text-red-400"
+              title="删除"
+            >
+              ✕
+            </span>
           </button>
         );
       })}

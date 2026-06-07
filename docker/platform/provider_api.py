@@ -33,7 +33,7 @@ sys.path.insert(0, "/tutor_platform")
 sys.path.insert(0, "/")
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 import httpx
 from markitdown import MarkItDown
 from pydantic import BaseModel
@@ -64,6 +64,7 @@ from tutor_platform.teach_question import (
     JSON_BLOCK_RE,
     TeachEvaluation,
     TeachQuestion,
+    ExtractedExam,
     strip_options_from_content,
     parse_evaluation_from_json,
     parse_question_from_json,
@@ -180,17 +181,20 @@ def _hash_file(file_path: str) -> str:
 # Phase C protocol handler (e.g. student answers "B"), the cached context
 # is auto-injected so DT TutorBot has the teaching context.
 _last_tutor_context: dict[str, str] = {}
+# ── 教学图形缓存：_build_teaching_persona 注入后供 _tutor_chat_core 后处理使用 ──
+_last_teaching_figures: dict[str, list[dict]] = {}
 _MAX_CACHED_CONTEXTS = 100
+
 
 # Question number tracker per learner: tracks the last question number DT
 # output (e.g. "第5题"). Used by auto-next to send explicit "请出第N+1题"
 # instead of ambiguous "下一题" — prevents LLM miscounting/skipping.
 _last_question_num: dict[str, int] = {}
 
-# Correct answer key per learner: stores the most recent correct answer
-# extracted from DT's [ANSWER_KEY:X] marker.  Injected into SOUL.md on
-# the next turn so the LLM sees the correct answer in its system prompt.
-_answer_keys: dict[str, str] = {}
+# Correct answer key per learner: stores answer keys per question index so
+# that navigating to any question (next/prev/redo) can find the right key.
+# Structure: {learner_id: {question_index: "answer_key_string"}}
+_answer_keys: dict[str, dict[int, str]] = {}
 
 # Per-learner KP name parsed from DT's 【知识点：XXX】 marker, stored after
 # each question is asked.  Used for mastery recording on the next turn when
@@ -216,6 +220,15 @@ _FATIGUE_THRESHOLDS = {
     "primary_high": {"questions": 10, "minutes": 25},
     "middle": {"questions": 15, "minutes": 35},
 }
+
+# ── 试卷结构化提取缓存 ──
+# key: learner_id，在 OCR 后由 LLM 提取，逐题教学中验证 DT 输出
+_extracted_exams: dict[str, "ExtractedExam"] = {}
+
+# ── OCR 正则拆题缓存 ──
+# key: learner_id，value: {1: "第1题正文", 2: "第2题正文", ...}
+# 用于分段喂 DT，避免 LLM 看到后续题目内容
+_ocr_questions: dict[str, dict[int, str]] = {}
 
 # Hint Ladder: per-question hint level (0-3) per learner.
 # Key format: "{learner_id}:{question_index}" → int (0-3).
@@ -1458,7 +1471,7 @@ async def _handle_pdf(file_path: str, trace_id: str, kb_name: str = "", filename
 async def _pdf_manual_ocr_fallback(file_path: str, trace_id: str, kb_name: str = "", filename: str = "") -> str:
     """Manual PDF OCR: fitz render each page → OpenCV preprocess → OCR.
 
-    Uses file-based checkpoints (JSON in /data/ocr_checkpoints/) for resume
+    Uses file-based checkpoints (JSON in chromadb/ocr_checkpoints/) for resume
     on container restart.  Checkpoints never touch ChromaDB — only the final
     chunked+embedded index goes there via ``_sync_kb_from_dt``.
     """
@@ -1478,7 +1491,7 @@ async def _pdf_manual_ocr_fallback(file_path: str, trace_id: str, kb_name: str =
     # ── File-based checkpoint: resume from last successful run ──
     import hashlib as _hl
     _ckpt_dir = os.path.join(
-        os.environ.get("CHROMA_PERSIST_DIR", "/data/chromadb"), "..", "ocr_checkpoints",
+        os.environ.get("CHROMA_PERSIST_DIR", "/data/chromadb"), "ocr_checkpoints",
     )
     _ckpt_key = _hl.sha256((filename or Path(file_path).name).encode("utf-8")).hexdigest()[:16]
     _ckpt_path = os.path.join(_ckpt_dir, f"{_ckpt_key}.json")
@@ -2327,6 +2340,82 @@ async def _ingest_to_kb(
             except Exception:
                 pass
 
+    # ── Step 3: Figure extraction + storage + disk persistence ──
+    try:
+        from tutor_platform.rag.extractors import extract_figures
+        from pathlib import Path as _Path
+
+        fig_file_path = meta.get("file_path", "") if isinstance(meta, dict) else ""
+        file_path_local = fig_file_path or _get_source_path(filename, trace_id)
+        if file_path_local and os.path.isfile(file_path_local):
+            _figures = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: extract_figures(file_path_local, trace_id=trace_id),
+            )
+            if _figures:
+                # Persist figure PNGs to .figures/ directory alongside source
+                _src = _Path(file_path_local)
+                _fig_dir = _src.parent / f"{_src.stem}.figures"
+                _fig_dir.mkdir(exist_ok=True)
+                for _f in _figures:
+                    _img = _f.get("image_bytes")
+                    if _img:
+                        _fp = _fig_dir / f"{_f['figure_id']}.png"
+                        try:
+                            _fp.write_bytes(_img)
+                            _f["image_path"] = str(_fp)
+                        except OSError:
+                            pass
+                    _f.pop("image_bytes", None)
+
+                # Also write a sidecar listing for quick reference
+                try:
+                    import json as _json
+                    _fig_list = [{
+                        "figure_id": f["figure_id"],
+                        "fig_type": f["fig_type"],
+                        "fig_type": f["fig_type"],
+                        "caption": f.get("caption", ""),
+                        "description_text": f.get("description_text", ""),
+                        "image_path": f.get("image_path", ""),
+                    } for f in _figures]
+                    (_fig_dir / "_index.json").write_text(
+                        _json.dumps(_fig_list, ensure_ascii=False, indent=2),
+                    )
+                except Exception:
+                    pass
+
+                await provider.add_figures(
+                    kb_name=_chroma_kb,
+                    figures=_figures,
+                )
+                logger.info(
+                    "[%s] Figure storage: %d figures -> %s + .figures/",
+                    trace_id, len(_figures), _chroma_kb,
+                )
+    except Exception as exc:
+        logger.debug("[%s] Figure extraction skipped: %s", trace_id, exc)
+
+
+def _get_source_path(filename: str, trace_id: str) -> str:
+    """Try to locate the source file for figure extraction.
+
+    Looks in SOURCES_DIR for files matching the filename or trace_id.
+    """
+    import glob as _glob
+    sources_dir = os.environ.get("SOURCES_DIR", "/data/sources")
+    # Try by trace_id first
+    trace_pattern = os.path.join(sources_dir, f"*{trace_id}*")
+    matches = _glob.glob(trace_pattern)
+    if matches:
+        return matches[0]
+    # Try by filename
+    name_pattern = os.path.join(sources_dir, "**", filename)
+    matches = _glob.glob(name_pattern, recursive=True)
+    if matches:
+        return matches[0]
+    return ""
+
 
 def _split_content_for_ingest(content: str, filename: str, chunk_size: int = 800) -> list[str]:
     """Split content into chunks for KB ingestion.
@@ -3009,7 +3098,7 @@ async def _startup_kb_sync():
 
     First purges old ocr_batch records from the previous ChromaDB-checkpoint
     era, then re-syncs each KB from DT.  Scanned PDFs use file-based checkpoints
-    (/data/ocr_checkpoints/) so container restarts resume without re-doing pages.
+    (/data/chromadb/ocr_checkpoints/) so container restarts resume without re-doing pages.
     """
     await asyncio.sleep(5)  # let provider + other services stabilize
 
@@ -3508,6 +3597,217 @@ def api_kb_search(query: str = "", kb_name: str = "初中教材", top_k: int = 5
         return {"ok": False, "error": str(e), "source": "chromadb"}
 
 
+@app.get("/api/kb/figures/search")
+def api_kb_figures_search(
+    kb_name: str = "",
+    query: str = "",
+    top_k: int = 20,
+):
+    """搜索图形 collection，返回含 image_url 的搜索结果。"""
+    if not query.strip():
+        return {"ok": False, "error": "query is required"}
+
+    # 用 provider 的内部 ChromaDB 查（避免 SharedSystemClient 冲突）
+    from tutor_platform.unified_provider import _sanitize_collection_name
+    import chromadb
+
+    fig_coll = _sanitize_collection_name(f"{kb_name}_figures") if kb_name else ""
+    if not fig_coll:
+        return {"ok": True, "results": [], "total": 0}
+
+    try:
+        client = chromadb.PersistentClient(path="/data/chromadb")
+        coll = client.get_collection(fig_coll)
+    except Exception:
+        return {"ok": True, "results": [], "total": 0}
+
+    from tutor_platform.tools.embeddings import BgeSmallEmbedding
+    try:
+        _ef = BgeSmallEmbedding()
+        _qvec = _ef([query])
+        results = coll.query(query_embeddings=_qvec, n_results=top_k)
+    except Exception:
+        return {"ok": True, "results": [], "total": 0}
+
+    docs = results.get("documents", [[]])[0] or []
+    metas = results.get("metadatas", [[]])[0] or []
+    dists = results.get("distances", [[]])[0] or []
+
+    items = []
+    for i, doc in enumerate(docs):
+        meta = metas[i] if i < len(metas) else {}
+        dist = float(dists[i]) if i < len(dists) else 1.0
+        fid = meta.get("figure_id", "")
+        items.append({
+            "figure_id": fid,
+            "fig_type": meta.get("fig_type", "unknown"),
+            "caption": meta.get("caption", ""),
+            "source_file": meta.get("source_file", ""),
+            "page_num": int(meta.get("page_num", 0)),
+            "description": (doc or "")[:300],
+            "score": round(1.0 - min(dist, 1.0), 3),
+            "image_url": f"/api/kb/figures/{fid}/image?kb_name={kb_name}" if fid else "",
+        })
+
+    return {"ok": True, "results": items, "total": len(items)}
+
+    docs = results.get("documents", [[]])[0]
+    metas = results.get("metadatas", [[]])[0] or []
+    distances = results.get("distances", [[]])[0] or []
+
+    items = []
+    for i, doc in enumerate(docs):
+        meta = metas[i] if i < len(metas) else {}
+        dist = float(distances[i]) if i < len(distances) else 1.0
+        fid = meta.get("figure_id", "")
+
+        items.append({
+            "figure_id": fid,
+            "fig_type": meta.get("fig_type", "unknown"),
+            "caption": meta.get("caption", ""),
+            "source_file": meta.get("source_file", ""),
+            "page_num": int(meta.get("page_num", 0)),
+            "description": doc[:300],
+            "score": round(1.0 - min(dist, 1.0), 3),
+            "image_url": f"/api/kb/figures/{fid}/image?kb_name={kb_name}" if fid else "",
+        })
+
+    return {"ok": True, "results": items, "total": len(items)}
+
+
+@app.get("/api/kb/figures/{figure_id}/image")
+def api_kb_figure_image(figure_id: str, kb_name: str = ""):
+    """返回图形裁剪 PNG 的二进制内容。"""
+    import glob as _glob
+
+    if not figure_id:
+        return Response(status_code=404)
+
+    # 在所有已知的 .figures 目录中搜索 figure_id.png
+    _search_roots = [
+        os.environ.get("SOURCES_DIR", "/data/sources"),
+        "/data/knowledge_bases",
+        "/data/sources",
+    ]
+
+    for _root in _search_roots:
+        if not os.path.isdir(_root):
+            continue
+        for _pattern in (f"**/*.figures/{figure_id}.png", f"**/*.figures/{figure_id}.jpg"):
+            matches = _glob.glob(os.path.join(_root, _pattern), recursive=True)
+            if matches:
+                _fp = matches[0]
+                _mt = "image/png" if _fp.endswith(".png") else f"image/{_fp.rsplit('.', 1)[-1]}"
+                return Response(
+                    content=Path(_fp).read_bytes(),
+                    media_type=_mt,
+                    headers={"Cache-Control": "public, max-age=3600"},
+                )
+
+    return Response(status_code=404)
+
+
+@app.get("/api/kb/figures/gallery")
+def api_kb_figures_gallery(kb_name: str = ""):
+    """图形浏览 HTML 页面——纯服务端渲染，直接展示所有图形缩略图。"""
+    from fastapi.responses import HTMLResponse
+
+    if not kb_name:
+        kb_name = "child_knowledge_base"
+
+    # 服务端直接查图库，避免 JS 转义问题
+    try:
+        from tutor_platform.tools.embeddings import BgeSmallEmbedding
+        import chromadb
+        from chromadb.config import Settings
+        from tutor_platform.unified_provider import _sanitize_collection_name
+
+        client = chromadb.PersistentClient(path="/data/chromadb", settings=Settings(anonymized_telemetry=False))
+        col_name = _sanitize_collection_name(f"{kb_name}_figures")
+        col = client.get_collection(col_name)
+        ef = BgeSmallEmbedding()
+        qvec = ef(["图"])
+        results = col.query(query_embeddings=qvec, n_results=100)
+    except Exception:
+        results = {"documents": [[]], "metadatas": [[]], "distances": [[]]}
+
+    docs = results.get("documents", [[]])[0] or []
+    metas = results.get("metadatas", [[]])[0] or []
+    dists = results.get("distances", [[]])[0] or []
+
+    cards_html = ""
+    if docs:
+        for i, doc in enumerate(docs):
+            meta = metas[i] if i < len(metas) else {}
+            dist = float(dists[i]) if i < len(dists) else 1.0
+            fid = meta.get("figure_id", "")
+            fig_type = meta.get("fig_type", "unknown")
+            caption = meta.get("caption", "")
+            img_url = f"/api/kb/figures/{fid}/image?kb_name={kb_name}" if fid else ""
+
+            type_label = {"geometry": "几何图", "function_graph": "函数图", "table": "表格", "illustration": "插图"}.get(fig_type, fig_type)
+            desc = (doc or "")[:200]
+
+            card = f"""<div class="card">"""
+            if img_url:
+                card += f"""<img class="card-img" src="{img_url}" loading="lazy" />"""
+            card += f"""<div class="card-body">
+        <div class="card-tags"><span class="tag">{type_label}</span></div>"""
+            if caption:
+                card += f"""<div class="card-title">{_html_escape(caption)}</div>"""
+            if desc:
+                card += f"""<div class="card-desc">{_html_escape(desc)}</div>"""
+            card += f"""<div class="card-source">{_html_escape(meta.get("source_file", "").split("/")[-1])}</div>"""
+            card += "</div></div>"
+            cards_html += card
+
+    if not cards_html:
+        body = """<div class="empty"><p>🖼️</p><p>该知识库暂无入库的图形</p></div>"""
+    else:
+        body = f"""<div class="gallery">{cards_html}</div>"""
+
+    html = f"""<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>图形浏览 - {_html_escape(kb_name)}</title>
+<style>
+  * {{margin:0;padding:0;box-sizing:border-box}}
+  body {{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#f5f5f7;color:#1d1d1f}}
+  .header {{background:#fff;border-bottom:1px solid #d2d2d7;padding:16px 24px}}
+  .header h1 {{font-size:18px;font-weight:600}}
+  .header p {{font-size:12px;color:#86868b;margin-top:2px}}
+  .gallery {{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px;padding:24px}}
+  .card {{background:#fff;border-radius:12px;overflow:hidden;border:1px solid #e8e8ed}}
+  .card-img {{width:100%;height:200px;object-fit:contain;background:#fafafa;display:block}}
+  .card-body {{padding:10px 14px 14px}}
+  .card-tags {{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px}}
+  .tag {{font-size:10px;padding:2px 8px;border-radius:10px;background:#e8f0fe;color:#0071e3;font-weight:500}}
+  .card-title {{font-size:13px;font-weight:500;margin-bottom:4px}}
+  .card-desc {{font-size:12px;color:#515154;line-height:1.5;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}}
+  .card-source {{font-size:10px;color:#86868b;margin-top:6px}}
+  .empty {{text-align:center;padding:60px 20px;color:#86868b;font-size:14px}}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>🔍 图形浏览: {_html_escape(kb_name)}</h1>
+  <p>共 {len(docs)} 个图形</p>
+</div>
+{body}
+</body>
+</html>"""
+    return HTMLResponse(html)
+
+
+def _html_escape(s: str) -> str:
+    """HTML 转义——防止 XSS。"""
+    if not s:
+        return ""
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Web UI ↔ ChromaDB 关联入库
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3651,7 +3951,7 @@ async def api_kb_ingest_file(
 async def _sync_kb_from_dt(kb_name: str, trace_id: str = "") -> dict:
     """从 DT 知识库同步全部文件到平台 ChromaDB（幂等，内容哈希防重复）。
 
-    扫描 PDF 使用文件 checkpoint（/data/ocr_checkpoints/），容器重启自动 resume。
+    扫描 PDF 使用文件 checkpoint（/data/chromadb/ocr_checkpoints/），容器重启自动 resume。
     全册 OCR 完成后一次性 chunk + embed 入库。
     """
     if not trace_id:
@@ -3688,48 +3988,96 @@ async def _sync_kb_from_dt(kb_name: str, trace_id: str = "") -> dict:
     import hashlib
     import tempfile
 
+    # Per-file duplicate check: use checkpoint JSON instead of ChromaDB queries.
+    # /data/chromadb/ocr_checkpoints/<sha256>.json  tracks lifecycle:
+    #   embedded=true    -> skip (zero-cost)
+    #   all pages done   -> assemble from JSON, no download
+    #   partial / absent -> download + OCR resume
+    _ckpt_dir = os.path.join(
+        os.environ.get("CHROMA_PERSIST_DIR", "/data/chromadb"), "ocr_checkpoints",
+    )
+    os.makedirs(_ckpt_dir, exist_ok=True)
+
     for filename in files:
-        # 2) 从 DT 下载原始文件 (URL-encode kb_name + filename)
-        safe_name = filename.replace("/", "%2F")
-        file_url = f"{DEEPTUTOR_URL}/api/v1/knowledge/{_safe_kb}/files/{safe_name}"
+        _ckpt_key = hashlib.sha256(filename.encode("utf-8")).hexdigest()[:16]
+        _ckpt_path = os.path.join(_ckpt_dir, f"{_ckpt_key}.json")
+        _ckpt_data: dict | None = None
         try:
-            async with httpx.AsyncClient(timeout=120) as dl:
-                file_resp = await dl.get(file_url)
-                if file_resp.status_code != 200:
-                    logger.warning(
-                        "[%s] DT download failed: %s (HTTP %d)",
-                        trace_id, filename, file_resp.status_code,
-                    )
-                    continue
-                raw = file_resp.content
-        except Exception as exc:
-            logger.warning("[%s] DT download error: %s: %s", trace_id, filename, exc)
+            if os.path.isfile(_ckpt_path):
+                _ckpt_data = json.loads(open(_ckpt_path, encoding="utf-8").read())
+        except Exception:
+            pass
+
+        # Branch 1: embedded=true -> skip
+        if _ckpt_data and _ckpt_data.get("embedded"):
+            logger.info("[%s] KB reindex skip (embedded): %s", trace_id, filename)
             continue
 
-        # 3) 提取文本
-        suffix = os.path.splitext(filename)[1] or ".bin"
-        tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
-        try:
-            tmp.write(raw)
-            tmp_path = tmp.name
-        finally:
-            tmp.close()
+        extracted: str = ""
+        tmp_path: str = ""
 
-        try:
-            result = await _handle_inbound_file(
-                tmp_path,
-                metadata={
-                    "source": "web_ui_reindex",
-                    "kb_name": kb_name,
-                    "trace_id": trace_id,
-                    "dt_filename": filename,
-                },
+        # Branch 2: all pages OCR'd but not embedded -> assemble from checkpoint
+        _page_texts = (_ckpt_data or {}).get("page_texts", {})
+        _total_pages = (_ckpt_data or {}).get("total_pages", 0)
+        if _page_texts and _total_pages and len(_page_texts) >= _total_pages:
+            logger.info(
+                "[%s] KB reindex from checkpoint (no download): %s (%d pages)",
+                trace_id, filename, len(_page_texts),
             )
-            extracted = result.get("content", "").strip()
-            if not extracted:
+            extracted = "\n\n".join(
+                f"--- Page {int(k) + 1} ---\n{v}"
+                for k, v in sorted(_page_texts.items(), key=lambda x: int(x[0]))
+            )
+        else:
+            # Branch 3: download and process
+            safe_name = filename.replace("/", "%2F")
+            file_url = f"{DEEPTUTOR_URL}/api/v1/knowledge/{_safe_kb}/files/{safe_name}"
+            try:
+                async with httpx.AsyncClient(timeout=120) as dl:
+                    file_resp = await dl.get(file_url)
+                    if file_resp.status_code != 200:
+                        logger.warning(
+                            "[%s] DT download failed: %s (HTTP %d)",
+                            trace_id, filename, file_resp.status_code,
+                        )
+                        continue
+                    raw = file_resp.content
+            except Exception as exc:
+                logger.warning("[%s] DT download error: %s: %s", trace_id, filename, exc)
                 continue
 
-            # 4) 入库平台 ChromaDB (use sanitized name)
+            suffix = os.path.splitext(filename)[1] or ".bin"
+            tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+            try:
+                tmp.write(raw)
+                tmp_path = tmp.name
+            finally:
+                tmp.close()
+
+            try:
+                result = await _handle_inbound_file(
+                    tmp_path,
+                    metadata={
+                        "source": "web_ui_reindex",
+                        "kb_name": kb_name,
+                        "trace_id": trace_id,
+                        "dt_filename": filename,
+                    },
+                )
+                extracted = result.get("content", "").strip()
+            except Exception as exc:
+                logger.warning("[%s] KB reindex error: %s: %s", trace_id, filename, exc)
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+        if not extracted:
+            continue
+
+        # 3) 入库平台 ChromaDB
+        try:
             _content_hash = hashlib.sha256(extracted.encode("utf-8")).hexdigest()[:16]
             docs = _split_content_for_ingest(extracted, filename)
             ids = [f"{_content_hash}_{i}" for i in range(len(docs))]
@@ -3759,13 +4107,22 @@ async def _sync_kb_from_dt(kb_name: str, trace_id: str = "") -> dict:
                 "[%s] KB reindex sync: %s -> %d chunks (chroma: %s)",
                 trace_id, filename, len(docs), _chroma_kb,
             )
-        except Exception as exc:
-            logger.warning("[%s] KB reindex error: %s: %s", trace_id, filename, exc)
-        finally:
+
+            # 4) 嵌入成功 → checkpoint 标记 embedded=true
+            _new_ckpt = _ckpt_data.copy() if _ckpt_data else {"filename": filename}
+            _new_ckpt["embedded"] = True
+            _new_ckpt["updated_at"] = time.time()
+            # 删除 page_texts 省磁盘
+            _new_ckpt.pop("page_texts", None)
+            _new_ckpt.pop("total_pages", None)
             try:
-                os.unlink(tmp_path)
-            except OSError:
+                with open(_ckpt_path + ".tmp", "w", encoding="utf-8") as _tf:
+                    json.dump(_new_ckpt, _tf, ensure_ascii=False)
+                os.replace(_ckpt_path + ".tmp", _ckpt_path)
+            except Exception:
                 pass
+        except Exception as exc:
+            logger.warning("[%s] KB embed error: %s: %s", trace_id, filename, exc)
 
     return {
         "ok": True,
@@ -3773,6 +4130,34 @@ async def _sync_kb_from_dt(kb_name: str, trace_id: str = "") -> dict:
         "total_chunks": total_chunks,
         "trace_id": trace_id,
     }
+
+
+@app.post("/api/embed")
+async def api_embed(request: Request):
+    """Ollama-compatible embedding endpoint for DT's ollama adapter.
+    
+    DT sends POST {model, input: ["text1", ...]} → returns {embeddings: [[...], ...]}.
+    Uses the same RkllamaEmbeddingFunction (Ollama Tier 1) as platform's own KB ingestion.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+    
+    texts = body.get("input") or []
+    if not texts or not isinstance(texts, list):
+        return JSONResponse({"error": "Missing 'input' list"}, status_code=400)
+    if not all(isinstance(t, str) for t in texts):
+        texts = [str(t) for t in texts]
+    
+    model = body.get("model", "bge-small-zh-v1.5")
+    
+    provider = await _get_provider()
+    embed_fn = provider._get_embed_fn()
+    loop = asyncio.get_running_loop()
+    embeddings = await loop.run_in_executor(None, lambda: embed_fn(texts))
+    
+    return {"model": model, "embeddings": embeddings}
 
 
 @app.post("/api/kb/sync-from-dt")
@@ -3982,6 +4367,8 @@ async def api_process_file(request: Request):
         kb_name = body.get("kb_name", "初中教材")
         learner_id = body.get("learner_id", "default")
         suppress_auto_teach = body.get("suppress_auto_teach", "")
+        if str(suppress_auto_teach).strip() == "1":
+            kb_name = ""
         file = None
     elif "multipart/form-data" in content_type:
         form = await request.form()
@@ -3990,6 +4377,8 @@ async def api_process_file(request: Request):
         kb_name = form.get("kb_name", "初中教材")
         learner_id = form.get("learner_id", "default")
         suppress_auto_teach = form.get("suppress_auto_teach", "")
+        if str(suppress_auto_teach).strip() == "1":
+            kb_name = ""
     else:
         return {"ok": False, "error": "Unsupported content-type; use JSON or multipart/form-data"}
 
@@ -4002,18 +4391,35 @@ async def api_process_file(request: Request):
         error = _validate_file(file.filename, len(content))
         if error:
             return {"ok": False, "error": error}
-        # 直接写入 SOURCES_DIR 归档目录，trace_id 前缀避免重名
+        # ── 按内容 hash 去重归档，微信教学文件不入 sources ──
         sources_dir = SOURCES_DIR
         os.makedirs(sources_dir, exist_ok=True)
         safe = os.path.basename(file.filename)
-        archive_name = f"{trace_id}_{int(time.time())}_{safe}"
+        import hashlib as _hl
+        _ch = _hl.sha256(content).hexdigest()[:16]
+        archive_name = f"{_ch}_{safe}"
         dest = os.path.join(sources_dir, archive_name)
-        with open(dest, "wb") as f:
-            f.write(content)
-        file_path_ref = dest
-        source_url = f"/sources/{archive_name}"
-        # ── Submit to unified pipeline in background (non-blocking) ──
-        _spawn_unified_pipeline_bg(dest, trace_id)
+        _is_wechat_teach = str(suppress_auto_teach).strip() == "1"
+        _was_deduped = False  # 标记：是否因内容重复而跳过
+        if _is_wechat_teach:
+            logger.debug("[%s] WeChat teaching file, skipped sources archive: %s", trace_id, safe)
+            import tempfile as _tmp
+            _tmpf = _tmp.NamedTemporaryFile(suffix=os.path.splitext(safe)[1], delete=False)
+            _tmpf.write(content); _tmpf.close()
+            dest = _tmpf.name
+            file_path_ref = dest
+            source_url = ""
+        elif os.path.exists(dest):
+            _was_deduped = True
+            logger.info("[%s] Duplicate archive skipped (hash=%s): %s", trace_id, _ch, safe)
+            file_path_ref = dest
+            source_url = f"/sources/{archive_name}"
+        else:
+            with open(dest, "wb") as f:
+                f.write(content)
+            _spawn_unified_pipeline_bg(dest, trace_id)
+            file_path_ref = dest
+            source_url = f"/sources/{archive_name}"
     elif file_path:
         file_path_ref = file_path
         source_url = ""
@@ -4053,8 +4459,8 @@ async def api_process_file(request: Request):
         },
     )
 
-    # Write extracted content to ChromaDB + DT if a KB is requested.
-    # WeChat sends suppress_auto_teach=1 — skip auto-ingest for tutoring files.
+    # Write extracted content to ChromaDB only for explicit KB uploads.
+    # WeChat teaching photos (suppress_auto_teach=1) skip ChromaDB ingestion.
     _proc_filename = file.filename if file and file.filename else os.path.basename(file_path_ref)
     if kb_name and kb_name.strip() and not (suppress_auto_teach and str(suppress_auto_teach).strip() == "1"):
         await _maybe_ingest_result(
@@ -4063,7 +4469,7 @@ async def api_process_file(request: Request):
             kb_name=kb_name,
             filename=_proc_filename,
             learner_id=learner_id,
-            source="mcp",
+            source="web",
             trace_id=trace_id,
         )
 
@@ -4102,7 +4508,7 @@ async def api_process_file(request: Request):
         )
 
         # ── 入库: 异步写入 ChromaDB + DT（不阻塞 WeChat 教学回复）──
-        if kb_name and kb_name.strip():
+        if kb_name and kb_name.strip() and not (suppress_auto_teach and str(suppress_auto_teach).strip() == "1"):
             asyncio.create_task(
                 _maybe_ingest_result(
                     provider=provider,
@@ -4117,6 +4523,13 @@ async def api_process_file(request: Request):
                 )
             )
 
+    # ── 附加归档状态到响应（前端/日志可见去重和过滤结果）──
+    if file and file.filename:
+        result["_archive"] = {
+            "dedup_skipped": _was_deduped,
+            "wechat_skipped": _is_wechat_teach,
+            "hash": _ch,
+        }
     return result
 
 
@@ -4726,11 +5139,16 @@ async def _build_teaching_persona(
     learner_id: str,
     context: str,
     mode: str = "guide",
+    kb_name: str = "初中教材",
 ) -> str:
     """Build the full teaching persona string from exam context + KB + mastery data.
 
     Pure data assembly — no HTTP calls.  The caller can cache the result and
     skip HTTP PATCH if the persona hasn't changed from the previous build.
+
+    When figure images are found in the KB search results, their URLs are
+    injected into the persona and also cached in ``_last_teaching_figures``
+    so ``_tutor_chat_core`` can append them to the teaching response.
     """
     _persona = _TEACHER_EXPLAIN_SOUL if mode == "explain" else _TEACHER_SOUL
     # Replace hint_level placeholder with current value (for Hint Ladder).
@@ -4834,8 +5252,12 @@ async def _build_teaching_persona(
     try:
         logger.debug("KB section ENTERED for %s", learner_id)
         provider = await _get_provider()
-        _kb_results = await provider.query(_chromadb_kb_name("初中教材"), [_exam], n_results=10)
+        _kb_results = await provider.query(
+            _chromadb_kb_name(kb_name), [_exam], n_results=10,
+            include_figures=True,
+        )
         _kb_found = []
+        _figures_injected: set[str] = set()
         if _exam:
             # Pass 1: prefer teaching_summary entries matching current subject.
             for _doc_item in _kb_results:
@@ -4876,6 +5298,50 @@ async def _build_teaching_persona(
             )
             for _dc in _kb_found:
                 _persona += f"- {_dc}\n"
+
+            # ── Inject figure images referenced by knowledge chunks ──
+            _fig_lines: list[str] = []
+            for _doc_item in _kb_results:
+                _figs = _doc_item.get("figures", [])
+                for _f in _figs:
+                    _fid = _f.get("figure_id", "")
+                    if not _fid or _fid in _figures_injected:
+                        continue
+                    _figures_injected.add(_fid)
+                    _ftype = _f.get("fig_type", "unknown")
+                    _fdesc = _f.get("description_text", "") or _f.get("caption", "")
+                    # Use proxy-friendly URL (deeptutor:3782 → platform:8100)
+                    _img_url = f"/api/platform/api/kb/figures/{_fid}/image?kb_name=初中教材"
+                    _fig_lines.append(
+                        f"![{_fdesc}]({_img_url})"
+                    )
+            if _fig_lines:
+                _persona += "\n### 相关图形\n以下是与当前知识点相关的图形，可作为教学辅助：\n"
+                for _line in _fig_lines:
+                    _persona += _line + "\n"
+
+                # ── 缓存图形数据，供 _tutor_chat_core 后处理注入回复 ──
+                try:
+                    _cached = []
+                    for _doc_item in _kb_results:
+                        for _f in _doc_item.get("figures", []):
+                            _fid = _f.get("figure_id", "")
+                            if _fid and _fid not in {c["figure_id"] for c in _cached}:
+                                _cached.append({
+                                    "figure_id": _fid,
+                                    "fig_type": _f.get("fig_type", ""),
+                                    "description_text": _f.get("description_text", ""),
+                                    "image_url": f"/api/platform/api/kb/figures/{_fid}/image?kb_name={kb_name}",
+                                })
+                    if _cached:
+                        _last_teaching_figures[learner_id] = _cached
+                        logger.debug(
+                            "[%s] Cached %d figures for learner %s",
+                            learner_id, len(_cached), learner_id,
+                        )
+                except Exception:
+                    pass
+
     except Exception as _kb_err:
         logger.warning("KB query failed for %s: %s", learner_id, _kb_err)
 
@@ -5610,6 +6076,58 @@ def _detect_total_questions(content: str) -> int:
     return max(nums) if nums else 0
 
 
+def _split_ocr_questions(ocr_text: str) -> dict[int, str]:
+    """按题号正则拆分 OCR 文本，返回 {题号: 题目正文}。
+
+    匹配格式：
+      - 行首 "1." "2．" "3、"
+      - "第1题" "第2题"
+      - "(1)" "（2）"
+
+    返回的题目正文不含题号标记，保留选项和换行。
+    """
+    if not ocr_text or not ocr_text.strip():
+        return {}
+
+    # 找所有题号位置 — 宽松匹配各种格式
+    markers: list[tuple[int, int]] = []
+    for m in re.finditer(
+        r"(?:^|\n)\s*"
+        r"(?:"
+        r"第\s*(\d{1,3})\s*[题、．.）\)]|"       # 第1题、第 2 题
+        r"(\d{1,3})\s*[.．、）\)]|"              # 1. 2． 3、
+        r"[（(]\s*(\d{1,3})\s*[）)]"             # (1) （2）
+        r")",
+        ocr_text,
+    ):
+        num = m.group(1) or m.group(2) or m.group(3)
+        if num:
+            n = int(num)
+            if 1 <= n <= 200:
+                markers.append((m.start(), n))
+
+    if not markers:
+        # 没有找到题号标记 → 整个作为一道题
+        return {1: ocr_text.strip()}
+
+    # 按题号切分
+    result: dict[int, str] = {}
+    for i, (pos, num) in enumerate(markers):
+        end = markers[i + 1][0] if i + 1 < len(markers) else len(ocr_text)
+        # 提取正文（去掉题号标记本身）
+        content = ocr_text[pos:end].strip()
+        # 去掉行首的题号标记
+        content = re.sub(
+            r"^(?:第\s*\d+\s*[题、．.）\)]|\d+\s*[.．、）\)]|[（(]\s*\d+\s*[）)])\s*",
+            "", content,
+        ).strip()
+        if content:
+            # 按题号顺序存储，确保连续
+            result[num] = content
+
+    return result
+
+
 def _build_display_text(parsed: dict, phase: str) -> str:
     """Build human-readable WeChat display text from a structured JSON response.
 
@@ -5884,6 +6402,9 @@ async def _direct_deepseek_teach(
         _exam_ctx = context.strip() or _last_tutor_context.get(learner_id, "")
         if _exam_ctx:
             user_content += f"\n\n# 当前试卷（下一题必须从此试卷中选取）\n{_exam_ctx[:6000]}"
+            user_content += f"\n# 已答题目（不要重复出这些题）\n"
+            for _i in range(1, _qnum):
+                user_content += f"第{_i}题 ✓\n"
 
     payload = {
         "model": llm_model,
@@ -5898,7 +6419,7 @@ async def _direct_deepseek_teach(
     _last_err = ""
     for _attempt in range(2):
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
+            async with httpx.AsyncClient(timeout=60) as client:
                 resp = await client.post(
                     llm_url,
                     json=payload,
@@ -6138,6 +6659,7 @@ async def _tutor_chat_core(
     trace_id: str,
     total_questions: int = 0,
     fast: bool = False,
+    teach_session_id: str = "",
 ) -> dict:
     """tutor_chat 核心逻辑 — 供 HTTP endpoint 和内部直接调用共用.
 
@@ -6148,6 +6670,7 @@ async def _tutor_chat_core(
         mode: "guide" 或 "explain"
         trace_id: 追踪 ID
         total_questions: 试卷总题数（用于完成检测）
+        teach_session_id: 已创建的 TeachSession ID（由调用者传入）
     Returns:
         {"ok": True, "content": "..."} 或 {"ok": False, "error": "..."}
     """
@@ -6174,36 +6697,49 @@ async def _tutor_chat_core(
 
     # 1. Context cache: remember last teaching context per learner.
     #    Persisted to disk for container restart recovery.
-    _teach_session_id: str = ""
+    _teach_session_id = teach_session_id
     if context.strip():
         _last_tutor_context[learner_id] = context
         _last_question_num[learner_id] = 0
+
         if len(_last_tutor_context) > _MAX_CACHED_CONTEXTS:
             _last_tutor_context.clear()
         _save_context_to_disk(learner_id)
+
+        # ── 向后兼容：调用者没传 teach_session_id 时自动创建 ──
+        # (hermes_agent 容器是旧镜像，还在调 /api/tutor/chat 不走 api_teach_start)
+        if not _teach_session_id:
+            try:
+                _existing = get_teach_store().get_pending(learner_id, limit=1)
+                if not _existing:
+                    _title = _derive_title_from_ocr(context.strip())
+                    _ts = get_teach_store().create(
+                        learner_id=learner_id, source="wechat",
+                        ocr_text=context.strip(),
+                        title=_title or "微信试卷", task_type="exam_paper",
+                    )
+                    _teach_session_id = _ts.session_id
+                    logger.info("[%s] Backward-compat created TeachSession %s for %s",
+                                trace_id, _teach_session_id, learner_id)
+            except Exception:
+                pass
+
+        # ── OCR 正则拆题 ──
+        try:
+            _ocr_questions[learner_id] = _split_ocr_questions(context)
+            _total = len(_ocr_questions[learner_id])
+            if _total > 0:
+                logger.info("[%s] Split OCR into %d questions", trace_id, _total)
+        except Exception:
+            pass
+
         # ── Fatigue: new session starts now ──
         if learner_id not in _session_start_time:
             _session_start_time[learner_id] = time.time()
-        # ── Auto-create TeachSession for WeChat → Web UI bridge ──
-        # Only create if no active session already exists for this learner
-        try:
-            _existing = get_teach_store().get_pending(learner_id, limit=1)
-            if not _existing:
-                # Derive title from OCR — skip headers/footers/prefixes
-                _title = _derive_title_from_ocr(context.strip())
-                if not _title:
-                    _title = "微信试卷"
-                _ts = get_teach_store().create(
-                    learner_id=learner_id,
-                    source="wechat",
-                    ocr_text=context.strip(),
-                    title=_title,
-                    task_type="exam_paper",
-                )
-                _teach_session_id = _ts.session_id
-                logger.info("[%s] Auto-created TeachSession %s for %s", trace_id, _teach_session_id, learner_id)
-        except Exception as _ae:
-            logger.warning("[%s] Auto-create session failed: %s", trace_id, _ae)
+        # ── Auto-create TeachSession REMOVED ──
+        # Caller (api_teach_start / api_tutor_chat) is responsible for creating
+        # the TeachSession before calling _tutor_chat_core and passing its ID.
+        # The recover/update logic below uses the passed teach_session_id.
 
     # 1a. Fatigue check: "累了/休息" resets session timer.
     _msg_lower = message.strip().lower()
@@ -6267,10 +6803,26 @@ async def _tutor_chat_core(
     #     No LLM involvement — platform determines correct/wrong by comparing
     #     the student's message with the [ANSWER_KEY:] stored when the question
     #     was asked.  Result is injected into SOUL.md so LLM explains, not judges.
+    #     NOTE: _last_question_num was advanced to the NEXT question by the
+    #     JSON path, so the current question being evaluated is (current - 1).
     _mastery_eval = None
     _eval_kp = ""
-    if message.strip() and learner_id in _answer_keys:
-        _correct = _answer_keys[learner_id]
+    _q_for_eval = _last_question_num.get(learner_id, 0)
+    if _q_for_eval > 1:
+        _q_for_eval -= 1  # 还原到当前正在答的题号
+    _all_keys = _answer_keys.get(learner_id, {})
+    _eval_key_idx = _q_for_eval if _q_for_eval in _all_keys else None
+    if _eval_key_idx is None:
+        # No answer key for current question — DT skipped it.
+        # Don't use a fallback key (would be from a different question → wrong evaluation).
+        # Instead, skip platform evaluation entirely. DT's response text is shown
+        # but no correct/wrong is recorded in mastery.
+        logger.info(
+            "[%s] No answer key for q%d (DT skipped), skipping platform eval",
+            trace_id, _q_for_eval,
+        )
+    if message.strip() and _eval_key_idx is not None:
+        _correct = _all_keys[_eval_key_idx]
         _student = message.strip()
         # Ternary scoring: exact → 1.0, partial → 0.5, wrong → 0.0
         if _match_answers(_student, _correct):
@@ -6349,12 +6901,70 @@ async def _tutor_chat_core(
             "✅ 最后一题（index==total）：content 中加入提示：这是最后一道题了，坚持住！🏁\n"
             "✅ explanation 采用 step-by-step 分解（Plan → Solve），参考分步教学法。\n"
         )
-        payload = f"[PHASE:{_phase}]{_constraint}\n{context}"
+        # FIRST_QUESTION: 优先用预提取数据，失败时 OCR 正则拆题兜底
+        # 如果还没有预提取数据，立即预提取（确保判题用预提取 answer_key）
+        if not _extracted_exams.get(learner_id) and context.strip():
+            try:
+                _ee = await _pre_extract_exam(context, trace_id)
+                if not _ee:
+                    logger.info("[%s] Pre-extract returned None, skipping", trace_id)
+                elif not _ee.get("questions"):
+                    logger.info("[%s] Pre-extract returned 0 questions", trace_id)
+                if _ee and _ee.get("questions"):
+                    _tq_fields = {"index","total","question_type","content","answer_key",
+                                  "explanation","knowledge_point","options","hints","difficulty"}
+                    _qq = [TeachQuestion(**{k: v for k, v in q.items() if k in _tq_fields},
+                                          total=_ee["total"]) for q in _ee["questions"]]
+                    _extracted_exams[learner_id] = ExtractedExam(
+                        questions=_qq, total=_ee["total"], raw_ocr=context,
+                    )
+                    logger.info("[%s] Pre-extracted %d questions inline",
+                                trace_id, _ee["total"])
+                    # 存入 TeachSession 持久化
+                    if _teach_session_id:
+                        _ts_x = get_teach_store().get(_teach_session_id)
+                        if _ts_x:
+                            _ts_x.extracted_exam = _ee
+                            _ts_x.total_questions = _ee["total"]
+                            get_teach_store().save(_ts_x)
+            except Exception as _ex:
+                logger.warning("[%s] Inline pre-extract failed: %s", trace_id, _ex)
+        _exam = _extracted_exams.get(learner_id)
+        if _exam and _exam.questions:
+            # Phase 3: 使用预提取的结构化试卷数据出第一题
+            _q1 = _exam.questions[0]
+            _q1_text = f"第1题：{_q1.content}"
+            if _q1.options:
+                for _k, _v in _q1.options.items():
+                    _q1_text += f"\n{_k}. {_v}"
+            _first_ctx = _q1_text
+            _first_total = _exam.total
+            _total_tag = f" [试卷共{_first_total}题]"
+            # 预填充第一题的 answer_key（供 EVALUATE_ANSWER 平台判题用）
+            if _q1.answer_key:
+                _answer_keys.setdefault(learner_id, {})[1] = _q1.answer_key
+            # 预填充知识点
+            if _q1.knowledge_point:
+                _kp_names[learner_id] = _q1.knowledge_point
+        else:
+            # Legacy: OCR 正则拆题
+            _q1_text = _ocr_questions.get(learner_id, {}).get(1, "")
+            _first_total = max(
+                len(_ocr_questions.get(learner_id, {})),
+                _detect_total_questions(context),
+            )
+            if _q1_text and _first_total > 0:
+                _first_ctx = _q1_text
+                _total_tag = f" [试卷共{_first_total}题]"
+            else:
+                _first_ctx = context
+                _total_tag = ""
+        payload = f"[PHASE:{_phase}]{_total_tag} {_constraint}\n{_first_ctx}"
     else:
         _phase = "EVALUATE_ANSWER"
         _qnum = _last_question_num.get(learner_id, 0)
         _next_q = _qnum + 1
-        _prev_answer = _answer_keys.get(learner_id, "")
+        _prev_answer = _answer_keys.get(learner_id, {}).get(_qnum, "")
         _constraint = (
             "\n\n【输出格式 - 严格 JSON】\n"
             "你必须且只能输出一个 JSON 代码块（用 ```json 包裹），格式如下：\n\n"
@@ -6401,12 +7011,31 @@ async def _tutor_chat_core(
         # Inject stored answer key so the LLM knows the correct answer.
         # The LLM should use this to provide accurate feedback, not to judge.
         # 不注入 _prev_answer（指向上一题答案键），用户当前答的题号通过「学生正在回答第X题」标明
-        payload = f"[PHASE:{_phase}] [学生正在回答第{_qnum}题] {_constraint}\n" + (message or context or "")
-        # Attach exam context so the LLM picks the next question from the
-        # same paper rather than generating from its own knowledge.
-        _exam_ctx = context.strip() or _last_tutor_context.get(learner_id, "")
-        if _exam_ctx:
-            payload += f"\n\n# 当前试卷（下一题必须从此试卷中选取）\n{_exam_ctx[:6000]}"
+        # EVALUATE_ANSWER: 只告诉 DT 学生当前答的是哪一题，不带完整试卷上下文
+        # （完整上下文在 FIRST_QUESTION 时已提供，DT 会话历史中有）
+        # 这样 DT 不会因为看到 Q3 的内容而误判 Q2 的答案。
+        # Phase 3: 优先用预提取数据提供当前题目的准确内容
+        _exam_eval = _extracted_exams.get(learner_id)
+        _q_text = ""
+        if _exam_eval and _exam_eval.questions:
+            from tutor_platform.teach_question import get_question_by_index
+            _cur_q = get_question_by_index(_exam_eval, _qnum)
+            if _cur_q:
+                _q_text = f"第{_qnum}题：{_cur_q.content}"
+                if _cur_q.options:
+                    for _k, _v in _cur_q.options.items():
+                        _q_text += f"\n{_k}. {_v}"
+                # 预填充 answer_key 供平台判题
+                if _cur_q.answer_key:
+                    _answer_keys.setdefault(learner_id, {})[_qnum] = _cur_q.answer_key
+        if not _q_text:
+            _q_text = _ocr_questions.get(learner_id, {}).get(_qnum, "")
+        _eval_ctx = _q_text if _q_text else (message or context or "")
+        payload = (
+            f"[PHASE:{_phase}] [学生正在回答第{_qnum}题] {_constraint}\n"
+            f"当前题目：\n{_eval_ctx}\n\n"
+            f"学生的答案：{message}"
+        )
 
     _nudge_sent = False  # track if we already nudged for next question
 
@@ -6430,7 +7059,7 @@ async def _tutor_chat_core(
                 message=message,
                 mode=mode,
                 trace_id=trace_id,
-                answer_key=_answer_keys.get(learner_id, ""),
+                answer_key=_answer_keys.get(learner_id, {}).get(_last_question_num.get(learner_id, 0), ""),
                 system_content=_persona or None,
             )
         except Exception:
@@ -6463,7 +7092,7 @@ async def _tutor_chat_core(
                 message=message,
                 mode=mode,
                 trace_id=trace_id,
-                answer_key=_answer_keys.get(learner_id, ""),
+                answer_key=_answer_keys.get(learner_id, {}).get(_last_question_num.get(learner_id, 0), ""),
             )
         except Exception:
             _direct_content = ""
@@ -6498,20 +7127,27 @@ async def _tutor_chat_core(
             result = await _session.send_and_recv(payload, trace_id)
 
             # 5a. Ensure next question was output in EVALUATE_ANSWER guide mode.
-            #     If the LLM only evaluated without advancing, nudge it once.
+            #     If the LLM only evaluated without advancing, nudge it.
+            #     Retry up to 2 times if the nudge response still skips.
             if (mode == "guide" and _phase == "EVALUATE_ANSWER" and result.get("ok")
-                    and not _nudge_sent and _last_question_num.get(learner_id, 0) < _next_q):
-                _r_content = _normalize_qnum(result.get("content", ""))
-                _has_next = re.search(rf"第{_next_q}题", _r_content) is not None
-                if not _has_next:
+                    and _last_question_num.get(learner_id, 0) < _next_q):
+                _next_text = _ocr_questions.get(learner_id, {}).get(_next_q, "")
+                _nudge_attempts = 0
+                while _nudge_attempts < 2:
+                    _r_content = _normalize_qnum(result.get("content", ""))
+                    if re.search(rf"第{_next_q}题", _r_content) is not None:
+                        break  # DT output the expected next question
                     _nudge_payload = (
-                        f"【系统】你只评判了第{_qnum}题但没有出第{_next_q}题。"
-                        f"请立即从试卷中选出第{_next_q}题输出。"
+                        f"【系统】请直接输出第{_next_q}题，内容如下：\n{_next_text}\n\n"
                         "只要题目+选项+引导问题，不要评判。"
-                        "题号必须用阿拉伯数字「第X题」，不要用中文数字。"
                     )
-                    logger.info("[%s] Missing next question, nudging (q%d→q%d)", trace_id, _qnum, _next_q)
+                    logger.info(
+                        "[%s] Missing next question, nudging (q%d->q%d, attempt %d/2)",
+                        trace_id, _qnum, _next_q, _nudge_attempts + 1,
+                    )
                     result = await _session.send_and_recv(_nudge_payload, trace_id)
+                    _nudge_attempts += 1
+                if _nudge_attempts > 0:
                     _nudge_sent = True
 
             # 5b. Fallback chain: empty cloud response → retry once.
@@ -6551,16 +7187,17 @@ async def _tutor_chat_core(
                 result = await _session.send_and_recv(payload, trace_id)
                 # Nudge on retry too if still missing next question
                 if (mode == "guide" and _phase == "EVALUATE_ANSWER" and result.get("ok")
-                        and not _nudge_sent and _last_question_num.get(learner_id, 0) < _next_q):
-                    _r_content = _normalize_qnum(result.get("content", ""))
-                    if re.search(rf"第{_next_q}题", _r_content) is None:
+                        and _last_question_num.get(learner_id, 0) < _next_q):
+                    _next_text = _ocr_questions.get(learner_id, {}).get(_next_q, "")
+                    for _na in range(2):
+                        _r_content = _normalize_qnum(result.get("content", ""))
+                        if re.search(rf"第{_next_q}题", _r_content) is not None:
+                            break
                         _nudge_payload = (
-                            f"【系统】你只评判了第{_qnum}题但没有出第{_next_q}题。"
-                            f"请立即从试卷中选出第{_next_q}题输出。"
+                            f"【系统】请直接输出第{_next_q}题，内容如下：\n{_next_text}\n\n"
                             "只要题目+选项+引导问题，不要评判。"
-                            "题号必须用阿拉伯数字「第X题」，不要用中文数字。"
                         )
-                        logger.info("[%s] Missing next question (retry), nudging", trace_id)
+                        logger.info("[%s] Missing next question (retry), nudging (attempt %d/2)", trace_id, _na + 1)
                         result = await _session.send_and_recv(_nudge_payload, trace_id)
                         _nudge_sent = True
         except Exception as e:
@@ -6593,66 +7230,114 @@ async def _tutor_chat_core(
                 bool(_json_question), bool(_json_evaluation),
             )
 
+        # ── 会话级 exam 数据：优先从 session 恢复 ──
+        if not _extracted_exams.get(learner_id) and _teach_session_id:
+            try:
+                _ts = get_teach_store().get(_teach_session_id)
+                if _ts and _ts.extracted_exam and _ts.extracted_exam.get("questions"):
+                    _recovered = ExtractedExam(
+                        questions=[TeachQuestion(**{k: v for k, v in q.items() if k in (
+                            "index", "total", "question_type", "content", "answer_key",
+                            "explanation", "knowledge_point", "options",
+                        )}) for q in _ts.extracted_exam["questions"]],
+                        total=_ts.extracted_exam["total"],
+                        raw_ocr=_ts.ocr_text or "",
+                    )
+                    _extracted_exams[learner_id] = _recovered
+            except Exception:
+                pass
+
         if _json_question:
-            # Store answer_key from JSON for future evaluation turns
+            _exam = _extracted_exams.get(learner_id)
+            _qidx = int(_json_question.get("index", 0))
+            _current_qnum = _last_question_num.get(learner_id, 0)
+            _next_qnum = _current_qnum + 1
+
+            if _exam and _exam.questions:
+                from tutor_platform.teach_question import validate_question_against_exam
+                _vr = validate_question_against_exam(_json_question, _exam, _next_qnum)
+                if _vr["action"] == "pass" and _vr.get("corrected"):
+                    _corrected = _vr["corrected"]
+                    _qidx = _corrected.get("index", _next_qnum)
+                    _json_question = _corrected
+
+            # Store answer_key per question index
             _ak = _json_question.get("answer_key", "")
-            if _ak:
-                _answer_keys[learner_id] = str(_ak).strip()
-                logger.info("[%s] Stored answer key from JSON: %s", trace_id, _answer_keys[learner_id])
+            if _ak and _qidx > 0:
+                _answer_keys.setdefault(learner_id, {})[_qidx] = str(_ak).strip()
+                logger.info("[%s] Stored answer key[%d]=%s", trace_id, _qidx, _ak)
             # Store knowledge_point
             _kp = _json_question.get("knowledge_point", "")
             if _kp:
                 _kp_names[learner_id] = str(_kp).strip()
                 logger.info("[%s] Stored KP from JSON: %s", trace_id, _kp_names[learner_id])
-            # Advance question tracking — BUT guard against OCR-induced skips.
-            # If the LLM jumps from Q10 to Q12 (garbled Q11), accept the skip
-            # but cap the jump at +2 to prevent feedback/answer mismatch later.
-            _qidx = int(_json_question.get("index", 0))
-            _current_qnum = _last_question_num.get(learner_id, 0)
-            if _qidx > _current_qnum:
-                # Cap: never jump more than 2 questions at a time
-                _cap = _current_qnum + 2
-                _safe_qidx = min(_qidx, _cap)
-                if _safe_qidx != _qidx:
-                    logger.info(
-                        "[%s] Question jump capped: %d → %d (LLM output %d — probable OCR skip)",
-                        trace_id, _current_qnum, _safe_qidx, _qidx,
+            # Advance question tracking
+            if _nudge_sent and _qidx > _next_qnum:
+                logger.warning(
+                    "[%s] Nudge FAILED — DT still skipped q%d (output q%d). "
+                    "Holding qnum at %d and stripping next_question.",
+                    trace_id, _next_qnum, _qidx, _current_qnum,
+                )
+                _json_question = None
+            else:
+                if _qidx > _next_qnum:
+                    logger.warning(
+                        "[%s] DT skipped q%d -> q%d", trace_id, _next_qnum, _qidx,
                     )
-                _last_question_num[learner_id] = _safe_qidx
-                logger.info("[%s] Advanced question num to %d from JSON", trace_id, _safe_qidx)
+                _last_question_num[learner_id] = _next_qnum
+                logger.info("[%s] Advanced question num to %d", trace_id, _next_qnum)
 
         if _json_evaluation:
-            # Use JSON evaluation directly — no regex, no guesswork
-            _score_json = float(_json_evaluation.get("score", 0.0))
-            _is_correct_json = bool(_json_evaluation.get("is_correct", _score_json >= 1.0))
-            _correct_answer_json = str(_json_evaluation.get("answer_key", ""))
-            _eval_kp_json = _kp_names.get(learner_id, "")
-
-            # Override _mastery_eval with JSON data so the evaluation block below
-            # (which checks _mastery_eval first) uses the structured result.
-            _mastery_eval = {
-                "score": _score_json,
-                "is_correct": _is_correct_json,
-                "student_answer": message.strip(),
-                "correct_answer": _correct_answer_json,
-            }
-            _eval_kp = _eval_kp_json
-            logger.info(
-                "[%s] JSON evaluation: correct=%s score=%s kp=%s",
-                trace_id, _is_correct_json, _score_json, _eval_kp_json,
-            )
+            # ── 用预提取试卷验证 DT 的评估 ──
+            _exam = _extracted_exams.get(learner_id)
+            _current_qnum = _last_question_num.get(learner_id, 0)
+            if _exam and _exam.questions and message.strip():
+                from tutor_platform.teach_question import validate_evaluation_against_exam
+                _ev = validate_evaluation_against_exam(
+                    _json_evaluation, _exam, _current_qnum, message.strip(),
+                )
+                _mastery_eval = {
+                    "score": _ev["score"],
+                    "is_correct": _ev["is_correct"],
+                    "student_answer": message.strip(),
+                    "correct_answer": _ev["correct_answer"],
+                }
+                _eval_kp = _ev.get("knowledge_point", _kp_names.get(learner_id, ""))
+                logger.info(
+                    "[%s] Validated evaluation: correct=%s score=%s key=%s",
+                    trace_id, _ev["is_correct"], _ev["score"], _ev["correct_answer"],
+                )
+            else:
+                _q_for_eval = _last_question_num.get(learner_id, 0)
+                _all_keys = _answer_keys.get(learner_id, {})
+                if _q_for_eval in _all_keys:
+                    _correct = _all_keys[_q_for_eval]
+                    _is_correct = _match_answers(message.strip(), _correct)
+                    _mastery_eval = {
+                        "score": 1.0 if _is_correct else 0.0,
+                        "is_correct": _is_correct,
+                        "student_answer": message.strip(),
+                        "correct_answer": _correct,
+                    }
+                    _eval_kp = _kp_names.get(learner_id, "")
+                    logger.info("[%s] Platform eval (key found): correct=%s", trace_id, _is_correct)
+                else:
+                    logger.info(
+                        "[%s] No key for q%d, skipping eval (DT skipped this question)",
+                        trace_id, _q_for_eval,
+                    )
 
         # ── Legacy marker parsing (only when JSON eval is unavailable) ──
         if not _json_evaluation:
             # Parse and store [ANSWER_KEY:] marker (for future use if LLM outputs it)
             _ak_m = _ANSWER_KEY_RE.search(content)
             if _ak_m:
-                _answer_keys[learner_id] = _ak_m.group(1).strip()
+                _next_ak_idx = _last_question_num.get(learner_id, 0) + 1
+                _answer_keys.setdefault(learner_id, {})[_next_ak_idx] = _ak_m.group(1).strip()
                 logger.info(
-                    "[%s] Stored answer key for %s: %s",
-                    trace_id,
-                    learner_id,
-                    _answer_keys[learner_id],
+                    "[%s] Stored answer key[%d]=%s",
+                    trace_id, _next_ak_idx,
+                    _ak_m.group(1).strip(),
                 )
             content = _ANSWER_KEY_RE.sub("", content).strip()
 
@@ -6691,16 +7376,15 @@ async def _tutor_chat_core(
                     _kp_names[learner_id] = _zp.group(1).strip()
 
             # Extract question number from reply and advance tracking.
-            _qn_normalized = _normalize_qnum(content)
-            _all_qn = list(re.finditer(r"第\s*(\d+)\s*题", _qn_normalized))
-            if _all_qn:
-                _parsed_qnum = int(_all_qn[-1].group(1))
-                if _parsed_qnum > _last_question_num.get(learner_id, 0):
-                    _last_question_num[learner_id] = _parsed_qnum
-                    logger.info(
-                        "[%s] Advanced question num to %d for %s",
-                        trace_id, _parsed_qnum, learner_id,
-                    )
+            # Legacy path: auto-increment by 1 (same as JSON path)
+            # ONLY run when NO structured JSON response (避免 FIRST_QUESTION 双重推进)
+            if not _parsed_json:
+                _next_qnum = _last_question_num.get(learner_id, 0) + 1
+                _last_question_num[learner_id] = _next_qnum
+                logger.info(
+                    "[%s] Advanced question num to %d for %s (legacy)",
+                    trace_id, _next_qnum, learner_id,
+                )
 
         # === Platform Evaluation ===
         # Three paths, in priority order:
@@ -6735,8 +7419,17 @@ async def _tutor_chat_core(
                 _eval_kp_used,
             )
         elif message.strip():
-            # No stored key — extract correct answer from DT's explanation
-            _correct_answer = _extract_correct_answer(content)
+            # 平台没有当前题的 key（DT 跳题了），安全做法是不评估
+            _pa_qnum = _last_question_num.get(learner_id, 0)
+            _pa_keys = _answer_keys.get(learner_id, {})
+            if _pa_qnum not in _pa_keys:
+                logger.info(
+                    "[%s] No key for q%d, skipping Path 3 eval (DT skipped)",
+                    trace_id, _pa_qnum,
+                )
+                _correct_answer = None
+            else:
+                _correct_answer = _pa_keys[_pa_qnum]
             if _correct_answer:
                 _student = message.strip()
                 # Ternary scoring for extracted answers too
@@ -6965,6 +7658,37 @@ async def _tutor_chat_core(
         _q = _extract_question_text(content)
         if _q:
             _last_question_text[learner_id] = _q
+
+        # ── 学生点击"下一题"时从 OCR 拆题取数据，不依赖 DT 输出 ──
+        if _phase == "EVALUATE_ANSWER" and result.get("ok"):
+            # 确保 _ocr_questions 有数据（可能 split 没触发）
+            if learner_id not in _ocr_questions or not _ocr_questions[learner_id]:
+                _ctx = _last_tutor_context.get(learner_id, "")
+                if _ctx:
+                    _ocr_questions[learner_id] = _split_ocr_questions(_ctx)
+
+            _next_idx = _last_question_num.get(learner_id, 0) + 1
+            _total_ocr = len(_ocr_questions.get(learner_id, {}))
+            _next_q_text = _ocr_questions.get(learner_id, {}).get(_next_idx, "")
+
+            if "_parsed_json" not in result or not result.get("_parsed_json"):
+                result["_parsed_json"] = {}
+            # 总题数：拆题失败时用 OCR 检测
+            _total = _total_ocr or _detect_total_questions(
+                _last_tutor_context.get(learner_id, ""),
+            ) or (_next_idx - 1)
+
+            if _next_q_text:
+                result["next_question"] = {
+                    "index": _next_idx,
+                    "content": _next_q_text,
+                    "question_type": "short_answer",
+                    "answer_key": "",
+                    "explanation": "",
+                    "total": _total,
+                }
+            # 即使没有下一题数据，也返回总题数供前端显示
+            result["total_questions"] = _total
     # 7. Persist context + question number: 每次教学交互后保存,
     #    确保孩子隔天回来也能从中断处继续.
     if result.get("ok") and _last_tutor_context.get(learner_id):
@@ -6995,6 +7719,23 @@ async def _tutor_chat_core(
                 logger.info("[%s] TeachSession %s updated (q=%d/%d)", trace_id, _teach_session_id, 1, _ts.total_questions)
         except Exception as _ae:
             logger.warning("[%s] Auto-create session failed: %s", trace_id, _ae)
+
+    # ── 图形注入：将知识库中关联的图形追加到教学回复末尾 ──
+    if result.get("ok") and result.get("content"):
+        _figs = _last_teaching_figures.get(learner_id, [])
+        if _figs and _phase in ("FIRST_QUESTION", "EVALUATE_ANSWER"):
+            _fig_md_parts: list[str] = []
+            for _f in _figs[:2]:  # 最多 2 张图
+                _url = _f.get("image_url", "")
+                _desc = _f.get("description_text", "") or _f.get("fig_type", "图形")
+                if _url:
+                    _fig_md_parts.append(f"![{_desc}]({_url})")
+            if _fig_md_parts:
+                result["content"] += "\n\n" + "\n".join(_fig_md_parts)
+                logger.debug(
+                    "[%s] Injected %d figures into teaching response for %s",
+                    trace_id, len(_fig_md_parts), learner_id,
+                )
 
     logger.info(
         "[%s] tutor_chat timing: bot_setup=%.2fs total=%.2fs msg=%s profile_switched=%s",
@@ -7064,6 +7805,7 @@ async def api_tutor_chat(request: Request):
         mode=body.get("mode", "guide"),
         trace_id=trace_id,
         total_questions=body.get("total_questions", 0),
+        teach_session_id=body.get("teach_session_id", ""),
     )
 
 
@@ -7966,7 +8708,8 @@ async def api_practice_teach(request: Request):
         ocr_text=teach_context, source_file=topic_name, bypass_guards=True)
     try:
         result = await _tutor_chat_core(message="", learner_id=learner_id,
-            context=teach_context, mode="guide", trace_id=trace_id, fast=True)
+            context=teach_context, mode="guide", trace_id=trace_id, fast=True,
+            teach_session_id=session.session_id)
         reply = result.get("content", "") if result.get("ok") else ""
         if reply:
             import re
@@ -9047,6 +9790,133 @@ async def _ocr_file_base64(file_base64: str, filename: str, trace_id: str) -> di
             pass
 
 
+async def _pre_extract_and_store(ocr_text: str, learner_id: str, session_id: str, trace_id: str) -> None:
+    """Fire-and-forget: 预提取试卷结构并存入 TeachSession + 内存缓存。"""
+    _exam = await _pre_extract_exam(ocr_text, trace_id)
+    if not _exam or not _exam.get("questions"):
+        return
+    try:
+        # ── 存入内存缓存（供 _tutor_chat_core validate 使用）──
+        from tutor_platform.teach_question import ExtractedExam as _EE, TeachQuestion as _TQ
+        _recovered = _EE(
+            questions=[_TQ(**{k: v for k, v in q.items() if k in (
+                "index", "total", "question_type", "content", "answer_key",
+                "explanation", "knowledge_point", "options",
+            )}) for q in _exam["questions"]],
+            total=_exam["total"],
+            raw_ocr=ocr_text,
+        )
+        _extracted_exams[learner_id] = _recovered
+        logger.info("[%s] Pre-extracted exam stored in memory for %s (%d questions)",
+                     trace_id, learner_id, _exam["total"])
+
+        # ── 存入 TeachSession（持久化）──
+        _ts = get_teach_store().get(session_id)
+        if _ts:
+            _ts.extracted_exam = _exam
+            _ts.total_questions = _exam["total"]
+            get_teach_store().save(_ts)
+            logger.info("[%s] Pre-extracted exam saved to session %s", trace_id, session_id)
+    except Exception as _e:
+        logger.warning("[%s] _pre_extract_and_store failed: %s", trace_id, _e)
+
+
+async def _pre_extract_exam(ocr_text: str, trace_id: str) -> typing.Optional[dict]:
+    """调用 DeepSeek API 从 OCR 文本中预提取结构化试卷数据。
+
+    异步执行，返回 {questions: [...], total: N} 或 None。
+    结果可直接存入 TeachSession.extracted_exam。
+    提取成功后 _extracted_exams[learner_id] 也会被填充。
+
+    该函数幂等：同 learner_id 已提取过则跳过。
+    """
+    if not ocr_text or not ocr_text.strip():
+        return None
+    api_key = os.getenv("DEEPSEEK_API_KEY", "")
+    if not api_key:
+        return None
+
+    from tutor_platform.teach_question import _EXAM_EXTRACT_PROMPT
+    _prompt = _EXAM_EXTRACT_PROMPT + "\n" + ocr_text[:15000]
+
+    try:
+        async with httpx.AsyncClient(timeout=120) as _client:
+            _resp = await _client.post(
+                "https://api.deepseek.com/v1/chat/completions",
+                json={
+                    "model": os.getenv("LLM_MODEL", "deepseek-v4-flash"),
+                    "messages": [
+                        {"role": "system", "content": _prompt},
+                    ],
+                    "temperature": 0,
+                    "max_tokens": 8192,
+                },
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            if _resp.status_code != 200:
+                logger.warning("[%s] Pre-extract API error: HTTP %d", trace_id, _resp.status_code)
+                return None
+
+            _content = _resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+            logger.info("[%s] Pre-extract raw response: %d chars, starts with: %s",
+                        trace_id, len(_content), _content[:120])
+            if not _content:
+                logger.warning("[%s] Pre-extract empty response", trace_id)
+                return None
+
+            import json as _json
+            # Try direct JSON parse (prompt says no code block)
+            try:
+                _parsed = _json.loads(_content)
+                logger.info("[%s] Pre-extract direct JSON parse OK", trace_id)
+            except _json.JSONDecodeError:
+                _raw = JSON_BLOCK_RE.findall(_content)
+                if _raw:
+                    logger.info("[%s] Pre-extract JSON from code block (%d blocks)", trace_id, len(_raw))
+                    _parsed = _json.loads(_raw[-1].strip())
+                else:
+                    logger.warning("[%s] Pre-extract no JSON found in response: %s",
+                                  trace_id, _content[:200])
+                    return None
+
+            if not isinstance(_parsed, dict):
+                logger.warning("[%s] Pre-extract parsed result is not dict: %s", trace_id, type(_parsed))
+                return None
+
+            _questions_raw = _parsed.get("questions", [])
+            _total = _parsed.get("total", len(_questions_raw))
+            if not _questions_raw:
+                return None
+
+            _questions = []
+            for _i, _qr in enumerate(_questions_raw):
+                if not isinstance(_qr, dict):
+                    continue
+                _q_content = str(_qr.get("content", "")).strip()
+                if not _q_content:
+                    continue
+                _questions.append({
+                    "index": int(_qr.get("index", _i + 1)),
+                    "content": _q_content,
+                    "question_type": str(_qr.get("question_type", "short_answer")),
+                    "options": _qr.get("options") if isinstance(_qr.get("options"), dict) else None,
+                    "answer_key": str(_qr.get("answer_key", "")),
+                    "explanation": str(_qr.get("explanation", "")),
+                    "knowledge_point": str(_qr.get("knowledge_point", "")),
+                    "figure_ids": [],
+                })
+
+            if not _questions:
+                return None
+
+            logger.info("[%s] Pre-extracted %d questions from OCR", trace_id, len(_questions))
+            return {"questions": _questions, "total": _total or len(_questions)}
+
+    except Exception as _e:
+        logger.warning("[%s] Pre-extract exam failed: %s", trace_id, _e)
+        return None
+
+
 @app.post("/api/teach/start")
 async def api_teach_start(request: Request):
     """创建引导式教学会话，返回第一题。
@@ -9210,18 +10080,19 @@ async def api_teach_start(request: Request):
             task_type=_task_type,
             bypass_guards=True,
         )
-        # Mark active BEFORE _tutor_chat_core — prevents its auto-create guard
-        # from creating a duplicate when the freshly-created session is still "pending".
         store.mark_active(session.session_id)
 
+        # ── Phase 3: 预提取已移至 _tutor_chat_core FIRST_QUESTION 阶段执行 ──
+
     try:
-        # ── 调用 _tutor_chat_core 出第一题 ──
+        # ── 调用 _tutor_chat_core 出第一题（传入已创建的 session_id）──
         result = await _tutor_chat_core(
             message="",
             learner_id=learner_id,
             context=ocr_text,
             mode=mode,
             trace_id=trace_id,
+            teach_session_id=session.session_id,
         )
         reply = result.get("content", "") if result.get("ok") else ""
         # Save context under isolated key if bound to DT session
@@ -9253,6 +10124,10 @@ async def api_teach_start(request: Request):
                     if _detected:
                         session.total_questions = _detected
                 session.current_question = 1
+            # 重新读取 session 获取 _tutor_core 中预提取写入的数据
+            _saved = store.get(session.session_id)
+            if _saved and _saved.extracted_exam:
+                session.extracted_exam = _saved.extracted_exam
             store.save(session)
 
             _resp = {
@@ -9264,6 +10139,7 @@ async def api_teach_start(request: Request):
                 "current": session.current_question,
                 "title": _title,
                 "task_type": _task_type,
+                "content": reply,  # WeChat 友好文本格式（含 emoji/Unicode）
             }
             if _question:
                 _resp["first_question"] = _question.to_dict()
@@ -9299,6 +10175,40 @@ async def api_teach_continue(request: Request):
     if session.is_expired:
         return {"ok": False, "error": "教学链接已过期"}
 
+    # ── Phase 4: 从 TeachSession 恢复完整上下文（覆盖全局 dict，防止多 session 污染）──
+    if session.ocr_text:
+        _last_tutor_context[learner_id] = session.ocr_text
+        _ocr_questions[learner_id] = _split_ocr_questions(session.ocr_text)
+        if session.current_question > 0:
+            _last_question_num[learner_id] = session.current_question
+        logger.info(
+            "[%s] Restored context (qnum=%d, %d questions) from session %s",
+            trace_id, session.current_question, len(_ocr_questions[learner_id]),
+            teach_session_id,
+        )
+    # ── Phase 4: 恢复预提取试卷数据（_extracted_exams）──
+    if not _extracted_exams.get(learner_id) and session.extracted_exam:
+        try:
+            _ee_data = session.extracted_exam
+            if isinstance(_ee_data, dict) and _ee_data.get("questions"):
+                _recovered = ExtractedExam(
+                    questions=[TeachQuestion(**{
+                        k: v for k, v in q.items() if k in (
+                            "index", "total", "question_type", "content", "answer_key",
+                            "explanation", "knowledge_point", "options",
+                        )
+                    }) for q in _ee_data["questions"]],
+                    total=_ee_data.get("total", len(_ee_data["questions"])),
+                    raw_ocr=session.ocr_text or "",
+                )
+                _extracted_exams[learner_id] = _recovered
+                logger.info(
+                    "[%s] Restored extracted exam (%d questions) from session",
+                    trace_id, _recovered.total,
+                )
+        except Exception as _e:
+            logger.debug("[%s] Restore extracted exam failed: %s", trace_id, _e)
+
     try:
         # Context isolation: swap in the session-bound context
         _saved_ctx = None
@@ -9316,6 +10226,7 @@ async def api_teach_continue(request: Request):
             mode="guide",
             trace_id=trace_id,
             fast=(session.source == "child_practice"),
+            teach_session_id=teach_session_id,
         )
         reply = result.get("content", "") if result.get("ok") else ""
         if not reply:
@@ -9361,24 +10272,20 @@ async def api_teach_continue(request: Request):
 
             if _next_q:
                 # ── Auto-correct skipped questions ──
-                # When OCR garbles a question (e.g. Q6 has a picture),
-                # the LLM may skip to the next readable question.  Force
-                # the index to be _qnum + 1 so the sequence stays intact.
-                _expected_idx = (_last_question_num.get(learner_id, 0) or _qnum) + 1
-                if _next_q.index != _expected_idx:
+                # Only correct when the LLM actually skipped (>1 gap).
+                # session.current_question is ground truth (persisted).
+                # _last_question_num was already advanced by _tutor_core.
+                _next_expected = session.current_question + 1
+                if _next_q.index > _next_expected:
                     logger.info(
                         "[%s] Correcting next_q index: %d → %d (OCR skip detected)",
-                        trace_id, _next_q.index, _expected_idx,
+                        trace_id, _next_q.index, _next_expected,
                     )
-                    _next_q.index = _expected_idx
-                    # Also fix _last_question_num: it was polluted by the LLM's
-                    # skipped output during _tutor_chat_core post-processing.
-                    # Without this, the next EVALUATE_ANSWER phase uses the wrong
-                    # question number, causing feedback/answer mismatch.
-                    _last_question_num[learner_id] = _expected_idx
+                    _next_q.index = _next_expected
+                    _last_question_num[learner_id] = _next_expected
                     logger.info(
                         "[%s] Fixed _last_question_num to %d for %s",
-                        trace_id, _expected_idx, learner_id,
+                        trace_id, _next_expected, learner_id,
                     )
                 session.current_question = _next_q.index
                 session.total_questions = _next_q.total
@@ -9399,7 +10306,26 @@ async def api_teach_continue(request: Request):
             else:
                 store.save(session)
 
-            # Build response
+            # Build response — fallback next_question from OCR split
+            if not _next_q:
+                # 确保 _ocr_questions 有数据
+                if learner_id not in _ocr_questions or not _ocr_questions[learner_id]:
+                    _ocr_questions[learner_id] = _split_ocr_questions(
+                        session.ocr_text or "",
+                    )
+                _ocr_next = _ocr_questions.get(learner_id, {}).get(
+                    session.current_question + 1, "",
+                )
+                if _ocr_next:
+                    from tutor_platform.teach_question import TeachQuestion
+                    _next_q = TeachQuestion(
+                        index=session.current_question + 1,
+                        total=session.total_questions or len(_ocr_questions.get(learner_id, {})),
+                        question_type="short_answer",
+                        content=_ocr_next,
+                        answer_key="",
+                        explanation="",
+                    )
             _resp = {
                 "ok": True,
                 "evaluation": _eval.to_dict(),
@@ -9488,6 +10414,42 @@ async def api_teach_continue(request: Request):
             if _saved_ctx:
                 _last_tutor_context[learner_id] = _saved_ctx
         return {"ok": False, "error": f"教学交互失败: {exc}"}
+
+
+@app.post("/api/teach/skip")
+async def api_teach_skip(request: Request):
+    """跳过当前题目，推进到下一题（不调用 LLM）。"""
+    trace_id = _extract_trace_id(request)
+    body = await request.json()
+    teach_session_id = str(body.get("teach_session_id", "")).strip()
+    if not teach_session_id:
+        return {"ok": False, "error": "缺少 teach_session_id"}
+
+    store = get_teach_store()
+    session = store.get(teach_session_id)
+    if not session:
+        return {"ok": False, "error": "教学会话不存在"}
+    if session.status == "completed":
+        return {"ok": False, "error": "教学已结束"}
+
+    # 推进到下一题
+    next_q = session.current_question + 1
+    session.current_question = next_q
+    session.wrong_count += 1  # 跳过记错一次
+    if next_q > session.total_questions:
+        store.mark_completed(teach_session_id)
+        logger.info("[%s] TeachSession %s completed via skip", trace_id, teach_session_id)
+    else:
+        store.save(session)
+
+    _last_question_num[session.learner_id] = next_q
+    logger.info("[%s] Skipped q%d -> q%d for %s", trace_id, next_q - 1, next_q, session.learner_id)
+    return {
+        "ok": True,
+        "current_question": next_q,
+        "total_questions": session.total_questions,
+        "done": next_q > session.total_questions,
+    }
 
 
 @app.get("/api/teach/pending")
@@ -9731,6 +10693,20 @@ async def api_task_update_progress(teach_session_id: str, request: Request):
     }
 
 
+@app.delete("/api/teach/session/{session_id}")
+async def api_teach_delete_session(session_id: str):
+    """删除（标记完成）一个教学会话。"""
+    store = get_teach_store()
+    session = store.get(session_id)
+    if not session:
+        return {"ok": False, "error": "会话不存在"}
+    if session.status == "completed":
+        return {"ok": False, "error": "会话已完成"}
+    store.mark_completed(session_id)
+    logger.info("[teach] Deleted session %s for %s", session_id, session.learner_id)
+    return {"ok": True}
+
+
 @app.get("/api/tasks/pending")
 async def api_task_pending(learner_id: str = ""):
     """获取学习者的待完成任务列表（包含完整任务元数据）。
@@ -9810,7 +10786,8 @@ def run_provider_api(port: int = 8100):
     except Exception as e:
         print(f"[provider_api] Config validation skipped: {e}")
 
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+    reload = os.environ.get("DEEPTUTOR_ENV") == "development"
+    uvicorn.run("provider_api:app", host="0.0.0.0", port=port, log_level="info", reload=reload)
 
 
 if __name__ == "__main__":

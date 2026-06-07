@@ -13,6 +13,7 @@ interface TeachingChatViewProps {
   messages: TeachingMessage[];
   onSendAnswer: (answer: string) => Promise<void>;
   isWaiting: boolean;
+  onSkip?: () => void;
 }
 
 function MessageBubble({
@@ -50,6 +51,7 @@ export function TeachingChatView({
   messages,
   onSendAnswer,
   isWaiting,
+  onSkip,
 }: TeachingChatViewProps) {
   const [answer, setAnswer] = useState("");
   const containerRef = useRef<HTMLDivElement>(null);
@@ -172,6 +174,14 @@ export function TeachingChatView({
             ) : (
               <ArrowUp size={18} />
             )}
+          </button>
+          <button
+            onClick={onSkip}
+            disabled={!onSkip}
+            className="flex h-11 shrink-0 items-center gap-1 rounded-xl border border-[var(--border)] bg-[var(--card)] px-3 text-[12px] text-[var(--muted-foreground)]/50 transition-all hover:border-red-400/30 hover:text-red-400 hover:shadow-sm active:scale-95"
+            title="跳过此题"
+          >
+            <span>跳过</span>
           </button>
         </div>
       </div>

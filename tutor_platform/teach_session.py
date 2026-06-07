@@ -58,6 +58,9 @@ class TeachSession:
     knowledge_points: str = ""        # 关联知识点，逗号分隔
     subject: str = ""                 # 学科 (math/physics/chemistry/english)
     past_questions: str = ""          # JSON: [{q_json, evaluation_json, user_answer}, ...] 已答题目缓存
+    # ── v2: 结构化提取的试卷数据 ──
+    extracted_exam: Optional[dict] = None  # {"questions": [{index,content,answer_key,...}], "total": N}
+    progress: Optional[dict] = None        # {"current_index": 2, "answers": {"1": {...}}, ...}
 
     @property
     def is_expired(self) -> bool:

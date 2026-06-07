@@ -299,6 +299,21 @@ export interface TaskCreateResponse {
   error?: string;
 }
 
+export async function deletePendingTask(
+  teachSessionId: string,
+): Promise<{ ok: boolean }> {
+  try {
+    const res = await fetch(`/api/platform/tasks/${teachSessionId}/progress`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ done: true }),
+    });
+    return res.json();
+  } catch {
+    return { ok: false };
+  }
+}
+
 export async function fetchPendingTasks(
   learnerId = "",
 ): Promise<{ tasks: PendingTask[]; total_pending: number }> {

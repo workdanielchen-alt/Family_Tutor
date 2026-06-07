@@ -271,3 +271,227 @@ def validate_teach_response(parsed: dict, phase: str) -> list[str]:
             errs.append("next_question must be null or a question object")
 
     return errs
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 试卷结构化提取 — OCR 后一次性提取全部题目+答案+解析
+# ═══════════════════════════════════════════════════════════════════════
+
+import hashlib as _hashlib
+import time as _time
+
+from dataclasses import dataclass, field
+from typing import Optional
+
+
+@dataclass
+class ExtractedExam:
+    """整份试卷的结构化数据，OCR 后由 LLM 一次性提取。
+
+    所有题目、答案、解析在逐题教学开始前就已准备好。
+    平台用此数据验证 DT 输出的题号和答案，不依赖 DT 的 JSON。
+    """
+    questions: list[TeachQuestion]
+    total: int
+    raw_ocr: str
+    raw_file_hash: str = ""
+    _extracted_at: float = 0.0
+
+
+# OCR 原文 → 试卷结构化的提取 prompt
+_EXAM_EXTRACT_PROMPT = """你是一个专业的试卷结构化提取助手。
+
+请从以下 OCR 文本中提取所有题目，严格按照 JSON 格式输出。
+不要增加、删减或改写题目内容，原样保留题目正文。
+
+要求：
+1. 识别每道题的题号（index），从 1 开始连续编号
+2. 识别题型（question_type）：choice / fill_blank / short_answer / written
+3. 选择题需提取选项（options）和正确答案（answer_key）
+4. 提取解题解析（explanation）
+5. 识别知识点（knowledge_point），格式如"数学/三角形/全等三角形"
+6. 如果某题的答案或解析不明确，answer_key 填 ""，explanation 填 "待补充"
+
+输出格式（必须是最外层的 JSON 对象，不要用代码块包裹）：
+{
+  "total": 3,
+  "questions": [
+    {
+      "index": 1,
+      "content": "题目正文...",
+      "question_type": "choice",
+      "options": {"A": "...", "B": "...", "C": "...", "D": "..."},
+      "answer_key": "B",
+      "explanation": "解题步骤...",
+      "knowledge_point": "学科/章/节"
+    }
+  ]
+}
+
+OCR 文本：
+"""
+
+
+def extract_exam_from_ocr(ocr_text: str, llm_client=None) -> Optional[ExtractedExam]:
+    """调用 LLM 从 OCR 文本中提取结构化试卷数据。
+
+    只在 OCR 后调用一次。提取成功后可缓存（按 sha256）。
+    """
+    if not ocr_text or not ocr_text.strip():
+        return None
+    if llm_client is None:
+        return None
+
+    import json as _json
+
+    try:
+        raw = llm_client.complete(_EXAM_EXTRACT_PROMPT + ocr_text)
+        if not raw or not raw.strip():
+            return None
+        extracted_json = extract_json_block(raw.strip())
+        if extracted_json is None:
+            return None
+        parsed = _json.loads(extracted_json)
+    except Exception:
+        return None
+
+    questions_raw = parsed.get("questions", []) if isinstance(parsed, dict) else []
+    if not questions_raw:
+        return None
+
+    questions: list[TeachQuestion] = []
+    for qr in questions_raw:
+        if not isinstance(qr, dict):
+            continue
+        try:
+            index = int(qr.get("index", 0))
+            if index <= 0:
+                continue
+            questions.append(TeachQuestion(
+                index=index,
+                total=parsed.get("total", len(questions_raw)),
+                question_type=qr.get("question_type", "short_answer"),
+                content=str(qr.get("content", "")),
+                answer_key=str(qr.get("answer_key", "")),
+                explanation=str(qr.get("explanation", "")),
+                knowledge_point=str(qr.get("knowledge_point", "")),
+                options=qr.get("options") if isinstance(qr.get("options"), dict) else None,
+            ))
+        except (ValueError, TypeError):
+            continue
+
+    if not questions:
+        return None
+
+    file_hash = _hashlib.sha256(ocr_text.encode("utf-8")).hexdigest()[:16]
+    return ExtractedExam(
+        questions=questions,
+        total=len(questions),
+        raw_ocr=ocr_text,
+        raw_file_hash=file_hash,
+        _extracted_at=_time.time(),
+    )
+
+
+def get_question_by_index(exam: ExtractedExam, index: int) -> Optional[TeachQuestion]:
+    """从提取的试卷中按题号取题目（1-based）。"""
+    for q in exam.questions:
+        if q.index == index:
+            return q
+    return None
+
+
+def validate_question_against_exam(
+    dt_question: dict,
+    exam: ExtractedExam,
+    expected_idx: int,
+) -> dict:
+    """验证 DT 输出的题目数据，用预提取的试卷数据修正。
+
+    Returns:
+        {"valid": bool, "corrected": dict, "action": "pass"|"nudge"}
+    """
+    if not dt_question or not isinstance(dt_question, dict):
+        return {"valid": False, "corrected": {}, "action": "nudge"}
+
+    correct_q = get_question_by_index(exam, expected_idx)
+    if not correct_q:
+        return {"valid": False, "corrected": {}, "action": "nudge"}
+
+    dt_idx = int(dt_question.get("index", 0))
+    corrected = dict(dt_question)
+
+    if dt_idx != expected_idx:
+        # DT 题号错了 → 用预提取数据覆盖
+        corrected["index"] = expected_idx
+        corrected["content"] = correct_q.content
+        corrected["question_type"] = correct_q.question_type
+        corrected["answer_key"] = correct_q.answer_key
+        corrected["explanation"] = correct_q.explanation
+        corrected["knowledge_point"] = correct_q.knowledge_point
+        if correct_q.options:
+            corrected["options"] = correct_q.options
+        return {"valid": True, "corrected": corrected, "action": "pass"}
+
+    # 题号正确，只校正 answer_key（防止 DT 给错答案）
+    if corrected.get("answer_key", "") != correct_q.answer_key:
+        corrected["answer_key"] = correct_q.answer_key
+
+    return {"valid": True, "corrected": corrected, "action": "pass"}
+
+
+def validate_evaluation_against_exam(
+    dt_evaluation: dict,
+    exam: ExtractedExam,
+    current_idx: int,
+    student_answer: str,
+) -> dict:
+    """验证 DT 的评估，用预提取的试卷数据修正。
+
+    DT 的 feedback/explanation 保留教学价值，
+    但 is_correct/score 由平台用正确 key 决定。
+    """
+    correct_q = get_question_by_index(exam, current_idx)
+    if not correct_q:
+        # 没有预提取数据 → 信任 DT
+        return {
+            "is_correct": dt_evaluation.get("is_correct", False),
+            "score": float(dt_evaluation.get("score", 0.0)),
+            "correct_answer": dt_evaluation.get("answer_key", ""),
+            "feedback": dt_evaluation.get("feedback", ""),
+            "explanation": dt_evaluation.get("explanation", ""),
+            "knowledge_point": dt_evaluation.get("knowledge_point", ""),
+        }
+
+    correct_key = correct_q.answer_key
+    if not correct_key:
+        # 没有标准答案 → 信任 DT
+        return {
+            "is_correct": dt_evaluation.get("is_correct", False),
+            "score": float(dt_evaluation.get("score", 0.0)),
+            "correct_answer": dt_evaluation.get("answer_key", ""),
+            "feedback": dt_evaluation.get("feedback", ""),
+            "explanation": dt_evaluation.get("explanation", ""),
+            "knowledge_point": correct_q.knowledge_point,
+        }
+
+    # 平台判题（用预提取的正确 key）
+    from tutor_platform.rag.extractors import _match_answers
+    is_correct = _match_answers(student_answer, correct_key)
+    score = 1.0 if is_correct else 0.0
+    if not is_correct:
+        try:
+            from tutor_platform.rag.extractors import _match_answers_semantic
+            if _match_answers_semantic(student_answer, correct_key):
+                score = 0.5
+        except Exception:
+            pass
+
+    return {
+        "is_correct": is_correct,
+        "score": score,
+        "correct_answer": correct_key,
+        "feedback": dt_evaluation.get("feedback", ""),
+        "explanation": dt_evaluation.get("explanation", ""),
+        "knowledge_point": correct_q.knowledge_point,
+    }

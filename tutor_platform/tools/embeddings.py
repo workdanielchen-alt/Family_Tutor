@@ -1,102 +1,77 @@
 """
-tutor_platform/tools/embeddings.py — Embedding 函数
+tutor_platform/tools/embeddings.py — Unified embedding entry point.
 
-RkllamaEmbeddingFunction: ChromaDB 兼容的 embedding function。
-优先使用 RKLLM (RK3576 NPU) 生成 embedding，不可用时回退到 CPU 端 ollama / 确定性哈希。
+BgeSmallEmbedding: ChromaDB-compatible embedding function using sentence-transformers
+(BAAI/bge-small-zh-v1.5) loaded in-process.  No external services — no Ollama model-slot
+contention, no rkllama NPU, no deterministic-hash fallback.
+
+Single source consumed by:
+  - UnifiedLocalProvider._get_embed_fn() → Platform ChromaDB ingestion
+  - /api/embed HTTP endpoint → DT ollama adapter (reindex / upload)
 """
 
-import hashlib
 import logging
 import os
 
 logger = logging.getLogger("tutor_platform.tools.embeddings")
 
-RKLLM_SERVER_URL = os.environ.get("RKLLM_SERVER_URL", "http://rkllama:8080")
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434")
-_EMBED_DIM = 1024
+_EMBED_DIM = 512
+_DEFAULT_MODEL_NAME = os.environ.get("EMBEDDING_MODEL_NAME", "BAAI/bge-small-zh-v1.5")
 
 
-def _hash_embed(text: str, dim: int = _EMBED_DIM) -> list[float]:
-    """Generate a deterministic embedding vector from text content via MD5.
+class BgeSmallEmbedding:
+    """Sentence-transformers in-process embedding — bge-small-zh-v1.5 loaded once at startup."""
 
-    This is NOT a semantically meaningful embedding — it only guarantees
-    that identical texts produce identical vectors, preventing ChromaDB
-    from inserting duplicate chunks on reprocess.  Used as last resort
-    when no embedding service is reachable.
-    """
-    h = hashlib.sha256(text.encode("utf-8")).digest()
-    seed = int.from_bytes(h[:8], "big")
-    rng = __import__("random").Random(seed)
-    return [rng.random() * 2 - 1 for _ in range(dim)]
-
-
-class RkllamaEmbeddingFunction:
-    """ChromaDB embedding function 兼容接口。
-
-    封装 RKLLM (rkllama) 的 embedding API，调用 /api/embed 获取向量。
-    fallback 链: RKLLM → ollama → 确定性哈希。
-    """
-
-    def __init__(self, model: str = "", batch_size: int = 8):
-        self.model = model or os.environ.get("EMBEDDING_MODEL", "bge-m3")
+    def __init__(self, model_name: str = "", batch_size: int = 16):
+        self.model_name = model_name or _DEFAULT_MODEL_NAME
         self.batch_size = batch_size
-        self._http_client = None
+        self._model = None
 
-    async def _get_client(self):
-        if self._http_client is None:
-            import httpx
-            self._http_client = httpx.AsyncClient(timeout=30)
-        return self._http_client
+    def _ensure_model(self):
+        if self._model is None:
+            from sentence_transformers import SentenceTransformer
+
+            # Offline-safe: model is pre-cached in the Docker image.
+            # Use the snapshot path directly because AutoConfig / HF Hub
+            # can't resolve the model name offline (CN network issues).
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+            cache_root = os.environ.get(
+                "HF_HOME",
+                os.path.join(os.path.expanduser("~"), ".cache", "huggingface"),
+            )
+            # Try both HF cache layouts: v1 under HF_HOME, v2 under HF_HOME/hub/
+            safe_name = self.model_name.replace("/", "--")
+            model_dir_name = f"models--{safe_name}"
+            for base in (cache_root, os.path.join(cache_root, "hub")):
+                snap_dir = os.path.join(base, model_dir_name, "snapshots")
+                if os.path.isdir(snap_dir):
+                    snapshots = sorted(os.listdir(snap_dir))
+                    if snapshots:
+                        model_path = os.path.join(snap_dir, snapshots[0])
+                        break
+            else:
+                model_path = self.model_name  # fallback (will fail offline)
+
+            logger.info("Loading bge-small-zh-v1.5 (cold start, offline)... via %s", model_path)
+            self._model = SentenceTransformer(
+                model_path, trust_remote_code=True,
+                local_files_only=True,
+            )
+            logger.info("BAAI/bge-small-zh-v1.5 ready (%dD)", _EMBED_DIM)
 
     def __call__(self, input: list[str]) -> list[list[float]]:
-        """ChromaDB 兼容接口：同步返回 embedding 向量列表。"""
+        self._ensure_model()
+        embeddings = self._model.encode(
+            input,
+            batch_size=self.batch_size,
+            show_progress_bar=False,
+            normalize_embeddings=False,
+        )
+        return embeddings.tolist()
 
-        # ── Tier 1: RKLLM (NPU) ──
-        try:
-            import httpx
-            client = httpx.Client(timeout=30)
-            resp = client.post(
-                f"{RKLLM_SERVER_URL}/api/embed",
-                json={"texts": input, "model": self.model},
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                embeds = data.get("embeddings")
-                if embeds and len(embeds) == len(input):
-                    return embeds
-                logger.warning("RKLLM embed returned %d vectors (expected %d), fallback",
-                               len(embeds or []), len(input))
-            else:
-                logger.warning("RKLLM embed returned %s, trying fallback", resp.status_code)
-        except Exception as e:
-            logger.warning("RKLLM embed failed: %s, trying fallback", e)
 
-        # ── Tier 2: ollama (CPU) ──
-        try:
-            import httpx
-            client = httpx.Client(timeout=120)
-            resp = client.post(
-                f"{OLLAMA_URL}/api/embed",
-                json={"model": self.model, "input": input},
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                embeds = data.get("embeddings")
-                if embeds and len(embeds) == len(input):
-                    logger.info("Ollama embed fallback OK for %d texts", len(input))
-                    return embeds
-        except Exception:
-            logger.debug("Ollama embed fallback unavailable")
-
-        # ── Tier 3: Deterministic hash (last resort) ──
-        logger.warning("No embedding service available, using deterministic hash fallback")
-        return [_hash_embed(t) for t in input]
-
-    def close(self):
-        if self._http_client is not None:
-            import asyncio
-            try:
-                asyncio.create_task(self._http_client.aclose())
-            except Exception:
-                pass
-            self._http_client = None
+# Backward-compat
+RkllamaEmbeddingFunction = BgeSmallEmbedding
+M3Embedding = BgeSmallEmbedding

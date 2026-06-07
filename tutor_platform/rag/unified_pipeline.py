@@ -246,6 +246,38 @@ class UnifiedDocumentPipeline:
             stats["sidecars"].append(".md")
 
         # 4. Structured exam pipeline (Phase 1-4) for exam PDFs
+        # 4. Extract figures (all doc types) and persist to disk
+        fig_paths: list[str] = []
+        try:
+            from tutor_platform.rag.extractors import extract_figures
+
+            figures = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: extract_figures(path, llm_client=llm_client),
+            )
+            if figures:
+                # Persist figure images to .figures/ directory alongside the source
+                fig_dir = path.parent / f"{path.stem}.figures"
+                fig_dir.mkdir(exist_ok=True)
+                for fig in figures:
+                    img_bytes = fig.get("image_bytes")
+                    if img_bytes:
+                        fig_path = fig_dir / f"{fig['figure_id']}.png"
+                        try:
+                            fig_path.write_bytes(img_bytes)
+                            fig["image_path"] = str(fig_path)
+                        except OSError:
+                            pass
+                    # Strip large binary data from the in-memory dict
+                    fig.pop("image_bytes", None)
+
+                fig_paths = [str(fig_dir)]
+                stats["figure_count"] = len(figures)
+                stats["sidecars"].append(f".figures/ ({len(figures)} figures)")
+        except Exception as exc:
+            logger.debug("Figure extraction skipped for %s: %s", path.name, exc)
+
+        # 5. Structured exam pipeline (Phase 1-4) for exam PDFs
         if enable_structured_exam and doc_type == DocType.EXAM_PDF and llm_client:
             try:
                 exam_json = await cls._run_exam_pipeline(
@@ -264,7 +296,7 @@ class UnifiedDocumentPipeline:
             file_path=str(path),
             doc_type=doc_type,
             content_text=content_text,
-            sidecar_paths=sidecar_paths,
+            sidecar_paths=sidecar_paths + fig_paths,
             stats=stats,
         )
 
@@ -378,7 +410,7 @@ class UnifiedDocumentPipeline:
 
         exam_dict = await run_exam_pipeline(
             path, llm_client, max_pages=max_pages,
-            save_figures=False, skip_non_exam=False,
+            save_figures=True, skip_non_exam=False,
         )
         if exam_dict is None:
             return None

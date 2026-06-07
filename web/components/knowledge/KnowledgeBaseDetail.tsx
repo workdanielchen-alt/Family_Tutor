@@ -5,6 +5,7 @@ import { useTranslation } from "react-i18next";
 import {
   Database,
   FileText,
+  Image as ImageIcon,
   Layers,
   Settings as SettingsIcon,
   Star,
@@ -19,11 +20,12 @@ import type { TaskState } from "@/hooks/useKnowledgeProgress";
 import type { HistoryEntry } from "@/hooks/useKnowledgeHistory";
 import KbStatusBadge from "./KbStatusBadge";
 import KbFilesTab from "./KbFilesTab";
+import KbFiguresTab from "./KbFiguresTab";
 import KbDocumentsSection from "./KbDocumentsSection";
 import KbIndexVersionsSection from "./KbIndexVersionsSection";
 import KbSettingsSection from "./KbSettingsSection";
 
-type DetailSection = "files" | "add" | "versions" | "settings";
+type DetailSection = "figures" | "files" | "add" | "versions" | "settings";
 
 interface KnowledgeBaseDetailProps {
   kb: KnowledgeBase | null;
@@ -44,13 +46,14 @@ const SECTIONS: {
   Icon: typeof FileText;
 }[] = [
   { key: "files", label: "Files", Icon: FileText },
+  { key: "figures", label: "Figures", Icon: ImageIcon },
   { key: "add", label: "Add documents", Icon: Upload },
   { key: "versions", label: "Index versions", Icon: Layers },
   { key: "settings", label: "Settings", Icon: SettingsIcon },
 ];
 
 /** Sections that fill the detail body edge-to-edge (no max-w wrapper). */
-const FULL_BLEED_SECTIONS = new Set<DetailSection>(["files"]);
+const FULL_BLEED_SECTIONS = new Set<DetailSection>(["files", "figures"]);
 
 export default function KnowledgeBaseDetail({
   kb,
@@ -178,6 +181,9 @@ export default function KnowledgeBaseDetail({
         ) : (
           <div className="h-full overflow-y-auto px-6 py-5">
             <div className={fullBleed ? "" : "mx-auto max-w-3xl"}>
+              {section === "figures" && (
+                <KbFiguresTab key={kb.name} kb={kb} />
+              )}
               {section === "add" && (
                 <KbDocumentsSection
                   key={kb.name}

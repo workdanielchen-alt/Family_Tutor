@@ -31,6 +31,7 @@
 - `patches/deeptutor-rkllama-embedding.patch` — rkllama embedding provider
 - `patches/hermes-wechat-vendor.patch` — 通知路由 + 文件确认 + HA 其他修改 (原 hermes-wechat-file-ack + hermes-wechat-notification-routing 合并)
 - `patches/knowledge-list-async.patch` — `/api/v1/knowledge/list` 同步 I/O 阻塞修复：将 KB 信息加载移至线程池
+- `patches/weixin-teach-api-unify.patch` — 微信教学入口归一化：新文件→/api/teach/start，答题→/api/teach/continue
 
 ### 🟢 可正常修改 (项目自有代码)
 

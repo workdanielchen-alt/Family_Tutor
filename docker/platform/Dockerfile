@@ -20,7 +20,15 @@ COPY requirements/ ./requirements/
 COPY requirements.txt ./
 RUN pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/ && \
     pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir chromadb mcp "markitdown[all]" "qrcode[pil]" opencv-python-headless pymupdf pymupdf4llm
+    pip install --no-cache-dir chromadb mcp "markitdown[all]" "qrcode[pil]" opencv-python-headless pymupdf pymupdf4llm && \
+    pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu && \
+    pip install --no-cache-dir sentence-transformers
+
+# Pre-download BAAI/bge-small-zh-v1.5 embedding model (~33 MB)
+# Spare the cold-start download on first every request.
+ENV HF_HOME=/root/.cache/huggingface
+ENV SENTENCE_TRANSFORMERS_HOME=/root/.cache/huggingface
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-small-zh-v1.5', trust_remote_code=True)"
 
 # Copy local packages (paths match dev sys.path inserts)
 COPY tutor_platform/ /tutor_platform/

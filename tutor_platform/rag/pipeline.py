@@ -455,6 +455,32 @@ class RagDocumentPipeline:
                 if json_path:
                     ctx.augmented_paths.append(Path(json_path))
                     ctx.record_sidecar(pdf_path, Path(json_path))
+
+                    # ── Consume exam figures into vector store ──
+                    try:
+                        from tutor_platform.rag.extractors import _consume_exam_sidecar
+                        from tutor_platform.unified_provider import get_provider_instance
+
+                        figures = _consume_exam_sidecar(
+                            Path(json_path),
+                            source_file=str(pdf_path),
+                        )
+                        if figures:
+                            provider = get_provider_instance()
+                            _chroma_kb = pdf_path.stem  # use PDF stem as kb hint
+                            await provider.add_figures(
+                                kb_name=_chroma_kb,
+                                figures=figures,
+                            )
+                            logger.info(
+                                "Exam figures: %d from %s -> %s_figures",
+                                len(figures), pdf_path.name, _chroma_kb,
+                            )
+                    except Exception as fig_exc:
+                        logger.debug(
+                            "Exam figure consumption skipped for %s: %s",
+                            pdf_path.name, fig_exc,
+                        )
             except Exception as exc:
                 logger.error(
                     "Structured exam failed for %s: %s", pdf_path.name, exc,

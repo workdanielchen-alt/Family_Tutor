@@ -2296,7 +2296,8 @@ class WeixinAdapter(BasePlatformAdapter):
                     # Image with OCR: use extracted text as context
                     _teach_ctx = _teach_context
 
-                # Pass total_questions from session so platform can detect completion
+                # ── 统一教学调用（初次出题和后续答题都用 /api/tutor/chat）──
+                # WeChat 端独立走旧流程，与 Web UI 的 teach session 分离
                 _tq = 0
                 _cur_s = self._teaching_sessions.get(effective_chat_id)
                 if isinstance(_cur_s, dict):
@@ -2317,42 +2318,44 @@ class WeixinAdapter(BasePlatformAdapter):
                 if resp.status == 200:
                     data = await resp.json()
                     reply = data.get("content", "") if data.get("ok") else ""
-                    if reply:
-                        # Release the concurrency guard BEFORE iLink send
-                        # (5-10s).  Otherwise a fast student follow-up during
-                        # the send window gets blocked with no feedback.
-                        self._running_teachings.discard(effective_chat_id)
-                        try:
-                            await asyncio.wait_for(
-                                self.send(content=reply, chat_id=effective_chat_id),
-                                timeout=15,
-                            )
-                        except asyncio.TimeoutError:
-                            logger.warning(
-                                "[%s] WeChat send timed out for %s (rate limited?)",
-                                self.name, effective_chat_id,
-                            )
-                        # Update session (don't overwrite with timestamp)
-                        _cur = self._teaching_sessions.get(effective_chat_id)
-                        if isinstance(_cur, dict):
-                            _cur["last_active"] = time.time()
-                            # Extract question number from reply
-                            _qn_m = re.search(r"第\s*(\d+)\s*[题/]", reply)
-                            if _qn_m:
-                                _cur["question_num"] = int(_qn_m.group(1))
-                            # Detect total questions
-                            _tq_m = re.search(r"第\d+[题/]\s*(\d+)", reply)
-                            if _tq_m:
-                                _cur["total_questions"] = int(_tq_m.group(1))
-                        else:
-                            # Fallback: create new session
-                            self._teaching_sessions[effective_chat_id] = self._new_session("active")
-                        self._save_teaching_sessions()
-                        logger.info(
-                            "[%s] Tutor reply sent to %s (%d chars, %.1fs)",
-                            self.name, effective_chat_id, len(reply), time.time() - _start,
+                else:
+                    reply = ""
+
+                if reply:
+                    # Release the concurrency guard BEFORE iLink send
+                    # (5-10s).  Otherwise a fast student follow-up during
+                    # the send window gets blocked with no feedback.
+                    self._running_teachings.discard(effective_chat_id)
+                    try:
+                        await asyncio.wait_for(
+                            self.send(content=reply, chat_id=effective_chat_id),
+                            timeout=15,
                         )
-                        return
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "[%s] WeChat send timed out for %s (rate limited?)",
+                            self.name, effective_chat_id,
+                        )
+                    # Update session (don't overwrite with timestamp)
+                    _cur = self._teaching_sessions.get(effective_chat_id)
+                    if isinstance(_cur, dict):
+                        _cur["last_active"] = time.time()
+                        # Extract question number from reply
+                        _qn_m = re.search(r"第\s*(\d+)\s*[题/]", reply)
+                        if _qn_m:
+                            _cur["question_num"] = int(_qn_m.group(1))
+                        _tq_m = re.search(r"第\d+[题/]\s*(\d+)", reply)
+                        if _tq_m:
+                            _cur["total_questions"] = int(_tq_m.group(1))
+                    else:
+                        # Fallback: create new session
+                        self._teaching_sessions[effective_chat_id] = self._new_session("active")
+                    self._save_teaching_sessions()
+                    logger.info(
+                        "[%s] Tutor reply sent to %s (%d chars, %.1fs)",
+                        self.name, effective_chat_id, len(reply), time.time() - _start,
+                    )
+                    return
 
                 # Fallback: if tutor_chat returned no content, try agent
                 logger.warning("[%s] Tutor chat returned empty, falling back", self.name)

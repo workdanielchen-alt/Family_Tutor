@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re as _re
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -520,8 +521,15 @@ def extract_pdf_tables_as_markdown(file_path: str | Path, max_pages: int = 50) -
 
 # ── PDF embedded image extraction ─────────────────────────────────
 
-def extract_pdf_embedded_images(file_path: str | Path, max_pages: int = 50) -> list[bytes]:
+def extract_pdf_embedded_images(
+    file_path: str | Path,
+    max_pages: int = 50,
+    page_offset: int = 0,
+) -> list[bytes]:
     """Extract embedded images from a PDF using ``doc.get_page_images()``.
+
+    Skips the first ``page_offset`` pages (typically front matter: cover,
+    copyright, ToC) so callers don't waste the image budget on decorations.
 
     Returns raw image bytes for each embedded image found.  Caller can
     pass these to an OCR engine for text extraction from embedded graphics.
@@ -535,8 +543,10 @@ def extract_pdf_embedded_images(file_path: str | Path, max_pages: int = 50) -> l
     images: list[bytes] = []
     try:
         doc = fitz.open(str(path))
-        pages_to_check = min(max_pages, len(doc))
-        for i in range(pages_to_check):
+        total = len(doc)
+        start = min(page_offset, total - 1)
+        end = min(start + max_pages, total)
+        for i in range(start, end):
             page = doc[i]
             image_list = page.get_images(full=True)
             for img in image_list:
@@ -550,7 +560,10 @@ def extract_pdf_embedded_images(file_path: str | Path, max_pages: int = 50) -> l
         logger.warning("PDF image extraction failed for %s: %s", path.name, exc)
 
     if images:
-        logger.debug("extract_pdf_embedded_images: %d images from %s", len(images), path.name)
+        logger.debug(
+            "extract_pdf_embedded_images: %d images from pages %d-%d of %s",
+            len(images), start + 1, end, path.name,
+        )
     return images
 
 
@@ -738,6 +751,7 @@ def semantic_chunk(
     chunk_overlap: int = 100,
     doc_type: str = "unknown",
     filename: str = "",
+    figures: list[dict] | None = None,
 ) -> list[dict]:
     """Split text into semantic chunks preserving Markdown heading boundaries.
 
@@ -753,8 +767,12 @@ def semantic_chunk(
       - ``chunk_index``: 0-based chunk number
       - ``char_count``: length of this chunk's own text (excludes overlap)
       - ``doc_type``, ``filename``: metadata passthrough
+      - ``figures``: list of figure dicts referenced by or near this chunk
+      - ``figure_ids``: list of figure IDs for quick reference matching
 
     ``chunk_size`` defaults to ``RAG_CHUNK_SIZE`` env var or 800.
+    When ``figures`` is provided, each chunk carries a ``figures`` sub-list
+    of figure dicts whose spatial/textual context overlaps with that chunk.
     """
     import re as _re
 
@@ -762,6 +780,7 @@ def semantic_chunk(
         chunk_size = int(os.environ.get("RAG_CHUNK_SIZE", "800"))
 
     if len(text) <= chunk_size:
+        chunk_figures = _match_figures_to_chunk(text, figures or [])
         return [{
             "text": text,
             "heading_path": "",
@@ -769,6 +788,8 @@ def semantic_chunk(
             "char_count": len(text),
             "doc_type": doc_type,
             "filename": filename,
+            "figures": [_figure_ref(f) for f in chunk_figures],
+            "figure_ids": [f["figure_id"] for f in chunk_figures],
         }]
 
     # Split at Markdown headings (## / ### / ####) — each starts a new section
@@ -808,8 +829,10 @@ def semantic_chunk(
             sections.append((current_heading, body_text))
 
     # Build chunks from sections, splitting oversized ones
+    _figures = figures or []
     chunks: list[dict] = []
     for heading, body in sections:
+        chunk_figures = _match_figures_to_chunk(body, _figures)
         if len(body) <= chunk_size:
             chunks.append({
                 "text": body,
@@ -818,6 +841,8 @@ def semantic_chunk(
                 "char_count": len(body),
                 "doc_type": doc_type,
                 "filename": filename,
+                "figures": [_figure_ref(f) for f in chunk_figures],
+                "figure_ids": [f["figure_id"] for f in chunk_figures],
             })
         else:
             # Split oversized body at paragraph boundaries
@@ -826,25 +851,33 @@ def semantic_chunk(
             buf_heading = heading
             for para in paragraphs:
                 if len(buf) + len(para) + 2 > chunk_size and buf:
+                    buf_text = buf.strip()
+                    pfigures = _match_figures_to_chunk(buf_text, _figures)
                     chunks.append({
-                        "text": buf.strip(),
+                        "text": buf_text,
                         "heading_path": buf_heading,
                         "chunk_index": len(chunks),
-                        "char_count": len(buf.strip()),
+                        "char_count": len(buf_text),
                         "doc_type": doc_type,
                         "filename": filename,
+                        "figures": [_figure_ref(f) for f in pfigures],
+                        "figure_ids": [f["figure_id"] for f in pfigures],
                     })
                     buf = para
                 else:
                     buf = (buf + "\n\n" + para).strip() if buf else para
             if buf.strip():
+                buf_text = buf.strip()
+                pfigures = _match_figures_to_chunk(buf_text, _figures)
                 chunks.append({
-                    "text": buf.strip(),
+                    "text": buf_text,
                     "heading_path": heading,
                     "chunk_index": len(chunks),
-                    "char_count": len(buf.strip()),
+                    "char_count": len(buf_text),
                     "doc_type": doc_type,
                     "filename": filename,
+                    "figures": [_figure_ref(f) for f in pfigures],
+                    "figure_ids": [f["figure_id"] for f in pfigures],
                 })
 
     # Apply overlap: prepend tail of previous chunk
@@ -860,3 +893,541 @@ def semantic_chunk(
                 chunks[i]["text"] = overlap + "\n" + chunks[i]["text"]
 
     return chunks
+
+
+# ── Figure-chunk matching helpers ──────────────────────────────────
+
+_RE_FIGURE_REF = _re.compile(
+    r"[图图表示][0-9一二三四五六七八九十\-]|"
+    r"如图|Fig\.\s*\d+|figure\s*\d+|"
+    r"所示|示意图|图\d+",
+    _re.IGNORECASE,
+)
+
+
+def _match_figures_to_chunk(chunk_text: str, figures: list[dict]) -> list[dict]:
+    """Match figures to a chunk by checking for textual references.
+
+    A figure is considered "referenced" by a chunk when the chunk text
+    contains ``如图X`` / ``Fig.X`` / ``图X`` patterns, or when the
+    figure's caption/OCR text overlaps with the chunk content.
+
+    Returns a subset of ``figures`` that are relevant to this chunk.
+    """
+    if not figures or not chunk_text:
+        return []
+
+    matched: list[dict] = []
+    seen_ids: set[str] = set()
+
+    # Check for explicit figure references in the chunk text
+    has_ref = bool(_RE_FIGURE_REF.search(chunk_text))
+
+    for fig in figures:
+        fid = fig.get("figure_id", "")
+        if fid in seen_ids:
+            continue
+
+        # Match by textual reference pattern
+        caption = fig.get("caption", "")
+        fig_type = fig.get("fig_type", "")
+        ocr_text = fig.get("ocr_text", "")
+
+        # If the chunk mentions this figure's caption or OCR text
+        if caption and caption in chunk_text:
+            seen_ids.add(fid)
+            matched.append(fig)
+            continue
+
+        if has_ref and (caption or fig_type != "unknown"):
+            seen_ids.add(fid)
+            matched.append(fig)
+            continue
+
+        # Last-resort: if OCR text from the figure appears verbatim in chunk
+        if ocr_text and len(ocr_text) > 10 and ocr_text in chunk_text:
+            seen_ids.add(fid)
+            matched.append(fig)
+            continue
+
+    return matched
+
+
+def _figure_ref(fig_dict: dict) -> dict:
+    """Return a compact, JSON-safe reference to a figure for embedding in chunk metadata."""
+    return {
+        "figure_id": fig_dict.get("figure_id", ""),
+        "fig_type": fig_dict.get("fig_type", "unknown"),
+        "caption": fig_dict.get("caption", ""),
+        "description_text": fig_dict.get("description_text", ""),
+        "page_num": fig_dict.get("page_num", 0),
+    }
+
+
+# ── Unified figure extraction ─────────────────────────────────────
+
+_IMAGE_EXTENSIONS: set[str] = {
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".tif", ".heic",
+}
+
+
+def extract_figures(
+    file_path: str | Path,
+    *,
+    trace_id: str = "",
+    llm_client=None,
+    max_figures: int = 60,
+) -> list[dict]:
+    """Extract all figures from a document as serialisable dicts.
+
+    Dispatches to the appropriate sub-extractor based on file extension.
+    Returns a list of ``UnifiedFigure``-compatible dicts (JSON-safe).
+
+    Args:
+        file_path: Path to the source document.
+        trace_id: Trace ID for logging.
+        llm_client: Optional multimodal LLM client for figure description.
+                    When ``None``, only OCR text is extracted (no description).
+        max_figures: Maximum number of figures to extract (capped to avoid
+                     excessive NPU/LLM usage on large documents).
+    """
+    path = Path(file_path)
+    ext = path.suffix.lower()
+
+    if ext == ".pdf":
+        return _extract_pdf_figures(path, trace_id=trace_id, llm_client=llm_client,
+                                     max_figures=max_figures)
+    elif ext in _IMAGE_EXTENSIONS:
+        return _extract_image_figure(path, trace_id=trace_id, llm_client=llm_client)
+    elif ext in (
+        ".docx", ".pptx", ".pptm", ".ppsx", ".xlsx",
+        ".doc", ".ppt", ".pps", ".xls",
+    ):
+        return _extract_office_figures(path, trace_id=trace_id, llm_client=llm_client,
+                                        max_figures=max_figures)
+    return []
+
+
+def _extract_pdf_figures(
+    path: Path,
+    *,
+    trace_id: str = "",
+    llm_client=None,
+    max_figures: int = 20,
+) -> list[dict]:
+    """Extract figures from a PDF via ``extract_pdf_embedded_images()`` +
+    optional MiniCPM-V structured description.
+
+    If a ``.exam.json`` sidecar already exists next to the PDF, its
+    ``QuestionFigure`` entries are reused instead of re-running the LLM.
+    """
+    from tutor_platform.rag.figure_types import UnifiedFigure
+
+    # ── Prefer existing .exam.json sidecar ──
+    sidecar = path.with_name(path.stem + ".exam.json")
+    if sidecar.exists():
+        try:
+            return _consume_exam_sidecar(sidecar, source_file=str(path))
+        except Exception as exc:
+            logger.warning("[%s] Failed to consume exam sidecar %s: %s",
+                           trace_id, sidecar.name, exc)
+
+    # ── Fallback: extract embedded images directly ──
+    # Skip first 15 pages (cover, copyright, ToC), then scan 120 pages
+    # of content, capped at 60 figures per PDF.
+    _cap = min(max_figures, 60)
+    raw_images = extract_pdf_embedded_images(path, max_pages=120, page_offset=15)
+    if not raw_images:
+        return []
+
+    figures: list[dict] = []
+    for idx, img_bytes in enumerate(raw_images[:_cap]):
+        fig = UnifiedFigure(
+            source_file=str(path),
+            page_num=0,
+            image_bytes=img_bytes,
+            fig_type="unknown",
+        )
+
+        # OCR text in the figure if an LLM client is available
+        if llm_client and hasattr(llm_client, "complete"):
+            try:
+                import asyncio, base64
+                img_b64 = base64.b64encode(img_bytes).decode("ascii")
+                # Reuse the text OCR prompt from the exam pipeline
+                result = _run_llm_ocr_sync(llm_client, img_b64)
+                if result:
+                    fig.ocr_text = result
+                    fig.fig_type = _infer_fig_type_from_text(result)
+            except Exception as exc:
+                logger.warning("[%s] LLM OCR failed for PDF figure %d: %s",
+                               trace_id, idx, exc)
+        else:
+            # Without an LLM, mark the figure exists but has no content
+            fig.ocr_text = f"[Figure {idx + 1}]"
+
+        figures.append(_figure_to_dict(fig))
+
+    if figures:
+        logger.debug("[%s] Extracted %d figures from %s",
+                      trace_id, len(figures), path.name)
+    return figures
+
+
+def _extract_image_figure(
+    path: Path,
+    *,
+    trace_id: str = "",
+    llm_client=None,
+) -> list[dict]:
+    """Extract a figure from a standalone image file.
+
+    Combines OCR text extraction and LLM vision description into a single
+    ``UnifiedFigure``.
+    """
+    from tutor_platform.rag.figure_types import UnifiedFigure
+
+    raw_bytes = path.read_bytes()
+    fig = UnifiedFigure(
+        source_file=str(path),
+        page_num=0,
+        image_bytes=raw_bytes,
+        fig_type="illustration",
+    )
+
+    # OCR text first
+    try:
+        ocr_text = extract_image_text(path, trace_id=trace_id)
+        if ocr_text:
+            fig.ocr_text = ocr_text
+    except Exception as exc:
+        logger.warning("[%s] Image OCR failed for %s: %s", trace_id, path.name, exc)
+
+    # Vision description (separate call, cached externally)
+    if llm_client and hasattr(llm_client, "complete"):
+        try:
+            import asyncio, base64
+            img_b64 = base64.b64encode(raw_bytes).decode("ascii")
+            prompt = (
+                "Describe this image. Include visible text/OCR if present, "
+                "the main subject, and any educational or technical meaning. "
+                "Keep under 180 words."
+            )
+            result = _run_llm_ocr_sync(llm_client, img_b64, prompt)
+            if result:
+                fig.description = {"raw": result}
+        except Exception as exc:
+            logger.warning("[%s] Vision description failed for %s: %s",
+                           trace_id, path.name, exc)
+
+    # If no LLM, use OCR text directly
+    if not fig.description and fig.ocr_text:
+        fig.description = {"raw": f"Image containing text: {fig.ocr_text[:200]}"}
+
+    result = _figure_to_dict(fig)
+    logger.debug("[%s] Extracted figure from %s (ocr=%d, desc=%d)",
+                  trace_id, path.name,
+                  len(fig.ocr_text or ""),
+                  len(str(fig.description or "")))
+    return [result]
+
+
+def _extract_office_figures(
+    path: Path,
+    *,
+    trace_id: str = "",
+    llm_client=None,
+    max_figures: int = 20,
+) -> list[dict]:
+    """Extract figures from Office documents (docx/pptx/xlsx).
+
+    Upgrades the existing ``_extract_office_images()`` listing to include
+    OCR text and LLM description for each embedded image.
+    """
+    from tutor_platform.rag.figure_types import UnifiedFigure
+
+    raw_images = _extract_office_images_for_figures(path)
+    if not raw_images:
+        return []
+
+    figures: list[dict] = []
+    for idx, img_bytes in enumerate(raw_images[:max_figures]):
+        fig = UnifiedFigure(
+            source_file=str(path),
+            page_num=0,
+            image_bytes=img_bytes,
+            fig_type="illustration",
+        )
+
+        if llm_client and hasattr(llm_client, "complete"):
+            try:
+                import base64
+                img_b64 = base64.b64encode(img_bytes).decode("ascii")
+                result = _run_llm_ocr_sync(llm_client, img_b64)
+                if result:
+                    fig.ocr_text = result
+            except Exception as exc:
+                logger.warning("[%s] Office figure OCR failed for %s img %d: %s",
+                               trace_id, path.name, idx, exc)
+
+        figures.append(_figure_to_dict(fig))
+
+    if figures:
+        logger.debug("[%s] Extracted %d figures from Office %s",
+                      trace_id, len(figures), path.name)
+    return figures
+
+
+def _extract_office_images_for_figures(path: Path) -> list[bytes]:
+    """Extract all embedded images from an Office document.
+
+    Enhanced version of ``_extract_office_images()`` that returns raw
+    image bytes for LLM processing instead of just a text listing.
+
+    Handles both ZIP-based formats (docx/pptx/xlsx) and OLE-based
+    old formats (doc/ppt/xls).
+    """
+    import zipfile, os as _os
+
+    ext = path.suffix.lower()
+    all_images: list[bytes] = []
+    seen_hashes: set[int] = set()
+
+    # ── ZIP-based formats (modern Office) ──
+    media_prefixes = {
+        ".docx": ["word/media/"], ".docm": ["word/media/"],
+        ".pptx": ["ppt/media/"], ".pptm": ["ppt/media/"], ".ppsx": ["ppt/media/"],
+        ".xlsx": ["xl/media/"],
+    }.get(ext, [])
+
+    for prefix in media_prefixes:
+        try:
+            with zipfile.ZipFile(str(path)) as z:
+                for name in z.namelist():
+                    ext_lower = _os.path.splitext(name)[1].lower()
+                    if name.startswith(prefix) and ext_lower in {
+                        ".png", ".jpg", ".jpeg", ".gif", ".bmp",
+                    }:
+                        data = z.read(name)
+                        h = hash(data)
+                        if h not in seen_hashes and len(data) > 500:
+                            seen_hashes.add(h)
+                            all_images.append(data)
+        except (zipfile.BadZipFile, FileNotFoundError):
+            pass
+
+    # ── OLE-based formats (old Office: .doc, .ppt, .xls) ──
+    if ext in {".doc", ".ppt", ".pps", ".xls"}:
+        try:
+            import olefile
+        except ImportError:
+            return all_images
+
+        try:
+            ole = olefile.OleFileIO(str(path))
+            for s in ole.listdir():
+                try:
+                    data = ole.openstream(s).read()
+                    h = hash(data)
+                    if h in seen_hashes:
+                        continue
+                    sig = data[:8]
+                    if (
+                        sig[:2] == b"\xff\xd8"
+                        or sig[:4] == b"\x89PNG"
+                        or sig[:2] == b"BM"
+                        or sig[:4] == b"GIF8"
+                    ):
+                        seen_hashes.add(h)
+                        all_images.append(data)
+                except Exception:
+                    continue
+            ole.close()
+        except Exception:
+            pass
+
+    return all_images
+
+
+def _consume_exam_sidecar(sidecar_path: Path, source_file: str = "") -> list[dict]:
+    """Parse an ``.exam.json`` sidecar and return UnifiedFigure dicts."""
+    import json as _json
+    from tutor_platform.rag.figure_types import UnifiedFigure
+
+    with open(sidecar_path, "r", encoding="utf-8") as f:
+        exam = _json.load(f)
+
+    figures: list[dict] = []
+    for question in exam.get("questions", []):
+        for qf in question.get("figures", []):
+            desc = qf.get("description")
+            fig_type = _infer_fig_type_from_desc(desc) if desc else "unknown"
+            fig = UnifiedFigure(
+                figure_id=qf.get("figure_id", ""),
+                source_file=source_file or str(sidecar_path),
+                page_num=qf.get("page_num", 0),
+                bbox=tuple(qf.get("bbox", [0, 0, 0, 0])),
+                description=desc,
+                fig_type=fig_type,
+            )
+            # If the description has OCR-like text, pull it out
+            if desc and isinstance(desc, dict):
+                for key in ("text", "ocr", "content"):
+                    val = desc.get(key)
+                    if val and isinstance(val, str):
+                        fig.ocr_text = val
+                        break
+            figures.append(_figure_to_dict(fig))
+
+    return figures
+
+
+# ── Helpers ────────────────────────────────────────────────────────
+
+def _figure_to_dict(fig) -> dict:
+    """Convert a UnifiedFigure to a JSON-serialisable dict."""
+    return {
+        "figure_id": fig.figure_id,
+        "source_file": fig.source_file,
+        "page_num": fig.page_num,
+        "bbox": list(fig.bbox) if fig.bbox else None,
+        "image_bytes": fig.image_bytes,
+        "image_path": fig.image_path,
+        "ocr_text": fig.ocr_text,
+        "description": fig.description,
+        "fig_type": fig.fig_type,
+        "caption": fig.caption,
+        "referring_chunks": fig.referring_chunks,
+        "description_text": fig.description_text,
+    }
+
+
+def _infer_fig_type_from_text(text: str) -> str:
+    """Guess figure type from OCR text content."""
+    import re as _re
+    tl = text.lower()
+    if any(w in tl for w in ("三角形", "circle", "圆", "矩形", "正方形",
+                              "平行", "垂直", "∠", "△", "▱", "□")):
+        return "geometry"
+    if _re.search(r'[=xysincostanlim]', tl) and _re.search(r'\d', tl):
+        return "function_graph"
+    if _re.search(r'[│|]\s*[^│|]+\s*[│|]', text) or "table" in tl:
+        return "table"
+    if any(w in tl for w in ("图", "diagram", "chart", "实验", "示意")):
+        return "illustration"
+    return "unknown"
+
+
+def _infer_fig_type_from_desc(desc: dict) -> str:
+    """Determine figure type from a structured description dict."""
+    if not isinstance(desc, dict):
+        return "unknown"
+    if "figure_type" in desc:
+        return "geometry"
+    if "function_hint" in desc:
+        return "function_graph"
+    if "type" in desc:
+        t = str(desc.get("type", "")).lower()
+        if t in ("table",):
+            return "table"
+    return "illustration"
+
+
+def _run_llm_ocr_sync(llm_client, img_b64: str, prompt: str = "") -> str:
+    """Run a synchronous LLM OCR/description call.
+
+    Works with both sync and async LLM clients by detecting the running
+    event loop.
+    """
+    import asyncio as _asyncio
+
+    if not prompt:
+        prompt = (
+            "Transcribe all visible text from this image exactly as written, "
+            "preserving the original language and structure. "
+            "If the image contains diagrams or figures, describe them "
+            "briefly. Return only the transcribed text and description."
+        )
+
+    async def _call() -> str:
+        return await llm_client.complete(
+            prompt,
+            image_data=img_b64,
+            image_mime_type="image/png",
+            image_filename="figure.png",
+        )
+
+    try:
+        loop = _asyncio.get_running_loop()
+        if loop.is_running():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                return pool.submit(_asyncio.run, _call()).result()
+        return _asyncio.run(_call())
+    except RuntimeError:
+        return _asyncio.run(_call())
+
+
+def _match_answers(student: str, correct: str) -> bool:
+    """Compare student answer with correct answer, handles various formats.
+
+    Supports:
+    - Exact match (选择题: "B" == "B")
+    - Case-insensitive match
+    - Numeric equivalence ("33" == "33岁", "x=5" == "5")
+    - Trimmed comparison (trailing units/punctuation)
+    """
+    s = student.strip()
+    c = correct.strip()
+    if not s or not c:
+        return False
+
+    if s == c:
+        return True
+    if s.upper() == c.upper():
+        return True
+    if s in ("A", "B", "C", "D") and c in ("A", "B", "C", "D"):
+        return False
+    s_nums = _re.findall(r"\d+", s)
+    c_nums = _re.findall(r"\d+", c)
+    if s_nums and c_nums and all(cn in s_nums for cn in c_nums):
+        return True
+    s_clean = _re.sub(r"[.。，,、\s单位个只条约根种]+$", "", s)
+    c_clean = _re.sub(r"[.。，,、\s单位个只条约根种]+$", "", c)
+    if s_clean and c_clean and s_clean == c_clean:
+        return True
+    return False
+
+
+def _match_answers_semantic(student: str, correct: str) -> bool:
+    """Partial match detection — student has the right idea but not exact."""
+    import re as _re2
+    s = student.strip().lower()
+    c = correct.strip().lower()
+    if not s or not c or s == c:
+        return False
+
+    _opt_s = _re2.findall(r"^选?([a-dA-D])$|\(?([a-dA-D])\)?$", s)
+    _opt_c = _re2.findall(r"^选?([a-dA-D])$|\(?([a-dA-D])\)?$", c)
+    if _opt_s and _opt_c:
+        _s_letter = (_opt_s[0][0] or _opt_s[0][1]).upper()
+        _c_letter = (_opt_c[0][0] or _opt_c[0][1]).upper()
+        if _s_letter == _c_letter:
+            return True
+
+    _s_nums = set(_re2.findall(r"\d+", s))
+    _c_nums = set(_re2.findall(r"\d+", c))
+    if _s_nums and _c_nums:
+        if len(_s_nums & _c_nums) >= len(_c_nums) * 0.5:
+            return True
+
+    _key_terms = {
+        "加", "减", "乘", "除", "等于", "大", "小", "正", "负",
+        "数", "和", "差", "积", "商", "解", "方程", "分式",
+        "分子", "分母", "倒数", "绝对", "平方", "根",
+    }
+    _s_terms = {t for t in _key_terms if t in s}
+    _c_terms = {t for t in _key_terms if t in c}
+    if _s_terms and _c_terms and _s_terms == _c_terms:
+        return True
+    return False
