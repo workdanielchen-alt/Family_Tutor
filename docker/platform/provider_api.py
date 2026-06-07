@@ -6401,7 +6401,7 @@ async def _direct_deepseek_teach(
             "🔴 严格遵循试卷题号顺序，禁止跳题。即使某题 OCR 只有 [pic] 或乱码，也要输出该题。\n"
             "🔴 如果所有题已出完，next_question 设为 null。\n"
         )
-        user_content = f"[PHASE:{phase}] [学生正在回答第{_qnum}题] {_constraint}\n{message}"
+        user_content = f"[PHASE:{phase}] [学生正在回答第{max(1, _qnum - 1)}题] {_constraint}\n{message}"
         _exam_ctx = context.strip() or _last_tutor_context.get(learner_id, "")
         if _exam_ctx:
             user_content += f"\n\n# 当前试卷（下一题必须从此试卷中选取）\n{_exam_ctx[:6000]}"
@@ -7038,7 +7038,7 @@ async def _tutor_chat_core(
             _q_text = _ocr_questions.get(learner_id, {}).get(_qnum, "")
         _eval_ctx = _q_text if _q_text else (message or context or "")
         payload = (
-            f"[PHASE:{_phase}] [学生正在回答第{_qnum}题] {_constraint}\n"
+            f"[PHASE:{_phase}] [学生正在回答第{max(1, _qnum - 1)}题] {_constraint}\n"
             f"当前题目：\n{_eval_ctx}\n\n"
             f"学生的答案：{message}"
         )
