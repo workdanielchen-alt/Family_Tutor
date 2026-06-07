@@ -6402,9 +6402,6 @@ async def _direct_deepseek_teach(
         _exam_ctx = context.strip() or _last_tutor_context.get(learner_id, "")
         if _exam_ctx:
             user_content += f"\n\n# 当前试卷（下一题必须从此试卷中选取）\n{_exam_ctx[:6000]}"
-            user_content += f"\n# 已答题目（不要重复出这些题）\n"
-            for _i in range(1, _qnum):
-                user_content += f"第{_i}题 ✓\n"
 
     payload = {
         "model": llm_model,
@@ -6419,7 +6416,7 @@ async def _direct_deepseek_teach(
     _last_err = ""
     for _attempt in range(2):
         try:
-            async with httpx.AsyncClient(timeout=60) as client:
+            async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.post(
                     llm_url,
                     json=payload,
