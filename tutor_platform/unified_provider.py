@@ -206,7 +206,9 @@ class UnifiedLocalProvider:
         """Query the vector store for relevant documents."""
         try:
             client = self._get_chroma_client()
-            collection = client.get_collection(name=collection_name)
+            # 统一使用 sanitized 名称（与 ingest/add_documents 一致）
+            _safe_name = _sanitize_collection_name(collection_name)
+            collection = client.get_collection(name=_safe_name)
 
             embed_fn = self._get_embed_fn()
             loop = asyncio.get_running_loop()
