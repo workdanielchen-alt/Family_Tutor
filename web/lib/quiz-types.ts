@@ -77,6 +77,8 @@ export interface TeachEvaluation {
   feedback: string;
   answer_key: string;
   explanation: string;
+  /** Knowledge point ID, e.g. "数学/分式/分式有意义的条件" */
+  knowledge_point?: string;
 }
 
 /** Tracks the learner's answer state for one question. */

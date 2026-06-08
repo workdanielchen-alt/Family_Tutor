@@ -72,6 +72,14 @@ from tutor_platform.teach_question import (
     validate_teach_response,
 )
 from tutor_platform.quiz_sync import sync_quiz_to_mastery
+from tutor_platform.teach_loop import (
+    TeachLabel,
+    TeachPhase,
+    TeachLoopState,
+    TeachPromptManager,
+    run_teach_loop,
+    run_teach_loop_from_args,
+)
 from tutor_platform.storage import validate_provider_config
 from tutor_platform.tools.preprocess import preprocess_image_bytes
 from tutor_platform.unified_provider import (
@@ -2079,6 +2087,47 @@ def _scan_ole_images(file_path: str, seen: set[int]) -> list[bytes]:
     return images
 
 
+
+# ── Known MS Office / OLE artifact patterns in OCR output ──
+# These are text representations of embedded objects (equations, charts, etc.)
+# that Word/PPT embed as OLE objects and text extractors render as literal text.
+_OLE_ARTIFACT_RE = re.compile(
+    r'(?:'
+    r'EMBED\s+\S+'              # EMBED Equation.3, EMBED Word.Picture.8
+    r'|OBJECT\s+\S+'                         # OBJECT 1, OBJECT Shape
+    r'|HYPERLINK\s+"[^"]*"'                  # HYPERLINK "url"
+    r'|PAGEREF\s+\S+'                       # PAGEREF _Toc12345
+    r'|REF\s+\S+'                            # REF _Ref123456
+    r'|TC\s+"[^"]*"'                          # TC "Table of Contents entry"
+    r'|SEQ\s+\S+(?:\s+\S+)*'     # SEQ 式 \\* ARABIC
+    r')',
+    re.IGNORECASE,
+)
+
+# Lines that are entirely OLE artifacts (no real content) — used to detect
+# docs where the extractor failed on every embedded object.
+_ALL_OLE_LINE_RE = re.compile(
+    r'^\s*(?:EMBED\s+\S+|OBJECT\s+\S+|HYPERLINK\s+"[^"]*")\s*$',
+    re.IGNORECASE,
+)
+
+
+def _sanitize_ocr_text(text: str) -> str:
+    """Strip known MS Office/OLE garbage artifacts from OCR-extracted text.
+
+    These artifacts appear when a Word/PPT document with embedded equations,
+    charts, or cross-references is processed by text extraction (not visual OCR).
+    The extraction picks up the OLE object placeholder as literal text.
+    """
+    if not text:
+        return text
+    result = _OLE_ARTIFACT_RE.sub("", text)
+    # Collapse multiple blank lines into one
+    result = re.sub(r'\n{3,}', '\n\n', result)
+    result = result.strip()
+    return result
+
+
 def _ocr_output_is_garbled(text: str) -> bool:
     """Detect garbled OCR output from MiniCPM or other unreliable sources.
 
@@ -2096,6 +2145,14 @@ def _ocr_output_is_garbled(text: str) -> bool:
     # STUB mode output — always garbled
     if "[STUB:" in text:
         return True
+
+    # MS Office OLE artifacts (EMBED Equation.3, OBJECT, HYPERLINK, etc.)
+    # These are dead text — the extraction pipeline failed to decode the object.
+    _ole_lines = sum(1 for line in stripped.splitlines() if _ALL_OLE_LINE_RE.match(line))
+    _total_lines = max(len(stripped.splitlines()), 1)
+    if _ole_lines > 0 and _ole_lines / _total_lines > 0.5:
+        return True
+
 
     # Dominated by non-letter symbols (garbage ASCII noise)
     alnum = sum(1 for c in stripped if c.isalnum() or c.isspace())
@@ -3561,6 +3618,7 @@ def api_kb_search(query: str = "", kb_name: str = "初中教材", top_k: int = 5
         return {"ok": False, "error": "query is required"}
     try:
         import chromadb
+        from chromadb.config import Settings
 
         _chroma_kb = _chromadb_kb_name(kb_name)
         client = chromadb.PersistentClient(path="/data/chroma")
@@ -4498,6 +4556,8 @@ async def api_process_file(request: Request):
     # 后续 auto-trigger 或 tutor_chat 会从缓存取 context 更新 SOUL.md
     # 跳过 ocr_fallback/passthrough 路线, 防止虚假上下文污染后续交互
     _ocr_content = result.get("content", "").strip()
+    # Sanitize OCR text: strip MS Office OLE garbage before caching
+    _ocr_content = _sanitize_ocr_text(_ocr_content)
     if _ocr_content and result.get("ok") and result.get("route") not in ("ocr_fallback", "passthrough"):
         _last_tutor_context[learner_id] = _ocr_content
         if len(_last_tutor_context) > _MAX_CACHED_CONTEXTS:
@@ -6401,7 +6461,7 @@ async def _direct_deepseek_teach(
             "🔴 严格遵循试卷题号顺序，禁止跳题。即使某题 OCR 只有 [pic] 或乱码，也要输出该题。\n"
             "🔴 如果所有题已出完，next_question 设为 null。\n"
         )
-        user_content = f"[PHASE:{phase}] [学生正在回答第{max(1, _qnum - 1)}题] {_constraint}\n{message}"
+        user_content = f"[PHASE:{phase}] [学生正在回答第{_qnum}题] {_constraint}\n{message}"
         _exam_ctx = context.strip() or _last_tutor_context.get(learner_id, "")
         if _exam_ctx:
             user_content += f"\n\n# 当前试卷（下一题必须从此试卷中选取）\n{_exam_ctx[:6000]}"
@@ -6603,8 +6663,7 @@ async def _fast_teach(
 
     # Save context for follow-up turns
     if context.strip():
-        _last_tutor_context[learner_id] = context
-        _last_question_num[learner_id] = 0
+        _last_tutor_context[learner_id] = _sanitize_ocr_text(context)
 
     # LLM call with retry
     last_err = ""
@@ -6705,8 +6764,7 @@ async def _tutor_chat_core(
     #    Persisted to disk for container restart recovery.
     _teach_session_id = teach_session_id
     if context.strip():
-        _last_tutor_context[learner_id] = context
-        _last_question_num[learner_id] = 0
+        _last_tutor_context[learner_id] = _sanitize_ocr_text(context)
 
         if len(_last_tutor_context) > _MAX_CACHED_CONTEXTS:
             _last_tutor_context.clear()
@@ -6809,13 +6867,12 @@ async def _tutor_chat_core(
     #     No LLM involvement — platform determines correct/wrong by comparing
     #     the student's message with the [ANSWER_KEY:] stored when the question
     #     was asked.  Result is injected into SOUL.md so LLM explains, not judges.
-    #     NOTE: _last_question_num was advanced to the NEXT question by the
-    #     JSON path, so the current question being evaluated is (current - 1).
+    #     NOTE: _last_question_num is restored from session.current_question
+    #     (which stores the latest generated question index).
+    #     The student's current message is the answer to that question.
     _mastery_eval = None
     _eval_kp = ""
     _q_for_eval = _last_question_num.get(learner_id, 0)
-    if _q_for_eval > 1:
-        _q_for_eval -= 1  # 还原到当前正在答的题号
     _all_keys = _answer_keys.get(learner_id, {})
     _eval_key_idx = _q_for_eval if _q_for_eval in _all_keys else None
     if _eval_key_idx is None:
@@ -6868,7 +6925,9 @@ async def _tutor_chat_core(
         _phase = "FIRST_QUESTION"
         _last_question_num[learner_id] = 1  # ensure tracking starts at 1
         _session_answered_count[learner_id] = 0  # reset counter for new session
-        _constraint = (
+        # YAML 驱动约束（优先），硬编码降级保持向后兼容
+        _yaml_con = TeachPromptManager.get().get_phase_constraint(_phase)
+        _constraint = _yaml_con if _yaml_con else (
             "\n\n【输出格式 - 严格 JSON】\n"
             "你必须且只能输出一个 JSON 代码块（用 ```json 包裹），格式如下：\n\n"
             "```json\n"
@@ -6971,7 +7030,9 @@ async def _tutor_chat_core(
         _qnum = _last_question_num.get(learner_id, 0)
         _next_q = _qnum + 1
         _prev_answer = _answer_keys.get(learner_id, {}).get(_qnum, "")
-        _constraint = (
+        # YAML 驱动约束（优先），硬编码降级保持向后兼容
+        _yaml_con = TeachPromptManager.get().get_phase_constraint(_phase)
+        _constraint = _yaml_con if _yaml_con else (
             "\n\n【输出格式 - 严格 JSON】\n"
             "你必须且只能输出一个 JSON 代码块（用 ```json 包裹），格式如下：\n\n"
             "```json\n"
@@ -7038,12 +7099,47 @@ async def _tutor_chat_core(
             _q_text = _ocr_questions.get(learner_id, {}).get(_qnum, "")
         _eval_ctx = _q_text if _q_text else (message or context or "")
         payload = (
-            f"[PHASE:{_phase}] [学生正在回答第{max(1, _qnum - 1)}题] {_constraint}\n"
+            f"[PHASE:{_phase}] [学生正在回答第{_qnum}题] {_constraint}\n"
             f"当前题目：\n{_eval_ctx}\n\n"
             f"学生的答案：{message}"
         )
 
     _nudge_sent = False  # track if we already nudged for next question
+    _persona = _last_persona.get(learner_id, "")
+
+    # ── 优化1-3: Agentic Loop 教学引擎 (v8.0) ─────────────────────────
+    # 使用 THINK→TOOL→FINISH 标签协议 + Plan→Solve→Review 多阶段管道。
+    # 环境变量 AGENTIC_LOOP_ENABLED 控制是否启用（默认关闭保持向后兼容）。
+    # 失败时自动 fallback 到下面的直接 LLM 路径。
+    _agentic_loop_used = False
+    if os.getenv("AGENTIC_LOOP_ENABLED", "true").lower() in ("1", "true", "yes"):
+        try:
+            _agentic_result = await run_teach_loop_from_args(
+                phase=_phase,
+                learner_id=learner_id,
+                context=_soul_context or "",
+                message=message,
+                mode=mode,
+                trace_id=trace_id,
+                teach_session_id=_teach_session_id,
+                extracted_exam=_extracted_exams.get(learner_id),
+                answer_keys=_answer_keys.get(learner_id, {}),
+                last_question_num=_last_question_num.get(learner_id, 0),
+                persona=_persona or None,
+            )
+            if _agentic_result and _agentic_result.get("ok"):
+                result = _agentic_result
+                _agentic_loop_used = True
+                _skip_ws = True
+                logger.info("[%s] Agentic loop succeeded (%d chars)",
+                            trace_id, len(str(result.get("content", ""))))
+            else:
+                _agentic_error = _agentic_result.get("error", "unknown") if _agentic_result else "None"
+                logger.warning("[%s] Agentic loop failed (%s), falling through",
+                               trace_id, _agentic_error)
+        except Exception as _agentic_ex:
+            logger.warning("[%s] Agentic loop exception, falling through: %s",
+                           trace_id, _agentic_ex)
 
     # 4. Direct LLM paths (bypass DT AgentLoop for speed).
     #    Three tiers, each falling through to the next on failure:
@@ -7055,7 +7151,6 @@ async def _tutor_chat_core(
     # 4a. Direct DeepSeek API — fastest path, bypasses DT AgentLoop entirely.
     # Use _last_persona (built by _update_soul_with_context above) as system
     # prompt so the Direct path has the same rich context as the DT WS path.
-    _persona = _last_persona.get(learner_id, "")
     if not _skip_ws:
         try:
             _deepseek_content = await _direct_deepseek_teach(
@@ -10116,6 +10211,16 @@ async def api_teach_start(request: Request):
         if reply:
             if _question:
                 # Structured mode: use TeachQuestion for total / current tracking
+                # ── 题号校验：LLM 可能输出 0 或乱序，强制纠正 ──
+                if _question.index < 1:
+                    logger.info("[%s] Fixing start index: %d → 1", trace_id, _question.index)
+                    _question.index = 1
+                if _question.total < 1:
+                    _question.total = max(
+                        _question.total,
+                        _detect_total_questions(ocr_text) if ocr_text else 0,
+                        1,
+                    )
                 session.total_questions = _question.total
                 session.current_question = _question.index
                 session.first_question = json.dumps(_question.to_dict(), ensure_ascii=False)
@@ -10277,15 +10382,17 @@ async def api_teach_continue(request: Request):
             session.past_questions = json.dumps(_past, ensure_ascii=False)
 
             if _next_q:
-                # ── Auto-correct skipped questions ──
-                # Only correct when the LLM actually skipped (>1 gap).
-                # session.current_question is ground truth (persisted).
-                # _last_question_num was already advanced by _tutor_core.
-                _next_expected = session.current_question + 1
-                if _next_q.index > _next_expected:
+                # ── Auto-correct question index ──
+                # Handle three cases:
+                #   1. LLM outputs index=0 → force to expected
+                #   2. LLM skips numbers (>1 gap) → correct to expected
+                #   3. index out of bounds → clamp to total
+                _next_expected = max(session.current_question + 1, 1)
+                if _next_q.index < 1 or _next_q.index > _next_expected:
+                    _reason = "index=0" if _next_q.index < 1 else "skip detected"
                     logger.info(
-                        "[%s] Correcting next_q index: %d → %d (OCR skip detected)",
-                        trace_id, _next_q.index, _next_expected,
+                        "[%s] Correcting next_q index: %d → %d (%s)",
+                        trace_id, _next_q.index, _next_expected, _reason,
                     )
                     _next_q.index = _next_expected
                     _last_question_num[learner_id] = _next_expected
@@ -10332,6 +10439,7 @@ async def api_teach_continue(request: Request):
                         answer_key="",
                         explanation="",
                     )
+            _trace = result.get("trace_events", [])
             _resp = {
                 "ok": True,
                 "evaluation": _eval.to_dict(),
@@ -10342,6 +10450,8 @@ async def api_teach_continue(request: Request):
                 "wrong_count": session.wrong_count,
                 "done": _done,
             }
+            if _trace:
+                _resp["trace_events"] = _trace
             # Legacy compatibility: strip JSON block from raw reply so old
             # clients (practice page, WeChat) don't render ```json cruft.
             _clean_reply = JSON_BLOCK_RE.sub("", reply).strip()
@@ -10404,7 +10514,8 @@ async def api_teach_continue(request: Request):
             _last_tutor_context[f"{learner_id}:{session.dt_session_id}"] = _last_tutor_context.pop(learner_id, "")
             if _saved_ctx:
                 _last_tutor_context[learner_id] = _saved_ctx
-        return {
+        _trace = result.get("trace_events", [])
+        _resp = {
             "ok": True,
             "reply": reply,
             "current": session.current_question,
@@ -10413,6 +10524,9 @@ async def api_teach_continue(request: Request):
             "wrong_count": session.wrong_count,
             "done": _done,
         }
+        if _trace:
+            _resp["trace_events"] = _trace
+        return _resp
     except Exception as exc:
         logger.error("[%s] /api/teach/continue failed: %s", trace_id, exc)
         if session.dt_session_id and _saved_ctx:
@@ -10422,7 +10536,268 @@ async def api_teach_continue(request: Request):
         return {"ok": False, "error": f"教学交互失败: {exc}"}
 
 
-@app.post("/api/teach/skip")
+# ══════════════════════════════════════════════════════════════════
+# SSE 流式教学端点 — Agentic Loop 各步骤实时推送
+# ══════════════════════════════════════════════════════════════════
+
+
+async def _stream_teach_events(
+    teach_session_id: str,
+    message: str,
+    learner_id: str,
+    trace_id: str,
+):
+    """生成器：逐事件产出 SSE 格式的字符串。
+
+    事件类型（与前端 StreamEvent 兼容）:
+      - thinking:   推理/判题过程
+      - tool_call:  工具调用
+      - tool_result: 工具返回
+      - content:    逐 token 教学回复
+      - done:       完成（含 evaluation + next_question）
+      - error:      错误
+    """
+    import json as _json
+    from tutor_platform.teach_question import get_question_by_index
+
+    def _emit(typ: str, **kw):
+        payload = {"type": typ, "source": "teach_loop", "stage": "teaching",
+                    "content": kw.pop("content", ""), "metadata": kw, "timestamp": time.time()}
+        return f"data: {_json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    store = get_teach_store()
+    session = store.get(teach_session_id)
+    if not session:
+        yield _emit("error", content="教学会话不存在")
+        return
+
+    yield _emit("thinking", content=f"正在分析学生答案...")
+
+    # ── 恢复上下文（同 api_teach_continue） ──
+    if session.ocr_text:
+        _last_tutor_context[learner_id] = session.ocr_text
+        _ocr_questions[learner_id] = _split_ocr_questions(session.ocr_text)
+        if session.current_question > 0:
+            _last_question_num[learner_id] = session.current_question
+
+    if not _extracted_exams.get(learner_id) and session.extracted_exam:
+        try:
+            _ee_data = session.extracted_exam
+            if isinstance(_ee_data, dict) and _ee_data.get("questions"):
+                _recovered = ExtractedExam(
+                    questions=[TeachQuestion(**{
+                        k: v for k, v in q.items() if k in (
+                            "index", "total", "question_type", "content", "answer_key",
+                            "explanation", "knowledge_point", "options",
+                        )
+                    }) for q in _ee_data["questions"]],
+                    total=_ee_data.get("total", len(_ee_data["questions"])),
+                    raw_ocr=session.ocr_text or "",
+                )
+                _extracted_exams[learner_id] = _recovered
+        except Exception:
+            pass
+
+    # ── 平台判题 ──
+    _qnum = _last_question_num.get(learner_id, session.current_question)
+    _all_keys = _answer_keys.get(learner_id, {})
+    _correct = _all_keys.get(_qnum, "")
+    _student = message.strip()
+
+    _is_correct = False
+    _score = 0.0
+    if _correct and _student:
+        from tutor_platform.rag.extractors import _match_answers, _match_answers_semantic
+        if _match_answers(_student, _correct):
+            _is_correct = True
+            _score = 1.0
+        elif _match_answers_semantic(_student, _correct):
+            _score = 0.5
+            _is_correct = False
+        yield _emit("thinking", content=f"判题结果: {'✅ 正确' if _is_correct else '⚠️ 部分正确' if _score == 0.5 else '❌ 错误'}")
+    else:
+        yield _emit("thinking", content="未找到标准答案，交由 AI 判断")
+
+    # ── 答错时自动 RAG ──
+    _rag_text = ""
+    if not _is_correct and _extracted_exams.get(learner_id):
+        try:
+            _q = get_question_by_index(_extracted_exams[learner_id], _qnum)
+            if _q and _q.knowledge_point:
+                yield _emit("tool_call", content=f"查询教材: {_q.knowledge_point}", tool="rag_lookup")
+                from tutor_platform.teach_tools import rag_lookup
+                _subject = "math"
+                if "物理" in _q.knowledge_point: _subject = "physics"
+                elif "化学" in _q.knowledge_point: _subject = "chemistry"
+                elif "英语" in _q.knowledge_point: _subject = "english"
+                _rag_text = await rag_lookup(kp_id=_q.knowledge_point, subject=_subject, query_text=_q.content)
+                if _rag_text:
+                    yield _emit("tool_result", content=f"教材查询完成 ({len(_rag_text)} chars)", tool="rag_lookup")
+        except Exception:
+            pass
+
+    # ── 构建 Prompt 并流式调用 DeepSeek ──
+    yield _emit("thinking", content="正在生成教学回复...")
+
+    api_key = os.getenv("DEEPSEEK_API_KEY", "")
+    if not api_key:
+        yield _emit("error", content="DEEPSEEK_API_KEY 未配置")
+        return
+
+    llm_url = "https://api.deepseek.com/v1/chat/completions"
+    llm_model = os.getenv("LLM_MODEL", "deepseek-v4-flash")
+
+    # 构建 system prompt
+    _phase = "EVALUATE_ANSWER"
+    _soul = _TEACHER_SOUL
+    _soul = _re_phase1.sub("", _soul)
+    _soul = _re_phase2.sub("", _soul)
+    _soul = _re_markers.sub("", _soul)
+
+    _kp_info = ""
+    if _extracted_exams.get(learner_id):
+        _q = get_question_by_index(_extracted_exams[learner_id], _qnum)
+        if _q:
+            _kp_info = f"\n知识点: {_q.knowledge_point}" if _q.knowledge_point else ""
+
+    system_prompt = (
+        _json_override + "\n" + _soul +
+        f"\n\n学生当前正在回答第{_qnum}题。{_kp_info}"
+        f"\n正确答案: {_correct}" if _correct else ""
+    )
+
+    # 用户 prompt
+    _eval_ctx = ""
+    if _extracted_exams.get(learner_id):
+        _q = get_question_by_index(_extracted_exams[learner_id], _qnum)
+        if _q:
+            _eval_ctx = f"第{_qnum}题：{_q.content}"
+            if _q.options:
+                for _k, _v in _q.options.items():
+                    _eval_ctx += f"\n{_k}. {_v}"
+
+    user_prompt = (
+        f"[PHASE:EVALUATE_ANSWER] [学生正在回答第{_qnum}题]\n"
+        f"当前题目：\n{_eval_ctx}\n\n"
+        f"学生的答案：{_student}"
+    )
+    if _rag_text:
+        user_prompt += f"\n\n### 教材参考\n{_rag_text[:1000]}"
+
+    # ── SSE: 流式调 DeepSeek ──
+    _full_content = ""
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            async with client.stream(
+                "POST", llm_url,
+                json={
+                    "model": llm_model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "temperature": 0.7,
+                    "max_tokens": 2048,
+                    "stream": True,
+                },
+                headers={"Authorization": f"Bearer {api_key}"},
+            ) as resp:
+                if resp.status_code != 200:
+                    yield _emit("error", content=f"LLM 调用失败: HTTP {resp.status_code}")
+                    return
+                async for _line in resp.aiter_lines():
+                    if not _line.startswith("data: "):
+                        continue
+                    _chunk_str = _line[6:].strip()
+                    if _chunk_str == "[DONE]":
+                        break
+                    try:
+                        _chunk = _json.loads(_chunk_str)
+                        _delta = _chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                        if _delta:
+                            _full_content += _delta
+                            yield _emit("content", content=_delta)
+                    except _json.JSONDecodeError:
+                        continue
+    except Exception as e:
+        yield _emit("error", content=f"LLM 流式调用失败: {e}")
+        return
+
+    # ── 完成事件 ──
+    # 从回复中解析 JSON 结构化数据
+    from tutor_platform.teach_question import parse_teach_response, parse_evaluation_from_json, parse_question_from_json
+    _parsed = parse_teach_response(_full_content)
+    _eval = parse_evaluation_from_json(_parsed) if _parsed else None
+    _next_q = parse_question_from_json(_parsed) if _parsed else None
+    _done = _parsed is not None and _parsed.get("next_question") is None
+
+    # 更新 session
+    if _eval:
+        if _eval.is_correct:
+            session.correct_count += 1
+        elif _eval.score < 1.0:
+            session.wrong_count += 1
+        if _next_q:
+            session.current_question = _next_q.index
+            session.first_question = _json.dumps(_next_q.to_dict(), ensure_ascii=False)
+        elif _done:
+            store.mark_completed(teach_session_id)
+        else:
+            store.save(session)
+
+    _resp_data = {
+        "ok": True,
+        "reply": _full_content,
+        "current": session.current_question,
+        "total_questions": session.total_questions,
+        "correct_count": session.correct_count,
+        "wrong_count": session.wrong_count,
+        "done": _done,
+    }
+    if _eval:
+        _resp_data["evaluation"] = _eval.to_dict()
+    if _next_q:
+        _resp_data["next_question"] = _next_q.to_dict()
+    yield _emit("done", content="教学回复完成", **_resp_data)
+
+
+@app.post("/api/teach/continue/stream")
+async def api_teach_continue_stream(request: Request):
+    """SSE 流式教学 — 逐事件推送判题/推理/回复全过程。
+
+    与 /api/teach/continue 功能相同，但通过 SSE 实时推送中间状态。
+    前端可复用 TraceSurface / StreamingStatus 等现有组件。
+    """
+    from fastapi.responses import StreamingResponse
+
+    trace_id = _extract_trace_id(request)
+    body = await request.json()
+
+    teach_session_id = str(body.get("teach_session_id", "")).strip()
+    message = str(body.get("message", "")).strip()
+    if not teach_session_id or not message:
+        return {"ok": False, "error": "缺少 teach_session_id 或 message"}
+
+    store = get_teach_store()
+    session = store.get(teach_session_id)
+    if not session:
+        return {"ok": False, "error": "教学会话不存在"}
+    if session.status == "completed":
+        return {"ok": False, "error": "教学已结束"}
+    if session.is_expired:
+        return {"ok": False, "error": "教学链接已过期"}
+
+    learner_id = session.learner_id
+
+    return StreamingResponse(
+        _stream_teach_events(teach_session_id, message, learner_id, trace_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 async def api_teach_skip(request: Request):
     """跳过当前题目，推进到下一题（不调用 LLM）。"""
     trace_id = _extract_trace_id(request)

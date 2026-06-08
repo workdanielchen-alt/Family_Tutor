@@ -29,12 +29,38 @@ class UnifiedLocalProvider:
         self._chroma_dir = os.getenv("CHROMA_PERSIST_DIR", "/data/chromadb")
         self._client = httpx.AsyncClient(timeout=120)
         self._ocr_model = os.getenv("OLLAMA_OCR_MODEL", "openbmb/minicpm-v4.6:q4_K_M")
+        self._ocr_url = os.getenv("OCR_URL", "").rstrip("/") or self._ollama_url
         self._embed_fn = None
+        # ChromaDB client 缓存 — ChromaDB 1.x Rust API 不允许重复创建 PersistentClient
+        self._chroma_client = None
         logger.info(
             "UnifiedLocalProvider: ollama=%s chroma=%s",
             self._ollama_url,
             self._chroma_dir,
         )
+
+    def _get_chroma_client(self):
+        """获取（并缓存）ChromaDB PersistentClient 单例。
+
+        ChromaDB 1.x 的 Rust 引擎将配置固化在 SQLite 中，重复调用
+        PersistentClient() 会导致 "different settings" 错误。
+        缓存后所有请求共享同一个客户端实例。
+
+        必须传入 Settings(anonymized_telemetry=False) 以匹配
+        provider_api.py 中其他 PersistentClient() 调用（如 api_kb_search），
+        否则第一个写入此设置的调用会锁死 SQLite，后续用默认设置
+        （anonymized_telemetry=True）的调用被拒绝。
+        """
+        if self._chroma_client is None:
+            import chromadb
+            from chromadb.config import Settings
+            os.makedirs(self._chroma_dir, exist_ok=True)
+            self._chroma_client = chromadb.PersistentClient(
+                path=self._chroma_dir,
+                settings=Settings(anonymized_telemetry=False),
+            )
+            logger.info("ChromaDB client created (path=%s)", self._chroma_dir)
+        return self._chroma_client
 
     def _get_embed_fn(self):
         if self._embed_fn is None:
@@ -56,10 +82,7 @@ class UnifiedLocalProvider:
         if not documents:
             return {"ok": True, "count": 0}
         try:
-            import chromadb
-
-            os.makedirs(self._chroma_dir, exist_ok=True)
-            client = chromadb.PersistentClient(path=self._chroma_dir)
+            client = self._get_chroma_client()
             collection = client.get_or_create_collection(name=kb_name)
 
             embed_fn = self._get_embed_fn()
@@ -89,10 +112,7 @@ class UnifiedLocalProvider:
     ) -> dict:
         """Ingest text content into the knowledge base."""
         try:
-            import chromadb
-
-            os.makedirs(self._chroma_dir, exist_ok=True)
-            client = chromadb.PersistentClient(path=self._chroma_dir)
+            client = self._get_chroma_client()
             collection = client.get_or_create_collection(name=kb_name)
 
             doc_id = f"{filename or 'text'}_{trace_id or id(content)}"
@@ -131,10 +151,7 @@ class UnifiedLocalProvider:
             return {"ok": True, "count": 0}
 
         try:
-            import chromadb
-
-            os.makedirs(self._chroma_dir, exist_ok=True)
-            client = chromadb.PersistentClient(path=self._chroma_dir)
+            client = self._get_chroma_client()
             _safe_fig_name = _sanitize_collection_name(f"{kb_name}_figures")
             fig_collection = client.get_or_create_collection(
                 name=_safe_fig_name,
@@ -188,10 +205,7 @@ class UnifiedLocalProvider:
     ) -> list[dict]:
         """Query the vector store for relevant documents."""
         try:
-            import chromadb
-
-            os.makedirs(self._chroma_dir, exist_ok=True)
-            client = chromadb.PersistentClient(path=self._chroma_dir)
+            client = self._get_chroma_client()
             collection = client.get_collection(name=collection_name)
 
             embed_fn = self._get_embed_fn()
@@ -263,15 +277,9 @@ class UnifiedLocalProvider:
             img_bytes = base64.b64decode(image_data)
             img_b64 = base64.b64encode(img_bytes).decode("ascii")
             prompt = (
-                "OCR text extraction for a math tutoring system.\n\n"
-                "Rules:\n"
-                "1. Only extract text visible in the image — do NOT solve or add content not present\n"
-                "2. Chinese text must NOT be wrapped in $ delimiters\n"
-                "3. Math formulas, equations, numbers SHOULD be wrapped in $ (inline LaTeX) — "
-                "this is formatting, not solving\n"
-                "4. Use align* for equation systems; don't add unnecessary parentheses\n"
-                "5. Use \\frac{}{} for fractions, \\times for multiplication\n"
-                "6. Never add explanations or text not present in the image"
+                "Read the text in this image. "
+                "Output only the visible text content. "
+                "Wrap math formulas in $, e.g. $x^2 + 2x + 1 = 0$."
             )
             payload = {
                 "model": self._ocr_model,
@@ -291,7 +299,7 @@ class UnifiedLocalProvider:
                 "stream": False,
             }
             resp = await self._client.post(
-                f"{self._ollama_url}/v1/chat/completions",
+                f"{self._ocr_url}/v1/chat/completions",
                 json=payload,
             )
             if resp.status_code != 200:

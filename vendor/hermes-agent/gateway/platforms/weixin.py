@@ -2231,7 +2231,7 @@ class WeixinAdapter(BasePlatformAdapter):
                                 if data.get("ok") and data.get("content"):
                                     # Skip passthrough (fallback placeholder) — it's a system
                                     # error message, not teachable content.
-                                    if data.get("route") == "passthrough":
+                                    if data.get("route") in ("passthrough", "ocr_fallback"):
                                         logger.info(
                                             "[%s] File extraction failed for %s: %s",
                                             self.name, _filename, data.get("content", "")[:100],
@@ -2296,35 +2296,53 @@ class WeixinAdapter(BasePlatformAdapter):
                     # Image with OCR: use extracted text as context
                     _teach_ctx = _teach_context
 
-                # ── 统一教学调用（初次出题和后续答题都用 /api/tutor/chat）──
-                # WeChat 端独立走旧流程，与 Web UI 的 teach session 分离
-                _tq = 0
-                _cur_s = self._teaching_sessions.get(effective_chat_id)
-                if isinstance(_cur_s, dict):
-                    _tq = _cur_s.get("total_questions", 0)
-                resp = await asyncio.wait_for(
-                    session.post(
-                        f"{platform_url}/api/tutor/chat",
-                        json={
-                            "message": _teach_msg,
-                            "learner_id": effective_chat_id,
-                            "context": _teach_ctx,
-                            "mode": "guide",
-                            "total_questions": _tq,
-                        },
-                    ),
-                    timeout=90,
-                )
-                if resp.status == 200:
-                    data = await resp.json()
-                    reply = data.get("content", "") if data.get("ok") else ""
+                # Teach API selection: new file /api/teach/start, follow-up /api/teach/continue
+                if media_paths and _teach_context:
+                    _api_resp = await asyncio.wait_for(
+                        session.post(
+                            f"{platform_url}/api/teach/start",
+                            json={
+                                "learner_id": effective_chat_id,
+                                "ocr_text": _teach_context,
+                                "mode": "guide",
+                            },
+                        ),
+                        timeout=90,
+                    )
+                    if _api_resp.status == 200:
+                        _data = await _api_resp.json()
+                        reply = _data.get("content", "") if _data.get("ok") else ""
+                        if reply:
+                            _tsid = _data.get("teach_session_id", "")
+                            _tq = _data.get("total_questions", 0)
+                            _cur = self._teaching_sessions.get(effective_chat_id)
+                            if isinstance(_cur, dict):
+                                _cur["teach_session_id"] = _tsid
+                                _cur["total_questions"] = _tq
+                                self._save_teaching_sessions()
                 else:
-                    reply = ""
+                    _cur_s = self._teaching_sessions.get(effective_chat_id)
+                    _sid = _cur_s.get("teach_session_id", "") if isinstance(_cur_s, dict) else ""
+                    if _sid and message.strip():
+                        _api_resp = await asyncio.wait_for(
+                            session.post(
+                                f"{platform_url}/api/teach/continue",
+                                json={
+                                    "teach_session_id": _sid,
+                                    "message": message.strip(),
+                                },
+                            ),
+                            timeout=90,
+                        )
+                        if _api_resp.status == 200:
+                            _data = await _api_resp.json()
+                            reply = _data.get("reply", "") if _data.get("ok") else ""
+                        else:
+                            reply = ""
+                    else:
+                        reply = ""
 
                 if reply:
-                    # Release the concurrency guard BEFORE iLink send
-                    # (5-10s).  Otherwise a fast student follow-up during
-                    # the send window gets blocked with no feedback.
                     self._running_teachings.discard(effective_chat_id)
                     try:
                         await asyncio.wait_for(
@@ -2336,19 +2354,10 @@ class WeixinAdapter(BasePlatformAdapter):
                             "[%s] WeChat send timed out for %s (rate limited?)",
                             self.name, effective_chat_id,
                         )
-                    # Update session (don't overwrite with timestamp)
                     _cur = self._teaching_sessions.get(effective_chat_id)
                     if isinstance(_cur, dict):
                         _cur["last_active"] = time.time()
-                        # Extract question number from reply
-                        _qn_m = re.search(r"第\s*(\d+)\s*[题/]", reply)
-                        if _qn_m:
-                            _cur["question_num"] = int(_qn_m.group(1))
-                        _tq_m = re.search(r"第\d+[题/]\s*(\d+)", reply)
-                        if _tq_m:
-                            _cur["total_questions"] = int(_tq_m.group(1))
                     else:
-                        # Fallback: create new session
                         self._teaching_sessions[effective_chat_id] = self._new_session("active")
                     self._save_teaching_sessions()
                     logger.info(
@@ -2366,17 +2375,12 @@ class WeixinAdapter(BasePlatformAdapter):
             if hasattr(self, "_teaching_start"):
                 self._teaching_start.pop(effective_chat_id, None)
 
-        # Teaching session is preserved so the next student message retries
-        # automatically.
-        try:
-            await self.send(
-                content=" 教学未响应，请重试",
-                chat_id=effective_chat_id,
-            )
-        except Exception:
-            pass
+        # Teaching flow failed — do NOT send system error to user's WeChat.
+        # Clear teaching session to break the retry loop.
+        self._teaching_sessions.pop(effective_chat_id, None)
+        self._save_teaching_sessions()
         logger.warning(
-            "[%s] Tutor flow failed for %s, session preserved for retry",
+            "[%s] Tutor flow failed quietly for %s, session cleared",
             self.name, effective_chat_id,
         )
 
@@ -2401,6 +2405,7 @@ class WeixinAdapter(BasePlatformAdapter):
             "total_questions": total_questions,
             "trace_id": trace_id,
             "answered_count": 0,
+            "teach_session_id": "",
         }
 
     def _load_teaching_sessions(self) -> None:

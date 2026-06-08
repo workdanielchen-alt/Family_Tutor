@@ -243,6 +243,14 @@ export interface TeachContinueResponse {
   done?: boolean;
   /** v2: knowledge-point summary (only when done=true) */
   summary?: KnowledgePointSummary;
+  /** v2: Agentic Loop trace events */
+  trace_events?: Array<{
+    tool: string;
+    args?: Record<string, unknown>;
+    result?: string;
+    label?: string;
+    content?: string;
+  }>;
   error?: string;
 }
 

@@ -372,3 +372,31 @@ index 3c8fa6574..061465cc5 100644
              # 其他所有消息（答案、问问题、请求讲解、闲聊）→ tutor_chat
              _msg = text.strip() if text.strip() else "继续"
              platform_url = os.getenv("PLATFORM_API_URL", "http://platform:8100")
+
+--- a/vendor/hermes-agent/gateway/platforms/weixin.py
++++ b/vendor/hermes-agent/gateway/platforms/weixin.py
+@@ -2365,19 +2365,14 @@
+             self._running_teachings.discard(effective_chat_id)
+             if hasattr(self, "_teaching_start"):
+                 self._teaching_start.pop(effective_chat_id, None)
+ 
+-        # Teaching session is preserved so the next student message retries
+-        # automatically.
+-        try:
+-            await self.send(
+-                content=" 教学未响应，请重试",
+-                chat_id=effective_chat_id,
+-            )
+-        except Exception:
+-            pass
++        # Teaching flow failed — do NOT send system error to user's WeChat.
++        # Clear teaching session to break the retry loop.
++        self._teaching_sessions.pop(effective_chat_id, None)
++        self._save_teaching_sessions()
+         logger.warning(
+-            "[%s] Tutor flow failed for %s, session preserved for retry",
++            "[%s] Tutor flow failed quietly for %s, session cleared",
+             self.name, effective_chat_id,
+         )
+ 
+     def _build_dummy_event(self, chat_id: str, text: str) -> "MessageEvent":

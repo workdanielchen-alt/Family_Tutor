@@ -8,12 +8,16 @@ import {
   useMemo,
 } from "react";
 import {
+  ArrowLeft,
+  Brain,
+  BookOpen,
   Check,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
-  RotateCcw,
   Loader2,
-  ArrowLeft,
+  MessageSquare,
+  RotateCcw,
   Sparkles,
 } from "lucide-react";
 import { useRouter } from "next/navigation";
@@ -35,6 +39,14 @@ import QuestionNavDots from "./QuestionNavDots";
 import QuestionHintPanel from "./QuestionHintPanel";
 import QuizCompletionPanel from "./QuizCompletionPanel";
 
+export interface TraceEvent {
+  tool: string;
+  args?: Record<string, unknown>;
+  result?: string;
+  label?: string;
+  content?: string;
+}
+
 interface GuidedQuizFlowProps {
   questions: TeachQuestion[];
   currentIndex: number;
@@ -53,6 +65,8 @@ interface GuidedQuizFlowProps {
   /** Paper total (e.g. 36), set once at start & never changes. */
   totalQuestions: number;
   summary?: KnowledgePointSummary;
+  /** Agentic Loop trace events per question index */
+  traceEvents?: Record<number, TraceEvent[]>;
 }
 
 const EMPTY_ANSWER: TeachAnswerState = {
@@ -283,6 +297,57 @@ function CelebrationOverlay({ onDone }: { onDone: () => void }) {
   );
 }
 
+// ── Trace Event Panel ──────────────────────────────────────────────────
+
+function TracePanel({ events }: { events: TraceEvent[] }) {
+  const [open, setOpen] = useState(false);
+  if (!events.length) return null;
+
+  const icons: Record<string, React.ReactNode> = {
+    THINK: <Brain size={13} className="text-purple-500" />,
+    TOOL: <BookOpen size={13} className="text-blue-500" />,
+    FINISH: <MessageSquare size={13} className="text-green-500" />,
+    PLAN: <Brain size={13} className="text-indigo-500" />,
+  };
+
+  return (
+    <div className="mt-2 border-t border-[var(--border)]/20 pt-2">
+      <button
+        type="button"
+        onClick={() => setOpen(!open)}
+        className="flex items-center gap-1 text-[11px] text-[var(--muted-foreground)] hover:text-[var(--foreground)] transition-colors"
+      >
+        {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+        <Brain size={12} />
+        教学推理过程 ({events.length} 步)
+      </button>
+      {open && (
+        <div className="mt-1.5 space-y-1 rounded-lg border border-[var(--border)]/30 bg-[var(--card)]/50 p-2">
+          {events.map((ev, i) => (
+            <div key={i} className="flex items-start gap-2 py-1">
+              <span className="mt-0.5 shrink-0">{icons[ev.label ?? ""] || <ChevronRight size={13} />}</span>
+              <div className="min-w-0 flex-1 text-[12px] leading-relaxed">
+                <span className="font-medium text-[var(--foreground)]">{ev.label || ev.tool}</span>
+                {ev.content && (
+                  <span className="ml-1 text-[var(--muted-foreground)]">{ev.content.slice(0, 200)}</span>
+                )}
+                {ev.result && ev.result.length > 20 && (
+                  <details className="mt-0.5">
+                    <summary className="cursor-pointer text-[11px] text-[var(--primary)]">查看工具结果</summary>
+                    <div className="mt-0.5 rounded bg-[var(--muted)]/30 p-1.5 text-[11px] text-[var(--muted-foreground)]">
+                      {ev.result.slice(0, 300)}
+                    </div>
+                  </details>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Main Component ─────────────────────────────────────────────────────
 
 export default function GuidedQuizFlow({
@@ -302,6 +367,7 @@ export default function GuidedQuizFlow({
   isComplete,
   totalQuestions: paperTotal,
   summary,
+  traceEvents,
 }: GuidedQuizFlowProps) {
   const router = useRouter();
   const [selectedOption, setSelectedOption] = useState<string | null>(null);
@@ -582,7 +648,12 @@ export default function GuidedQuizFlow({
               </span>
               {q.knowledge_point && (
                 <span className="rounded-md bg-purple-50 px-2 py-0.5 text-[10px] text-purple-600 dark:bg-purple-950/30 dark:text-purple-400">
-                  {q.knowledge_point.split("/").pop()}
+                  📚 {q.knowledge_point.split("/").pop()}
+                  {evalResult?.is_correct !== undefined && (
+                    <span className="ml-1">
+                      {evalResult.is_correct ? "✅" : "📖"}
+                    </span>
+                  )}
                 </span>
               )}
             </div>
@@ -782,6 +853,11 @@ export default function GuidedQuizFlow({
             )}
           </div>
 
+          {/* ── Agentic Loop trace events ── */}
+          {traceEvents?.[currentIndex] && traceEvents[currentIndex]!.length > 0 && (
+            <TracePanel events={traceEvents[currentIndex]!} />
+          )}
+
           {/* ── Correct answer & explanation (shown on wrong) ── */}
           {submitted && ans.isCorrect === false && (
             <div className="rounded-xl border border-green-200 bg-green-50 p-4 dark:border-green-800 dark:bg-green-950/20">
@@ -819,6 +895,24 @@ export default function GuidedQuizFlow({
                     />
                   </div>
                 </details>
+              )}
+            </div>
+          )}
+
+          {/* Mastery & KP badge in evaluation area */}
+          {evalResult?.knowledge_point && (
+            <div className="flex items-center gap-2 text-[11px] text-[var(--muted-foreground)]">
+              <span className="inline-flex items-center gap-1 rounded-full bg-purple-50 px-2 py-0.5 text-purple-600 dark:bg-purple-950/20 dark:text-purple-400">
+                📚 {evalResult.knowledge_point.split("/").pop()}
+              </span>
+              {evalResult.is_correct ? (
+                <span className="inline-flex items-center gap-1 rounded-full bg-green-50 px-2 py-0.5 text-green-600 dark:bg-green-950/20 dark:text-green-400">
+                  ✅ 已掌握
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2 py-0.5 text-amber-600 dark:bg-amber-950/20 dark:text-amber-400">
+                  📖 待巩固
+                </span>
               )}
             </div>
           )}

@@ -43,11 +43,18 @@ def preprocess_image_bytes(image_bytes: bytes) -> bytes:
         return image_bytes
 
     try:
-        # 1. Downscale: cap longest side at 1800px (MiniCPM-V 1.8M pixel limit)
+        # 1. Downscale: cap longest side AND total megapixels
+        #    For Qwen2-VL, each 28x28 patch generates ~1 token.
+        #    max_pixels ≈ 768 * 28 * 28 = 602K → Prefill快了60%+
         _MAX_DIM = 1800
+        _MAX_PIXELS = 602_112  # ~776x776 square equivalent
         h, w = img.shape[:2]
+        scale = 1.0
         if max(h, w) > _MAX_DIM:
-            scale = _MAX_DIM / max(h, w)
+            scale = min(scale, _MAX_DIM / max(h, w))
+        if h * w > _MAX_PIXELS:
+            scale = min(scale, (_MAX_PIXELS / (h * w)) ** 0.5)
+        if scale < 1.0:
             img = cv2.resize(img, (int(w * scale), int(h * scale)),
                              interpolation=cv2.INTER_AREA)
 

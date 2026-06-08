@@ -37,6 +37,14 @@ const GeogebraOpenCTA = dynamic(
   () => import("@/components/common/GeogebraOpenCTA"),
   { ssr: false, loading: () => null },
 );
+const FunctionPlotter = dynamic(
+  () => import("@/components/visualize/FunctionPlotter"),
+  { ssr: false, loading: () => null },
+);
+const NumberLine = dynamic(
+  () => import("@/components/visualize/NumberLine"),
+  { ssr: false, loading: () => null },
+);
 
 type PluginBundle = {
   remarkMath?: unknown;
@@ -491,6 +499,26 @@ export default function RichMarkdownRenderer({
               title={ggbTitle}
               className={gap}
             />
+          </div>
+        );
+      }
+
+      if (lang === "funcplot" && enableCode) {
+        // funcplot fence: first line is formula, second is x_range
+        const lines = raw.split("\n").map((l) => l.trim()).filter(Boolean);
+        const formula = lines[0] || "";
+        const xRange = lines[1] || "-5:5";
+        return (
+          <div {...lineProps}>
+            <FunctionPlotter formula={formula} xRange={xRange} />
+          </div>
+        );
+      }
+
+      if (lang === "numberline" && enableCode) {
+        return (
+          <div {...lineProps}>
+            <NumberLine spec={raw} />
           </div>
         );
       }

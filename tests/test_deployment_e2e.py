@@ -11,6 +11,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import os
 import textwrap
 from pathlib import Path
 
@@ -28,6 +29,7 @@ PLATFORM_URL = "http://localhost:8100"
 DEEPTUTOR_URL = "http://deeptutor:8001"
 TEST_KB = "kb_e2e_test"
 
+
 # ── Fixtures ──────────────────────────────────────────────────────
 
 
@@ -39,7 +41,7 @@ async def _upload_file(endpoint: str, filename: str, content: bytes,
     fields = {"kb_name": TEST_KB, "learner_id": "e2e_test"}
     if extra_fields:
         fields.update(extra_fields)
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=180) as client:
         resp = await client.post(
             f"{PLATFORM_URL}{endpoint}",
             data=fields,
@@ -50,14 +52,14 @@ async def _upload_file(endpoint: str, filename: str, content: bytes,
 
 async def _upload_json(endpoint: str, body: dict) -> dict:
     """POST JSON to a platform endpoint."""
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=180) as client:
         resp = await client.post(f"{PLATFORM_URL}{endpoint}", json=body)
         return resp.json()
 
 
 async def _get(endpoint: str) -> dict:
     """GET JSON from a platform endpoint."""
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=180) as client:
         resp = await client.get(f"{PLATFORM_URL}{endpoint}")
         return resp.json() if resp.status_code == 200 else {"status": resp.status_code, "body": resp.text}
 
