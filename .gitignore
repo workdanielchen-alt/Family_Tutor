@@ -341,3 +341,36 @@ tmp_inspect_weixin.py
 # Reasonix agent tool data
 .codegraph/
 .reasonix/
+
+nul
+
+# Temp debug scripts
+scripts/build_*.py
+scripts/check_*.py
+scripts/cleanup_*.py
+scripts/clear_*.sh
+scripts/conftest_*.py
+scripts/create_*.py
+scripts/debug_*.py
+scripts/deploy_*.sh
+scripts/deploy_*.py
+scripts/download_*.py
+scripts/find_*.py
+scripts/fix_*.py
+scripts/force_*.py
+scripts/git_*.ps1
+scripts/persist_*.py
+scripts/pre_*.py
+scripts/set_*.ps1
+scripts/setup_*.py
+scripts/test_a4_*.py
+scripts/test_caching.py
+scripts/test_ocr_*.py
+scripts/test_optimized.py
+scripts/test_platform_*.py
+scripts/test_prompt_variants.py
+scripts/test_proxy_*.py
+scripts/upgrade_*.py
+scripts/verify_*.py
+scripts/commit_msg.txt
+优化方案.md
