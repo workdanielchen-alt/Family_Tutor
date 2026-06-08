@@ -33,7 +33,7 @@ import type { SelectedQuestionEntry } from "@/components/chat/QuestionBankPicker
 import ChatComposer from "@/components/chat/home/ChatComposer";
 import { ChatMessageList } from "@/components/chat/home/ChatMessages";
 import { TeachingChatView, type TeachingMessage } from "@/components/chat/home/TeachingChatView";  // legacy fallback
-import GuidedQuizFlow from "@/components/quiz/GuidedQuizFlow";
+import GuidedQuizFlow, { type TraceEvent } from "@/components/quiz/GuidedQuizFlow";
 import type { TeachQuestion, TeachEvaluation, TeachAnswerState, KnowledgePointSummary } from "@/lib/quiz-types";
 import TaskCreateModal from "@/components/chat/home/TaskCreateModal";
 // Imported eagerly so the drawer shell is always mounted off-screen —
@@ -112,6 +112,7 @@ import {
 import { downloadChatMarkdown } from "@/lib/chat-export";
 import type { SpaceMemoryFile } from "@/lib/space-items";
 import { startTeach, continueTeach, updateTaskProgress } from "@/lib/platform-api";
+import { fetchTeachStream } from "@/lib/teach-stream";
 import {
   selectedBooksToPayload,
   type SelectedBookReference,
@@ -314,6 +315,7 @@ export default function ChatPage() {
 
   // ── 引导式教学：用 ref 避免渲染，纯作路由标记 ──
   const teachSessionIdRef = useRef<string | null>(null);
+  const teachStreamAbortRef = useRef<AbortController | null>(null);
   const teachLaunchingRef = useRef<string | null>(null);
   const [teachingMessages, setTeachingMessages] = useState<TeachingMessage[]>([]);
   const [isTeachingWaiting, setIsTeachingWaiting] = useState(false);
@@ -329,6 +331,7 @@ export default function ChatPage() {
   const [teachSummary, setTeachSummary] = useState<KnowledgePointSummary | undefined>();
   const [teachDone, setTeachDone] = useState(false);
   const [teachTotalQuestions, setTeachTotalQuestions] = useState(0);
+  const [teachTraceEvents, setTeachTraceEvents] = useState<Record<number, TraceEvent[]>>({});
 
   // ── Reset teach state (called on completion or return-home) ──
   const resetTeachState = useCallback(() => {
@@ -343,6 +346,7 @@ export default function ChatPage() {
     setTeachSummary(undefined);
     setTeachDone(false);
     setTeachTotalQuestions(0);
+    setTeachTraceEvents({});
   }, []);
 
   // ── Task create modal ──
@@ -1743,6 +1747,13 @@ export default function ChatPage() {
               if (data.summary) setTeachSummary(data.summary);
               setTeachDone(true);
             }
+            // Store trace events
+            if (data.trace_events?.length) {
+              setTeachTraceEvents((prev) => ({
+                ...prev,
+                [currentIdx]: data.trace_events!,
+              }));
+            }
           } else if (data.reply) {
             // ── v1 legacy fallback ──
             injectAssistantMessage(data.reply);
@@ -2137,6 +2148,7 @@ export default function ChatPage() {
                 isComplete={teachDone}
                 totalQuestions={teachTotalQuestions}
                 summary={teachSummary}
+                traceEvents={teachTraceEvents}
                 onAnswer={async (answer, selectedOption) => {
                   if (!teachSessionIdRef.current) return;
 
@@ -2236,6 +2248,13 @@ export default function ChatPage() {
                         if (data.summary) setTeachSummary(data.summary);
                         setTeachDone(true);
                       }
+                      // Store trace events
+                      if (data.trace_events?.length) {
+                        setTeachTraceEvents((prev) => ({
+                          ...prev,
+                          [currentIdx]: data.trace_events!,
+                        }));
+                      }
                     } else if (data.reply) {
                       // Legacy fallback
                       setTeachingMessages((prev) => [
@@ -2288,28 +2307,85 @@ export default function ChatPage() {
                 onSendAnswer={async (answer) => {
                   if (!teachSessionIdRef.current) return;
                   setIsTeachingWaiting(true);
+                  const sid = teachSessionIdRef.current;
+
+                  // Cancel any previous stream
+                  teachStreamAbortRef.current?.abort();
+                  const abortController = new AbortController();
+                  teachStreamAbortRef.current = abortController;
+
                   setTeachingMessages((prev) => [
                     ...prev,
                     { role: "user", content: answer },
                   ]);
-                  const data = await continueTeach({
-                    teach_session_id: teachSessionIdRef.current,
-                    message: answer,
-                  }).catch(() => null);
-                  if (data?.ok && data.reply) {
-                    setTeachingMessages((prev) => [
-                      ...prev,
-                      { role: "assistant", content: data.reply! },
-                    ]);
-                    if (data.current != null) {
+
+                  // Try SSE streaming first; fall back to REST
+                  let streamUsed = false;
+                  let accumulated = "";
+                  let finalResult: any = null;
+
+                  try {
+                    await fetchTeachStream(
+                      sid,
+                      answer,
+                      {
+                        onThinking: (text) => {
+                          // Show transient status via the "waiting" indicator
+                        },
+                        onContent: (chunk) => {
+                          if (!streamUsed) {
+                            streamUsed = true;
+                            // Insert placeholder message
+                            setTeachingMessages((prev) => [...prev, { role: "assistant", content: "" }]);
+                          }
+                          accumulated += chunk;
+                          // Update last message content progressively
+                          setTeachingMessages((prev) => {
+                            const next = [...prev];
+                            const last = next[next.length - 1];
+                            if (last?.role === "assistant") {
+                              next[next.length - 1] = { ...last, content: accumulated };
+                            }
+                            return next;
+                          });
+                        },
+                        onDone: (result) => {
+                          finalResult = result;
+                        },
+                        onError: (msg) => {
+                          console.warn("[teach-stream] error:", msg);
+                        },
+                      },
+                      abortController.signal,
+                    );
+                  } catch {
+                    // SSE failed — ignore, fall through to REST
+                  }
+
+                  if (streamUsed && finalResult) {
+                    // SSE path succeeded — finalize the message
+                    setTeachingMessages((prev) => {
+                      const next = [...prev];
+                      const last = next[next.length - 1];
+                      if (last?.role === "assistant") {
+                        next[next.length - 1] = {
+                          ...last,
+                          content: finalResult.reply || accumulated,
+                          evaluation: finalResult.evaluation,
+                          question: finalResult.next_question,
+                        };
+                      }
+                      return next;
+                    });
+                    if (finalResult.current != null) {
                       updateTaskProgress(teachSessionIdRef.current!, {
-                        current_question: data.current,
-                        correct_count: data.correct_count,
-                        wrong_count: data.wrong_count,
-                        done: data.done,
+                        current_question: finalResult.current,
+                        correct_count: finalResult.correct_count ?? 0,
+                        wrong_count: finalResult.wrong_count ?? 0,
+                        done: finalResult.done ?? false,
                       }).catch(() => {});
                     }
-                    if (data.done) {
+                    if (finalResult.done) {
                       const sid = teachSessionIdRef.current;
                       setTimeout(() => {
                         if (teachSessionIdRef.current === sid) {
@@ -2318,6 +2394,42 @@ export default function ChatPage() {
                         }
                       }, 4000);
                     }
+                  } else {
+                    // SSE failed — fall back to REST
+                    try {
+                      const data = await continueTeach({
+                        teach_session_id: sid,
+                        message: answer,
+                      }).catch(() => null);
+                      if (data?.ok && data.reply) {
+                        setTeachingMessages((prev) => [
+                          ...prev,
+                          {
+                            role: "assistant",
+                            content: data.reply!,
+                            evaluation: data.evaluation,
+                            question: data.next_question,
+                            trace_events: data.trace_events,
+                          },
+                        ]);
+                        if (data.current != null) {
+                          updateTaskProgress(sid, {
+                            current_question: data.current,
+                            correct_count: data.correct_count ?? 0,
+                            wrong_count: data.wrong_count ?? 0,
+                            done: data.done ?? false,
+                          }).catch(() => {});
+                        }
+                        if (data.done) {
+                          setTimeout(() => {
+                            if (teachSessionIdRef.current === sid) {
+                              teachSessionIdRef.current = null;
+                              setTeachingMessages([]);
+                            }
+                          }, 4000);
+                        }
+                      }
+                    } catch {}
                   }
                   setIsTeachingWaiting(false);
                 }}
