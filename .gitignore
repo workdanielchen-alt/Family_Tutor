@@ -374,3 +374,6 @@ scripts/upgrade_*.py
 scripts/verify_*.py
 scripts/commit_msg.txt
 优化方案.md
+
+scripts/fix_*.sh
+scripts/*.ps1
