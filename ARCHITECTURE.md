@@ -117,6 +117,7 @@
 │  │    teach_session.py     — 教学会话持久化 (试题/进度/掌握度)       │  │
 │  │    teach_question.py    — 试题数据模型                            │  │
 │  │    teach_tools.py       — 教学工具 (知识库搜索/图形匹配)          │  │
+│  │    storage.py           — 配置校验                                │  │
 │  │    ingest_status.py     — 入库状态追踪                            │  │
 │  │    report_scheduler.py  — 报告调度                                │  │
 │  │    report_push.py       — 报告格式化                              │  │
@@ -136,12 +137,12 @@
 │  │  rkllama   │ │ deeptutor│ │ qwen2vl  │ │  Domains     │            │
 │  │  (8080)    │ │(8001/3782│ │ (8081)   │ │  (共享模块)   │            │
 │  │ NPU LLM    │ │ 教学引擎  │ │ OCR 引擎  │ │              │            │
-│  │            │ │           │ │           │ │ tutoring/    │            │
+│  │ (可选,stub) │ │           │ │           │ │ tutoring/    │            │
 │  │ r1-distill │ │ AgentLoop │ │ Qwen2-VL  │ │  mastery.py  │            │
 │  │ deepseekocr│ │ TutorBot  │ │ 2B-Instruct│ │  掌握度追踪  │            │
 │  │ qwen3-vl   │ │ FastAPI   │ │ llama.cpp │ │  错题本      │            │
 │  │ bge-m3     │ │ Next.js   │ │           │ │  每日统计    │            │
-│  │ (可选NPU)  │ │ 多用户    │ │           │ │  Ebbinghaus  │            │
+│  │            │ │ 多用户    │ │           │ │  Ebbinghaus  │            │
 │  └────────────┘ └──────────┘ └──────────┘ └──────────────┘            │
 │                                                                         │
 │  图例:                                                                  │
@@ -160,7 +161,7 @@
 | 8004 | hermes_agent | WeChat 双网关 API — **首要用户入口** |
 | 3782 | deeptutor | 前端 Web UI — **深度学习补充入口** |
 | 8001 | deeptutor | 后端 API (FastAPI + WebSocket) — 内部 |
-| 8080 | rkllama | OpenAI 兼容 NPU LLM API — 内部 (可选) |
+| 8080 | rkllama | OpenAI 兼容 NPU LLM API — 内部 (可选, `RKLLM_STUB_MODE=true` 时跳过) |
 | 8081 | qwen2vl | Qwen2-VL llama.cpp OCR 服务 — 内部 |
 | 8100 | platform | Provider API + MCP Server — 内部 |
 | 8101 | platform | Device Manager — 内部 |
