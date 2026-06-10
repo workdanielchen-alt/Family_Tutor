@@ -1,6 +1,6 @@
-# DeepTutor 系统架构文档 (v7.0+)
+# DeepTutor 系统架构文档
 
-> 本文档基于当前代码实现（v7.0+），反映真实运行时的系统架构、组件关系和核心流程。
+> 本文档基于当前代码实现，反映真实运行时的系统架构、组件关系和核心流程。
 
 ---
 
@@ -10,7 +10,7 @@
 
 2. **Hermes Agent 为中枢，DT 为教学工具** — Hermes Agent (HA) 是系统中枢，接收所有微信消息并路由到对应后端（教学 → platform → DT，闲聊 → LLM）。DT 是 HA 调用的教学引擎，无独立用户入口。
 
-3. **微信为首要入口，DT Web UI 为补充** — 日常学习通过微信进行（拍作业照片、获取引导、即时反馈）。Web UI (3782) 支持深度学习（集中复习、强化练习）。
+3. **微信为首要入口，DT Web UI 为补充** — 日常学习通过微信进行（拍作业照片、获取引导、即时反馈）。Web UI (3782) 支持深度学习（集中复习、强化练习、知识库管理）。
 
 4. **微信会话必须保证实时性** — iLink 长轮询约 5 分钟过期，所有后台处理（OCR、LLM 推理、教学生成）必须在窗口内完成。
 
@@ -56,7 +56,7 @@
 │  │  ◆ 家长/孩子双机器人身份             │                              │
 │  │  ◆ 消息分类: OCR/教学/闲聊/设备      │                              │
 │  │  ◆ teaching_sessions 会话管理        │                              │
-│  │  ◆ 通知文件消费 (按 target 路由: 报告→家长, 练习→孩子)         │
+│  │  ◆ 通知文件消费 (按 target 路由)      │                              │
 │  └──────────────────┬───────────────────┘                              │
 │                     │ HTTP REST                                        │
 │                     ▼                                                  │
@@ -65,20 +65,24 @@
 │  │                                                                   │  │
 │  │  ┌──────────── Provider API (8100) ────────────┐                 │  │
 │  │  │  /api/tutor/chat     → DT WebSocket 教学    │                 │  │
+│  │  │  /api/teach/start    → 教学会话创建          │                 │  │
+│  │  │  /api/teach/continue → 教学会话续接          │                 │  │
 │  │  │  /api/process/file   → OCR + 自动教学        │                 │  │
 │  │  │  /api/ocr            → 纯 OCR               │                 │  │
 │  │  │  /api/vision         → 视觉理解             │                 │  │
 │  │  │  /api/solve          → 深度解题             │                 │  │
-│  │  │  /api/vision/solve   → 拍照解题             │                 │  │
-│  │  │  /api/ingest/*       → 知识库入库           │                 │  │
-│  │  │  /api/kb/search      → ChromaDB 搜索        │                 │  │
+│  │  │  /api/kb/search      → ChromaDB 文本搜索     │                 │  │
+│  │  │  /api/kb/figures/*   → 图形搜索/查看        │                 │  │
+│  │  │  /api/kb/ingest-file → 知识库文件入库        │                 │  │
+│  │  │  /api/kb/sync-from-dt→ DT→ChromaDB 同步    │                 │  │
+│  │  │  /api/ingest/*       → 多入口文件入库        │                 │  │
 │  │  │  /api/mastery/*      → 掌握度 CRUD          │                 │  │
 │  │  │  /api/practice/*     → 练习/试卷生成        │                 │  │
 │  │  │  /api/report/*       → 学习报告             │                 │  │
 │  │  │  /api/llm/acquire    → LLM 锁获取           │                 │  │
 │  │  │  /api/llm/release    → LLM 锁释放           │                 │  │
-│  │  │  /api/bot/qrcode     → 微信二维码           │                 │  │
-│  │  │  /api/bot/bind_child → 子网关绑定           │                 │  │
+│  │  │  /api/tasks/*        → 统一任务系统         │                 │  │
+│  │  │  /api/bot/*          → 微信二维码/绑定      │                 │  │
 │  │  │  /health             → 健康检查             │                 │  │
 │  │  └────────────────────────────────────────────┘                 │  │
 │  │                                                                   │  │
@@ -99,37 +103,51 @@
 │  │  │  /api/device/cleanup  → 清理临时文件         │                 │  │
 │  │  └────────────────────────────────────────────┘                 │  │
 │  │                                                                   │  │
+│  │  ┌──────── 内嵌 ChromaDB (PersistentClient) ───┐                 │  │
+│  │  │  kb_Zu4F3wD-a-s          — 文本向量 (bge-small-zh-v1.5)     │  │
+│  │  │  kb_Zu4F3wD-a-s_figures  — 图形描述向量                     │  │
+│  │  │  curriculum               — 课标知识点 (KP-level)            │  │
+│  │  │  ◆ 嵌入: BAAI/bge-small-zh-v1.5 (512D, ONNX)               │  │
+│  │  │  ◆ 磁盘: /data/chromadb                                     │  │
+│  │  └────────────────────────────────────────────────────────────┘ │  │
+│  │                                                                   │  │
 │  │  tutor_platform/ (Python 模块):                                   │  │
-│  │    unified_provider.py  — ChromaDB 单例封装                       │  │
+│  │    unified_provider.py  — ChromaDB 单例封装 (add/query/figures)   │  │
+│  │    teach_loop.py        — Agentic Loop 教学引擎 (THINK→TOOL→…)   │  │
+│  │    teach_session.py     — 教学会话持久化 (试题/进度/掌握度)       │  │
+│  │    teach_question.py    — 试题数据模型                            │  │
+│  │    teach_tools.py       — 教学工具 (知识库搜索/图形匹配)          │  │
 │  │    ingest_status.py     — 入库状态追踪                            │  │
 │  │    report_scheduler.py  — 报告调度                                │  │
 │  │    report_push.py       — 报告格式化                              │  │
-│  │    ha_client.py         — HA API 客户端 (MCP 工具调用封装)           │  │
+│  │    ha_client.py         — HA API 客户端                           │  │
 │  │    quiz_sync.py         — 答题记录同步                            │  │
-│  │    storage.py           — 配置校验                                │  │
-│  │    tools/embeddings.py  — Embedding 函数                          │  │
-│  │    tools/intent_rules.py — 设备意图分类                           │  │
+│  │    rag/extractors.py    — 文本/图形提取统一入口                   │  │
+│  │    rag/figure_types.py  — UnifiedFigure 数据模型                  │  │
+│  │    rag/rapid_ocr.py     — RapidOCR (PP-OCRv4) 封装                │  │
+│  │    rag/ocr_adapters.py  — Qwen2-VL OCR 适配器                     │  │
+│  │    tools/embeddings.py  — Embedding 函数 (bge-small-zh-v1.5)      │  │
 │  │    tools/preprocess.py  — 图片预处理                              │  │
 │  └──────────────────┬────────────────────────────────────────────────┘  │
 │                     │                                                  │
-│            ┌────────┼────────────────┐                                 │
-│            ▼        ▼                ▼                                 │
-│  ┌────────────────┐  ┌──────────────────┐  ┌────────────────────────┐  │
-│  │   rkllama      │  │    deeptutor      │  │  Domains (共享模块)    │  │
-│  │   (8080)       │  │   (8001/3782)     │  │                        │  │
-│  │  NPU LLM 服务   │  │  教学引擎         │  │  domains/tutoring/    │  │
-│  │                │  │  ◆ AgentLoop      │  │   mastery.py          │  │
-│  │  模型:         │  │  ◆ TutorBot WS    │  │   掌握度追踪          │  │
-│  │  r1-distill    │  │  ◆ FastAPI 后端   │  │   错题本              │  │
-│  │  deepseekocr   │  │  ◆ Next.js 前端   │  │   每日统计            │  │
-│  │  qwen3-vl      │  │  ◆ 多用户系统     │  │   Ebbinghaus 复习     │  │
-│  │  bge-m3         │  │  ◆ 知识库索引     │  │   家长报告            │  │
-│  └────────────────┘  └──────────────────┘  └────────────────────────┘  │
+│            ┌────────┼────────┬─────────────┐                           │
+│            ▼        ▼        ▼             ▼                           │
+│  ┌────────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────┐            │
+│  │  rkllama   │ │ deeptutor│ │ qwen2vl  │ │  Domains     │            │
+│  │  (8080)    │ │(8001/3782│ │ (8081)   │ │  (共享模块)   │            │
+│  │ NPU LLM    │ │ 教学引擎  │ │ OCR 引擎  │ │              │            │
+│  │            │ │           │ │           │ │ tutoring/    │            │
+│  │ r1-distill │ │ AgentLoop │ │ Qwen2-VL  │ │  mastery.py  │            │
+│  │ deepseekocr│ │ TutorBot  │ │ 2B-Instruct│ │  掌握度追踪  │            │
+│  │ qwen3-vl   │ │ FastAPI   │ │ llama.cpp │ │  错题本      │            │
+│  │ bge-m3     │ │ Next.js   │ │           │ │  每日统计    │            │
+│  │ (可选NPU)  │ │ 多用户    │ │           │ │  Ebbinghaus  │            │
+│  └────────────┘ └──────────┘ └──────────┘ └──────────────┘            │
 │                                                                         │
 │  图例:                                                                  │
 │    ───→ HTTP / REST API                                                │
 │    ───→ iLink 长轮询 (微信)                                            │
-│    ───→ 本地 NPU LLM 调用                                               │
+│    ───→ 本地 NPU/CPU 调用                                              │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -142,7 +160,8 @@
 | 8004 | hermes_agent | WeChat 双网关 API — **首要用户入口** |
 | 3782 | deeptutor | 前端 Web UI — **深度学习补充入口** |
 | 8001 | deeptutor | 后端 API (FastAPI + WebSocket) — 内部 |
-| 8080 | rkllama | OpenAI 兼容 NPU LLM API — 内部 |
+| 8080 | rkllama | OpenAI 兼容 NPU LLM API — 内部 (可选) |
+| 8081 | qwen2vl | Qwen2-VL llama.cpp OCR 服务 — 内部 |
 | 8100 | platform | Provider API + MCP Server — 内部 |
 | 8101 | platform | Device Manager — 内部 |
 
@@ -152,7 +171,7 @@
 
 ## 组件详情
 
-### 1. hermes_agent (deepseek_hermes_agent) — 系统中枢 / 首要入口
+### 1. hermes_agent (8004) — 系统中枢 / 首要入口
 
 微信 iLink 双网关。**中央协调器**：接收所有微信消息，分类后路由到对应后端。
 
@@ -178,14 +197,13 @@
 
 ---
 
-### 2. platform (deepseek_platform) — 编排层 / MCP / 设备管理
+### 2. platform (8100/8101) — 编排层 / MCP / KB / 教学引擎
 
-编排层和 **LLM 调度器** (原则 1)。接收 HA 请求，协调 OCR、LLM 调度、教学。
+编排层和 **LLM 调度器** (原则 1)。接收 HA 请求，协调 OCR、LLM 调度、教学、知识库。
 
 #### LLM 资源锁
 
 `_llm_lock` (`_TTLock`, TTL=120s) 序列化本地 NPU 访问，带超时自动恢复机制：
-当锁持有超过 TTL（如 HTTP release 请求丢失），`api_llm_acquire` 自动检测 stale 状态并 force_release，防止死锁：
 
 | 场景 | 超时 | 结果 |
 |------|------|------|
@@ -202,135 +220,193 @@ Phase B 合并：MCP Server 作为 ASGI middleware 内嵌在 platform 进程中�
 
 | 类别 | 工具 | 数量 |
 |------|------|------|
-| 知识库 | kb_search, kb_list, kb_upload_text, kb_upload_file | 4 |
-| 教学 | tutor_chat, deep_solve, vision_solve, process_file | 4 |
-| 练习 | generate_practice, generate_exam_paper, quiz_review | 3 |
-| 教材 | book_create, book_read, book_list | 3 |
-| 笔记 | notebook_create, notebook_read, notebook_add_cell, notebook_execute, notebook_list | 5 |
-| 学习记录 | record_quiz_result, question_notebook_list, session_read, get_memory, update_memory | 5 |
-| 报告 | generate_report, push_report | 2 |
-| 写作 | cowriter_edit, cowriter_documents, cowriter_history | 3 |
-| 设备管理 | device_status, storage_info, ssd_health, device_temp, device_alerts, device_cleanup, device_command, wifi_scan, wifi_configure, wifi_status, wifi_forget, get_bot_qrcode, bind_child_bot | 13 |
-| 场景 | set_scene, detect_scene, get_scene | 3 |
-| 熔断器 | get_circuit_status, reset_circuit | 2 |
+| 教学 | tutor_chat, teach_start, teach_continue, practice_generate | 4 |
+| 知识库 | kb_search, kb_ingest, kb_sync | 3 |
+| OCR/视觉 | process_file, ocr, vision, vision_solve | 4 |
+| 解题 | solve, deep_solve | 2 |
+| 掌握度 | mastery_overview, mastery_detail, wrong_answers | 3 |
+| 报告 | daily_report, weekly_report, monthly_report | 3 |
+| 设备管理 | device_status, wifi_connect, wifi_scan, cleanup | 4 |
+| 场景管理 | set_scene, detect_scene | 2 |
+| 其他 | circuit_reset, get_circuit_status, list_learners | 3+ |
 
-**关键特性：**
-
-- **熔断器 (Circuit Breaker)** — 每个下游服务 (deeptutor/platform/device_manager) 独立熔断器，3 次连续失败 → 开启 → 60s 恢复
-- **场景管理** — practice/reading/full 三种模式，限制可用工具集
-- **角色权限门禁** — 孩子无法调用设备管理工具 (`device_command`, `wifi_configure` 等)
-- **慢操作队列** — `asyncio.Semaphore(1)` 串行化 CPU/IO 密集型操作
-
-#### Device Manager (8101)
-
-平台容器内的子服务，通过 subprocess 管理 RK3576 硬件：
-
-| 端点 | 功能 |
-|------|------|
-| `/api/device/status` | CPU/内存/温度综合状态 |
-| `/api/device/storage` | 存储空间详情 (挂载点使用率) |
-| `/api/device/ssd` | SSD 健康度、写入量、磨损均衡 |
-| `/api/device/temp` | SoC 温度 (thermal zones) |
-| `/api/device/alerts` | 当前活跃告警 |
-| `/api/device/wifi/scan` | 扫描 WiFi 网络 |
-| `/api/device/wifi/connect` | 连接 WiFi |
-| `/api/device/wifi/status` | 当前连接状态 |
-| `/api/device/wifi/forget` | 忘记网络 |
-| `/api/device/cleanup` | 清理临时文件和旧日志 |
-
-#### 掌握度数据模型 (`domains/tutoring/mastery.py`)
-
-JSON 文件存储 (`/data/mastery/{learner_id}.json`)：
-
-| 字段 | 类型 | 用途 |
-|------|------|------|
-| `mastery` | `Dict[kp_id, {level, total, correct}]` | 每知识点掌握度 (0.0–1.0) |
-| `wrong_answers` | `List[Dict]` | 最近 50 条错题 |
-| `daily_stats` | `Dict[YYYY-MM-DD, {total, correct, wrong, weak_points}]` | 每日聚合统计 |
-| `answer_history` | `List[Dict]` | 最近 500 条答题记录 |
-| `review_schedule` | `Dict[kp_id, due_date]` | Ebbinghaus 复习计划 |
-| `review_history` | `List[Dict]` | 最近 200 条复习记录 |
-
-自动迁移：加载时检测并执行 `_migrate_v1()`。
-
-#### 答案评估标记
-
-DT 在回复末尾添加结构化标记：
-```
-[ANSWER:correct:kp_id]  或   [ANSWER:wrong:kp_id]
-```
-
-platform 的 `_parse_answer_evaluation()` 解析流程：
-1. 剥离标记，返回清洗后的内容
-2. 提取 `(result, kp_id)` 元组
-3. 调用 `update_mastery()` 更新掌握度、每日统计、答题历史
-4. 调用 `schedule_review()` 安排 Ebbinghaus 复习
-
-#### 自动练习触发
-
-当同一知识点连续答错 ≥2 次：
-1. 直接调用 DeepSeek API (绕过 HA 避免模型名剥离问题)
-2. 生成 3 道针对性练习题
-3. 通过 `pending_practice` 字段返回，HA 发送到微信
-
-#### 自动试卷生成 (双通道)
-
-当薄弱知识点 ≥3 个 (水平 < 0.6)，有两个推送通道：
-
-**通道 A — 教学前注入 (实时)：**
-1. `_auto_generate_exam()` 触发 (24h 冷却)
-2. 生成试卷 → 存入 `_pending_exam_context[learner_id]`
-3. 下次教学时注入 SOUL.md，随教学流引导完成
-
-**通道 B — 通知推送 (定时):**
-1. `_periodic_task_loop()` 每天 20:00 后检查所有学习者
-2. 薄弱点 ≥3 个 → 调用 `_generate_exam_paper()` 生成强化试卷
-3. `_write_notification(target="child")` 写入通知文件
-4. 子网关 `_consume_report_notifications` 消费后推送到孩子微信
-
-#### Ebbinghaus 间隔复习
-
-| 掌握度 | 间隔 | 分类 |
-|--------|------|------|
-| < 0.4 | 1 天 | 薄弱 |
-| 0.4–0.6 | 3 天 | 学习中 |
-| 0.6–0.8 | 7 天 | 进步中 |
-| 0.8–0.9 | 14 天 | 已掌握 |
-| ≥ 0.9 | 30 天 | 已巩固 |
-
-每次教学前，`_update_soul_with_context()` 查询到期复习并注入 SOUL.md。
-
-#### SOUL.md 系统
-
-两种教学人格，通过 HTTP `_patch_soul()` 更新 DT 的 SOUL.md：
-
-| 常量 | 模式 | 用途 |
-|------|------|------|
-| `_TEACHER_SOUL` | guide | 苏格拉底式引导教学 |
-| `_TEACHER_EXPLAIN_SOUL` | explain | 直接讲解模式 |
-
-**Persona 构建流程：**
-1. `_build_teaching_persona()` 组装教学上下文 → 返回完整 persona 文本
-2. `_update_soul_with_context()` 检查 `_last_persona[learner_id]` 缓存
-3. 未变更 → 跳过 HTTP 调用（避免每次教学交互的 PATCH 开销）
-4. 已变更 → `_patch_soul()` 执行 HTTP：
-   - `GET /api/v1/tutorbot/teacher` → 检测 SOUL.md 是否存在
-   - 200 → `PATCH /api/v1/tutorbot/teacher/soul` (增量更新)
-   - 404 → `POST /api/v1/tutorbot/teacher` → `PUT /api/v1/tutorbot/teacher/soul` (全量创建)
-5. 缓存更新：`_last_persona[learner_id] = _persona`
-6. 强制刷新：`force=True` 跳过缓存（用于 DT 教师 Bot 被删除后的重试路径）
-
-**SOUL.md 注入内容 (每次教学前)：**
-- 当前教学上下文 (OCR 提取的题目)
-- 相关知识库参考 (ChromaDB 查询，top 3，去重)
-- 到期复习知识点 (Ebbinghaus)
-- 薄弱知识点列表
-- 近期错题记录
-- 待注入的自动生成试卷
+**熔断器 (Circuit Breaker)：** 每个后端独立计数，3 次连续失败 → circuit open → 30s 冷却后 half-open → 成功则恢复。
 
 ---
 
-### 3. deeptutor (deepseek_deeptutor) — 教学工具 / 深度学习 UI
+#### 知识库 (KB) 子系统
+
+**双索引模型：**
+
+| 索引层 | 位置 | 引擎 | 嵌入模型 | 用途 |
+|--------|------|------|----------|------|
+| DT LlamaIndex | deeptutor 容器 `/app/data/knowledge_bases/` | llama_index | ollama bge-small-zh-v1.5 | 教材文档索引 (Web UI 管理) |
+| platform ChromaDB | platform 容器 `/data/chromadb/` | chromadb PersistentClient | BAAI/bge-small-zh-v1.5 (ONNX) | 文本 + 图形向量检索 (教学时查询) |
+
+DT LlamaIndex 由 Web UI 管理（创建/删除/上传），platform 不直接操作。platform 通过 `_sync_kb_from_dt` 定期从 DT 同步文本到 ChromaDB，形成可检索的副本。
+
+**ChromaDB 集合：**
+
+| 集合名 | 内容 | 维度 | 条数 |
+|--------|------|------|------|
+| `kb_Zu4F3wD-a-s` | 文本 chunks (教材 + 用户上传) | 512 | ~2,816 |
+| `kb_Zu4F3wD-a-s_figures` | 图形描述 | 512 | ~1,426 |
+| `curriculum` | 课标知识点 (KP-level) | 512 | ~298 |
+
+**命名规则：** 中文 KB 名 (`初中教材`) → `_chromadb_kb_name()` → `kb_Zu4F3wD-a-s` → 图形集合 `{sanitized_name}_figures` = `kb_Zu4F3wD-a-s_figures`。存储和查询使用相同的 `_sanitize_collection_name()` 确保一致性。
+
+**KB 生命周期：**
+
+```
+Web UI 创建 KB (Settings → Knowledge Bases)
+    → DT LlamaIndex 索引初始化
+    → 上传教材 PDF
+        → DT 文本提取 + 向量索引
+        → Web UI 回调 POST /api/kb/ingest-file → platform ChromaDB 同步
+            → 文本提取 (_handle_inbound_file)
+            → ChromaDB 入库 (_ingest_to_kb)
+            → 图形提取 (_store_figures_from_file)
+        → POST /api/kb/sync-from-dt → 一键全量同步 (Web UI 触发)
+```
+
+**入库入口与防护：**
+
+| 端点 | 入口 | 防护 |
+|------|------|------|
+| `/api/kb/ingest-file` | Web UI KB上传 | `_check_kb_exists_on_dt` + `_reject_suspicious_filename` |
+| `/api/kb/sync-from-dt` | Web UI 一键同步 | `_SIDECAR_SUFFIXES` 过滤侧车文件 |
+| `/api/ingest/proxy/{kb_name}` | Web 代理上传 | `_check_kb_exists_on_dt` + `_reject_suspicious_filename` |
+| `/api/ingest/file` | MCP 显式入库 | `_check_kb_exists_on_dt` (via `_maybe_ingest_result`) |
+| `/api/ingest/text` | API 文本入库 | `_check_kb_exists_on_dt` |
+| `/api/process/file` (非微信) | MCP 处理 | `kb_name` 非空 + `_check_kb_exists_on_dt` |
+| `/api/process/file` (微信) | 教学照片 | ❌ `suppress_auto_teach=1` 跳过入库 |
+
+**三道 KB 卫生防护：**
+
+| # | 位置 | 防护 |
+|---|------|------|
+| ① | `_sync_kb_from_dt` | 过滤 11 种侧车后缀 (`.pdf.txt`, `.docx.txt`, `.pptx.txt`, `.png.txt`, `.htm.txt`…) |
+| ② | `api_kb_ingest_file` / `api_ingest_proxy` | `_reject_suspicious_filename` 拒绝 `test*`/`tmp*`/`sample*`/`demo*` 前缀 + <50B 非文本文件 |
+| ③ | `_maybe_ingest_result` | `_check_kb_exists_on_dt` — KB 不存在直接拒绝 |
+
+#### 图形管道
+
+**提取与入库：**
+
+```
+教材 PDF 上传
+    → _store_figures_from_file(file_path, kb_name)
+        → extract_figures(pdf, llm_client=None)
+            → extract_pdf_embedded_images() (PyMuPDF, skip前15页, 最多60张)
+            → RapidOCR (PP-OCRv4) 提取图中文字
+        → 保存 PNG → <pdf_stem>.figures/<figure_id>.png
+        → 保存索引 → <pdf_stem>.figures/_index.json
+        → 描述富化: "教材：义务教育教科书·化学九年级上册；图中文字：{OCR}"
+        → add_figures() → ChromaDB kb_Zu4F3wD-a-s_figures
+```
+
+**富化策略：** RapidOCR 从教材嵌入图片提取的文字通常极短（"口"/"1"/"H"/"玻璃片"），嵌入向量与长考试文本的余弦距离天然在 1.0-1.4 之间。在描述前拼接 `"教材：{教科书名称}"` 后，距离降至 0.5-0.7，使 bge-small-zh-v1.5 能将其与学科查询关联。
+
+**教学时检索：**
+
+```
+_build_teaching_persona(context)
+    → provider.query(kb_name, [exam_text], n_results=10, include_figures=True)
+        → 文本查询 kb_Zu4F3wD-a-s (主查询)
+        → 图形查询 kb_Zu4F3wD-a-s_figures (并行，distance < 1.3)
+        → 图形合并到文本结果的 figures 字段
+    → Persona 注入: "### 相关知识库参考" + "### 相关图形" (Markdown img 标签)
+    → _last_teaching_figures 缓存 (供 _tutor_chat_core 后处理追加到回复末尾)
+```
+
+**距离阈值 `1.3`：** bge-small-zh-v1.5 的余弦空间里，长文本 (800 字考试题) 与短文本 (10 字教材名+OCR) 的相似度天然较低。`0.8` 阈值会过滤掉几乎所有图形，`1.3` 保留教材名匹配的同时拒绝完全无关的图形。
+
+#### 学科检测
+
+检测优先级链：
+
+```
+1. 调用者显式传入 subject 参数
+2. _subject_from_filename(filename)  ← 从教材文件名推断 (最可靠)
+      "义务教育教科书·化学九年级上册.pdf" → "chemistry"
+      "义务教育教科书·数学七年级下册.pdf" → "math"
+3. _detect_exam_subject(content)  ← 关键词匹配 (考试/OCR 文本兜底)
+```
+
+文件名推断避免了 chemistry 关键词（"反应"/"元素"/"分解"）错误匹配数学/物理文本的问题。此前 1,979 条教材 chunks 被错误标记为 `chemistry`。
+
+#### 教学引擎 (Agentic Loop)
+
+教学从简单的 DT WebSocket 代理演进为多阶段 Agentic Loop：
+
+```
+_tutor_chat_core(phase="FIRST_QUESTION" | "EVALUATE_ANSWER")
+    ├── _build_teaching_persona() → 构建含 KB/课标/错题/复习的完整 persona
+    ├── _update_soul_with_context() → PATCH SOUL.md (教学规则注入 DT)
+    └── run_teach_loop_from_args() (AGENTIC_LOOP_ENABLED=true)
+         ├── Phase: Plan → 分析学生状态, 选择教学策略
+         ├── Phase: Solve → 生成题目/评估答案 (THINK→TOOL→FINISH 标签协议)
+         │    ├── THINK 思考过程
+         │    ├── TOOL 工具调用 (kb_search, mastery_query 等)
+         │    └── FINISH 最终输出 (题目或评价)
+         └── Phase: Review → 知识点回顾, 掌握度更新
+```
+
+**关键模块：**
+- `teach_loop.py` — 多阶段教学管道引擎
+- `teach_session.py` — 教学会话持久化 (OCR 试题提取、进度追踪、答案历史)
+- `teach_question.py` — 试题数据模型 (内容/选项/答案/解析/提示)
+- `teach_tools.py` — 教学工具集 (知识库搜索、图形匹配、掌握度查询)
+
+#### 教学会话 (TeachSession) 系统
+
+将临时 OCR 题目转化为持久化教学会话：
+
+```
+/api/teach/start → TeachSession.create(learner_id, ocr_text, title, task_type)
+    → _pre_extract_exam() 从 OCR 文本预提取试题 → _extracted_exams 缓存
+    → _tutor_chat_core(phase="FIRST_QUESTION") → 教学开始
+
+/api/teach/continue → TeachSession.recover(session_id)
+    → 从中断处继续 (支持容器重启恢复)
+    → _tutor_chat_core(phase="EVALUATE_ANSWER") → 评估 + 下一题
+```
+
+#### 统一任务系统
+
+将教学、练习、试卷等异步任务统一管理：
+
+```
+POST /api/tasks/create
+    body: {type: "teaching"|"practice"|"exam", payload: {...}}
+    → 创建 TeachSession + 返回 task_id
+    → 后台异步执行 (不阻塞 HTTP 响应)
+
+GET /api/tasks/{session_id}/progress
+    → 查询任务进度 (当前题号/总题数/状态)
+
+POST /api/tasks/{session_id}/progress
+    → 更新任务进度 (答题后上报)
+```
+
+#### 课标索引
+
+知识点级别的课程大纲索引，用于教学时精准匹配章节：
+
+```
+_ensure_curriculum_indexed()
+    → domains/curriculum/ 加载各科课标 YAML
+    → 逐 KP 索引到 ChromaDB "curriculum" 集合
+    → metadata: {type: "kp", subject, grade, semester, chapter, kp_id, importance}
+
+_build_teaching_persona()
+    → provider.query("curriculum", [exam_text], n_results=3)
+    → 注入: "### 相关课程章节" + kp_id 标记
+```
+
+---
+
+### 3. deeptutor (8001/3782) — 教学工具 / 深度学习 UI
 
 HA 通过 platform 调用的专业教学引擎。Web UI (3782) 提供深度学习补充入口。
 
@@ -338,6 +414,7 @@ HA 通过 platform 调用的专业教学引擎。Web UI (3782) 提供深度学�
 - `TutorBot` — 苏格拉底式教学 Agent，每次交互读取 SOUL.md
 - WebSocket `/api/v1/tutorbot/teacher/ws` — 实时教学 (仅 platform 调用)
 - AgentLoop 按 catalog 配置直接调用 LLM
+- 知识库管理 UI (上传/搜索/图形浏览)
 
 **模型 Catalog：**
 
@@ -350,9 +427,25 @@ Platform 在每次 WS 教学前切换配置。DT 无锁意识——只按 catalo
 
 ---
 
-### 4. rkllama (deepseek_rkllama)
+### 4. qwen2vl (8081) — OCR 引擎
 
-NPU LLM 服务，运行在 RK3576 NPU 上。
+Qwen2-VL-2B-Instruct 通过 llama.cpp 运行，提供 OpenAI 兼容的 vision API。
+
+**部署方式：**
+- 模型: `Qwen2-VL-2B-Instruct-Q4_K_M.gguf` + `mmproj-Qwen2-VL-2B-Instruct-Q8_0.gguf`
+- 内存: 6GB 限制, `--mlock --no-mmap` 防 OOM
+- Flash Attention: 开启
+- 并发: `-np 1` (单请求处理)
+
+**调用路径：**
+- OCR: `_ocr_pixmap_bytes()` → RapidOCR 快速路径 → 公式检测 → Qwen2-VL 兜底
+- 视觉描述: `POST /v1/chat/completions` → `model: "qwen2-vl"` → image_url base64
+
+---
+
+### 5. rkllama (8080) — 可选 NPU LLM
+
+RK3576 NPU 本地推理服务。非生产必需（环境变量 `RKLLM_STUB_MODE=true` 时可跳过）。
 
 **可用模型：**
 
@@ -363,7 +456,7 @@ NPU LLM 服务，运行在 RK3576 NPU 上。
 | qwen3-vl-2b | 2B | vision | 1.1 GB | 惰性 |
 | bge-m3 | — | embedding | — | — |
 
-非文本模型惰性加载以节省内存。
+非文本模型惰性加载以节省内存。平台通过 `_llm_lock` 序列化访问，教学超时 5s → 自动降级 DeepSeek 云端。
 
 ---
 
@@ -390,102 +483,49 @@ NPU LLM 服务，运行在 RK3576 NPU 上。
                   │    │    │    ├─ 有内容 → 入库 + 缓存上下文
                   │    │    │    └─ 空/乱码 → route=ocr_fallback
                   │    │    │
-                  │    │    └─ auto_teach_effective (教育内容 + 非 ocr_fallback)
-                  │    │         └─ asyncio.create_task(_async_tutor_teach)
-                  │    │              │  ← 异步后台，不阻塞 OCR 返回
-                  │    │              │
-                  │    │              ├─ _llm_lock.acquire(timeout=5s)
-                  │    │              │    ├─ 成功 → 直连 rkllama API (绕 DT WS)
-                  │    │              │    └─ 超时 → DT WebSocket → DeepSeek 云端
-                  │    │              │
-                  │    │              └─ _write_tutor_notification()
-                  │    │                   ← tutor_reply JSON 写入通知目录
+                  │    │    └─ auto_teach_effective → 异步教学
                   │    │
-                  │    └─ 释放 LLM 锁 (POST /api/llm/release)
+                  │    └─ 释放 LLM 锁
                   │
                   ├─ 即时确认: "📝 收到题目，正在识别处理，请稍候..."
                   │
                   └─ 后台 30s 轮询: _consume_report_notifications()
-                       │
-                       └─ tutor_reply 文件
-                            ├─ self.send() → 微信用户
-                            ├─ 创建 teaching_session (后续文本走 DT)
-                            └─ 重命名 .consumed
+                       → tutor_reply 文件 → self.send() → 微信用户
 
 微信文字 ──→ hermes_agent
-                  │
-                  ├─ _is_teaching_session() = true
-                  │
                   └─ _auto_teaching_followup()
-                       │
-                       └─ POST /api/tutor/chat
-                            │
-                            └─ _tutor_chat_core()
+                       └─ POST /api/tutor/chat → _tutor_chat_core()
 ```
 
-### 学习增强数据流
+### SOUL.md 注入 (每次教学前)
 
 ```
-答案评估 (每次教学交互):
-  DT WebSocket 回复
-       │
-       ├─ _extract_question_text()
-       │    └─ 从回复中提取最新题目文本 → 存入 _last_question_text[learner_id]
-       │        (下一轮 update_mastery 时传入, 确保错题记录包含题目全文)
-       │
-       ├─ _parse_answer_evaluation()
-       │    └─ 剥离 [ANSWER:correct|wrong:kp_id] 标记
-       │
-       ├─ update_mastery(kp_id, correct, question=_last_question_text[...])
-       │    ├─ 更新 KPI 掌握度
-       │    ├─ 记录答题历史
-       │    ├─ 更新每日统计
-       │    ├─ 记录错题 (如适用)
-       │    └─ schedule_review() → Ebbinghaus 间隔
-       │
-       ├─ _trigger_practice_if_needed()
-       │    └─ 同 KPI 连续答错 ≥2 → 生成 3 道巩固题
-       │
-       └─ _auto_generate_exam() (后台)
-            └─ 薄弱点 ≥3 & 24h 冷却 → 生成强化试卷
-                 ├─ 存入 _pending_exam_context (教学前注入)
-                 └─ 每日 20:00 后 _periodic_task_loop 推送通知 (见下文)
+_update_soul_with_context()
+    ├─ _build_teaching_persona() → 组装完整 persona:
+    │    ├─ 教师基础人格 (_TEACHER_SOUL / _TEACHER_EXPLAIN_SOUL)
+    │    ├─ 年龄适配指令 (小学低/高年级, 初中)
+    │    ├─ 当前教学内容 (OCR 提取的题目)
+    │    ├─ 相关知识库参考 (ChromaDB 查询 top 3, subject 过滤)
+    │    ├─ 相关图形 (ChromaDB figures 查询, Markdown img 标签)
+    │    ├─ 课标章节 (curriculum 集合查询)
+    │    ├─ 到期复习 (Ebbinghaus)
+    │    ├─ 薄弱知识点 + 近期错题
+    │    └─ 自动生成的试卷 (pending exam context)
+    ├─ _last_persona 缓存比对 → 未变更跳过 PATCH
+    └─ _patch_soul(): GET → PATCH/POST+PUT → DT SOUL.md
+```
 
-SOUL.md 注入 (每次教学前):
-  _update_soul_with_context()
-       │
-       ├─ _build_teaching_persona() → 组装完整 persona 文本
-       ├─ _last_persona[learner_id] 缓存比对
-       │    └─ 未变更 → 跳过 HTTP, 直接返回
-       │
-       ├─ _patch_soul(): GET → PATCH/POST+PUT → SOUL.md
-       │    ├─ ChromaDB 查询相关知识 → 注入
-       │    ├─ get_due_reviews() → Ebbinghaus 到期复习
-       │    ├─ weak_points() → 薄弱知识点摘要
-       │    ├─ get_wrong_answers() → 近期错题
-       │    └─ _pending_exam_context → 自动生成的试卷
-       │
-       └─ _last_persona[learner_id] = _persona (更新缓存)
+### 定期任务 (platform 后台 60s tick)
 
-定期任务 (platform 后台 60s tick):
-  _periodic_task_loop()
-       │
-       ├─ sync_quiz_to_mastery() (每 300s)
-       │    └─ 错题同步 → 掌握度更新
-       │
-       ├─ report_scheduler.py
-       │    ├─ enumerate_learners()
-       │    ├─ push_daily_reports() (每天 20:00 后, 北京时区)
-       │    ├─ push_weekly_reports() (周一 20:00 后)
-       │    ├─ push_monthly_reports() (每月 1 日 20:00 后)
-       │    └─ _write_notification(target="parent") → /data/hermes/notifications/
-       │
-       ├─ 强化试卷自动推送 (每天 20:00 后, 薄弱点 ≥3)
-       │    └─ _write_notification(target="child") → /data/hermes/notifications/
-       │
-       └─ weixin.py _consume_report_notifications()
-            ├─ 按 target 字段路由 (parent → 父网关, child → 子网关)
-            └─ self.send() → 微信用户
+```
+_periodic_task_loop()
+    ├─ sync_quiz_to_mastery() (每 300s)
+    ├─ report_scheduler.py
+    │    ├─ push_daily_reports() (每天 20:00)
+    │    ├─ push_weekly_reports() (周一 20:00)
+    │    └─ push_monthly_reports() (每月 1 日 20:00)
+    ├─ 强化试卷自动推送 (薄弱点 ≥3, 24h 冷却)
+    └─ HA _consume_report_notifications() 消费通知文件
 ```
 
 ---
@@ -495,51 +535,42 @@ SOUL.md 注入 (每次教学前):
 ```
 上传文件
     │
-    ├─ _handle_inbound_file() → extract_text() (extractors.py 统一入口)
-    │    │
-    │    ├─ 图片 (.jpg/.png/.heic/…)
-    │    │    └─ extract_image_text(): OpenCV 预处理 → VL 模型 OCR → 水平分割并行
-    │    │    └─ _describe_diagram(): VL 模型 图形描述 (vision)
-    │    │
-    │    ├─ PDF
-    │    │    └─ extract_pdf_text(ocr_enabled=True):
-    │    │         ├─ pymupdf4llm.to_markdown() 结构化 Markdown
-    │    │         ├─ 扫描件 → ocr_function=MinicpmOCRFunc (Qwen2-VL / rkllama, 无 Tesseract)
-    │    │         └─ pymupdf4llm 不可用 → _pdf_manual_ocr_fallback()
-    │    │
-    │    ├─ Office (.docx/.xlsx/.pptx)
-    │    │    ├─ python-docx / openpyxl / python-pptx 快速提取
-    │    │    ├─ 失败 → markitdown fallback
-    │    │    └─ _ocr_office_images() 内嵌图片 OCR
-    │    │
-    │    ├─ 旧版 Office (.doc/.ppt/.xls/.odt/.rtf) + EPUB
-    │    │    └─ markitdown 提取 (不依赖 antiword)
-    │    │
-    │    ├─ HTML (.html/.htm)
-    │    │    └─ extract_text_file() 多编码读取 + _sanitize_html() XSS 消毒
-    │    │
-    │    ├─ 音频 (.mp3/.wav) / ZIP
-    │    │    └─ markitdown[all] 提取 (音频转录 / 递归遍历)
-    │    │
-    │    └─ 文本 (.txt/.md/…)
-    │         └─ extract_text_file() 多编码链 (utf-8→gbk→gb2312→latin-1→cp1252)
+    ├─ 教学上传 (微信/Web Chat)
+    │    ├─ suppress_auto_teach=1 / kb_name="" → 不入库, 仅 OCR + 教学
+    │    └─ OCR 文本缓存到内存 → 直接进入教学流
     │
-    ├─ vector_store 异步双写入
-    │    ├─ 平台 ChromaDB (PersistentClient, 内嵌)
-    │    │    └─ semantic_chunk() 语义分块 (≤800 字符, 标题感知 + overlap), 带 metadata 入库
-    │    └─ DT LlamaIndex (HTTP POST /api/v1/knowledge)
-    │         └─ 扫描 PDF 路径双写: OCR 文本 → .txt → upload API
+    ├─ 知识库入库 (Web UI / MCP)
+    │    ├─ 闸门: _check_kb_exists_on_dt + _reject_suspicious_filename
+    │    │
+    │    ├─ _handle_inbound_file() → extract_text() (extractors.py 统一入口)
+    │    │    ├─ 图片: OpenCV预处理 → VL模型OCR → 水平分割并行
+    │    │    ├─ PDF: pymupdf4llm.to_markdown() → 扫描件Qwen2-VL OCR
+    │    │    ├─ Office: python-docx/openpyxl/pptx → markitdown fallback
+    │    │    └─ 文本: 多编码链 (utf-8→gbk→gb2312→latin-1)
+    │    │
+    │    ├─ 文本入库 (_ingest_to_kb)
+    │    │    ├─ 学科检测: _subject_from_filename(filename) → _detect_exam_subject(content)
+    │    │    ├─ 教学摘要生成 (非理科: LLM 摘要; 理科: 保留原始公式)
+    │    │    ├─ ChromaDB: _split_content_for_ingest (800字 chunks) → add_documents
+    │    │    └─ DT LlamaIndex: OCR 路径 → .txt 上传回 DT (双写)
+    │    │
+    │    ├─ 图形入库 (_store_figures_from_file)
+    │    │    ├─ extract_figures(pdf, llm_client=None) → RapidOCR 提取嵌入图片
+    │    │    ├─ 保存 PNGs → <pdf_stem>.figures/<figure_id>.png
+    │    │    ├─ 描述富化: "教材：{教科书名}" + "；图中文字：{OCR}"
+    │    │    ├─ 保存 _index.json
+    │    │    └─ add_figures() → ChromaDB kb_{hash}_figures
+    │    │
+    │    └─ UnifiedDocumentPipeline (fire-and-forget 后台)
+    │         ├─ classify_file() → 11 DocTypes
+    │         ├─ Phase 1-4 考试结构化 (.exam.json sidecar)
+    │         └─ _enrich_with_sidecar_content() 消费更完整的 sidecar
     │
-    ├─ UnifiedDocumentPipeline (fire-and-forget 后台)
-    │    ├─ classify_file() → 11 DocTypes
-    │    ├─ Phase 1-4 考试结构化 (.exam.json sidecar)
-    │    └─ _enrich_with_sidecar_content() 消费更完整的 sidecar
-    │
-    ├─ 缓存教学上下文到内存 + 持久化到磁盘
-    │
-    ├─ 写入通知文件 → HA 消费通知微信
-    │
-    └─ auto_teach=true → 自动触发 _tutor_chat_core()
+    └─ DT 同步 (_sync_kb_from_dt)
+         ├─ 列出 DT 知识库文件
+         ├─ 过滤 _SIDECAR_SUFFIXES (跳过 .pdf.txt 等侧车)
+         ├─ OCR checkpoint 去重 (embedded=true 跳过)
+         └─ 逐文件下载 → OCR → ChromaDB 入库
 ```
 
 ---
@@ -571,11 +602,19 @@ SOUL.md 注入 (每次教学前):
 ./data/user                  /app/data/user                  Model catalog, 用户设置
 ./data/memory                /app/data/memory                DT 记忆持久化
 ./data/knowledge_bases       /app/data/knowledge_bases       RAG 知识库
+    └── 初中教材/raw/                                         教材 PDF 源文件
+         ├─ *.pdf                                             18 本教材 (化学/数学/物理/语文)
+         ├─ *.figures/                                        图形 PNG 目录
+         │   └─ _index.json                                  图形元数据 (figure_id/描述/类型)
+         └─ version-1/                                       LlamaIndex 向量索引
 ./data/mastery               /data/mastery                   学习者掌握度数据
-./data/chromadb              /data/chromadb                  向量存储
+./data/chromadb              /data/chromadb                  向量存储 (PersistentClient)
+    └── ocr_checkpoints/                                      OCR 进度 checkpoint (防重启丢失)
 ./data/ingest_status         /data/ingest_status             文件入库追踪
 ./data/uploads               /data/uploads                   用户上传
 ./data/sources               /data/sources                   处理后归档
+./data/quiz_sessions         /data/quiz_sessions             答题会话持久化
+./data/teach_sessions        /data/teach_sessions            教学会话持久化
 ./data/hermes/notifications  /data/hermes/notifications      报告推送通知文件
 ./data_dev/hermes            /opt/data                       父网关数据
 ./data_dev/hermes_child      /opt/data/child                 子网关数据
@@ -583,16 +622,15 @@ SOUL.md 注入 (每次教学前):
 代码挂载 (只读):
 ./docker/platform/provider_api.py   → /app/provider_api.py
 ./docker/platform/mcp_server.py     → /app/mcp_server.py
-./vendor/hermes-agent/run_agent.py  → /opt/hermes/run_agent.py
-./vendor/hermes-agent/.../weixin.py → /opt/hermes/gateway/platforms/weixin.py
-./docker/platform/patches/gateway_run.py → /opt/hermes/gateway/run.py
+./tutor_platform/                   → /tutor_platform/
+./vendor/hermes-agent/*             → /opt/hermes/
 ```
 
 ---
 
 ## 关键设计决策
 
-1. **微信优先，Web 补充** — 日常学习通过微信完成，Web UI 仅用于深度学习
+1. **微信优先，Web 补充** — 日常学习通过微信完成，Web UI 仅用于深度学习和知识库管理
 
 2. **HA 为系统中枢** — HA 拥有会话生命周期和路由逻辑，DT 是纯教学工具
 
@@ -634,4 +672,14 @@ SOUL.md 注入 (每次教学前):
 
 21. **通知目标路由** — `_write_notification(target="parent"/"child")` 配合 HA 双网关，报告推家长，强化试卷推孩子，文件桥解耦两容器
 
-22. **后台 Periodic Loop** — `_periodic_task_loop()` 60s tick 模拟定时任务，文件 marker (`quiz_sync_last.txt`, `report_daily_last.txt` 等) 追踪执行状态，无外部 cron 依赖
+22. **后台 Periodic Loop** — `_periodic_task_loop()` 60s tick 模拟定时任务，文件 marker 追踪执行状态，无外部 cron 依赖
+
+23. **图形与文本双索引** — 图形存入独立 `{kb}_figures` ChromaDB 集合，与文本分开查询。图形描述通过教材名富化（`"教材：{名称}"`）使短 OCR 文本可被 bge-small-zh-v1.5 语义匹配。宽松距离阈值 (1.3) 适配短描述 vs 长考试文本的余弦分布
+
+24. **知识库只进不出** — 三道防护确保 KB 不被污染：API 入口拒收测试文件、同步时过滤侧车循环 (_SIDECAR_SUFFIXES)、写入前校验 KB 存在
+
+25. **文件名优先学科检测** — 教材文件名推断学科远比 OCR 文本关键词可靠。chemistry 关键词（"反应"/"元素"/"分解"）会错误匹配数学/物理文本。优先链：显式参数 → 文件名 → 关键词
+
+26. **Agentic Loop 多阶段教学** — Plan→Solve→Review 三阶段管道，THINK→TOOL→FINISH 标签协议。`teach_loop.py` 独立于 DT AgentLoop，在 platform 侧控制完整教学流程
+
+27. **教学会话持久化** — TeachSession 将 OCR 试题提取、答题进度、掌握度变化持久化到磁盘 (`/data/teach_sessions/`)。容器重启后通过 `/api/teach/continue` 恢复，支持从中断处继续教学
