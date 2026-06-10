@@ -35,7 +35,7 @@ async def run_exam_pipeline(
 
     Phases:
       1. Layout analysis (PaperLayoutEngine, no LLM)
-      2. Block-level OCR (BlockOCREngine → MiniCPM)
+      2. Block-level OCR (BlockOCREngine → VL model)
       3. Semantic structuring (ExamStructurer, no LLM)
       4. Serialize to dict
 

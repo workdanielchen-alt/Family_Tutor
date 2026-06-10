@@ -52,7 +52,7 @@ class LayoutBlock:
     figure_hint: FigureHint = FigureHint.UNKNOWN  # only for image blocks
     # Shared
     needs_ocr: bool = False              # True when raw_text is empty/sparse
-    needs_description: bool = False      # True when image block needs MiniCPM
+    needs_description: bool = False      # True when image block needs VL model description
 
 
 @dataclass

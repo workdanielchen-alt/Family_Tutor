@@ -34,37 +34,37 @@ def _make_jpeg(height: int, width: int, value: int = 255) -> bytes:
 
 class TestDownscale:
     def test_large_image_scaled(self):
-        """2000x1200 → max dim 1800 → unchanged (already ≤1800), but deskew may swap dims."""
+        """2000x1200 → max dim 600 → 600x360."""
         raw = _make_jpeg(2000, 1200)
         result = preprocess_image_bytes(raw)
         decoded = cv2.imdecode(np.frombuffer(result, np.uint8), cv2.IMREAD_GRAYSCALE)
         h, w = decoded.shape
-        # MiniCPM-V 1.8M pixels → _MAX_DIM = 1800; 2000 > 1800 so scale down
-        assert max(h, w) <= 1800, f"{h}x{w} exceeds 1800"
+        # Qwen2-VL 600px max — 2000 > 600 so scale down
+        assert max(h, w) <= 600, f"{h}x{w} exceeds 600"
 
-    def test_small_image_unchanged(self):
-        """600x800 under 1800 — not resized."""
+    def test_medium_image_scaled(self):
+        """800x600 → 800 > 600 → 600x450."""
         raw = _make_jpeg(800, 600)
         result = preprocess_image_bytes(raw)
         decoded = cv2.imdecode(np.frombuffer(result, np.uint8), cv2.IMREAD_GRAYSCALE)
         h, w = decoded.shape
-        assert h == 800 and w == 600, f"unchanged expected, got {h}x{w}"
+        assert max(h, w) <= 600, f"{h}x{w} exceeds 600"
 
     def test_square_large(self):
-        """2000x2000 → 1800x1800."""
+        """2000x2000 → 600x600."""
         raw = _make_jpeg(2000, 2000)
         result = preprocess_image_bytes(raw)
         decoded = cv2.imdecode(np.frombuffer(result, np.uint8), cv2.IMREAD_GRAYSCALE)
         h, w = decoded.shape
-        assert max(h, w) <= 1800
+        assert max(h, w) <= 600
 
     def test_boundary_below_max(self):
-        """1200x900 under 1800 — no resize."""
+        """1200x900 → 1200 > 600 → scaled down."""
         raw = _make_jpeg(1200, 900)
         result = preprocess_image_bytes(raw)
         decoded = cv2.imdecode(np.frombuffer(result, np.uint8), cv2.IMREAD_GRAYSCALE)
         h, w = decoded.shape
-        assert max(h, w) <= 1800
+        assert max(h, w) <= 600
 
     def test_invalid_bytes(self):
         """Non-decodable → returned raw."""

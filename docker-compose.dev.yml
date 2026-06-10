@@ -5,8 +5,8 @@
 #   python scripts/docker_compose.py -f docker-compose.yml -f docker-compose.dev.yml up -d
 #   python scripts/docker_compose.py -f docker-compose.yml -f docker-compose.dev.yml build
 #
-# For LLM services (ollama / rkllama) and WeChat gateway (hermes_agent):
-#   docker compose -f docker-compose.dev.yml up -d ollama hermes_agent
+# For LLM services (rkllama) and WeChat gateway (hermes_agent):
+#   docker compose -f docker-compose.dev.yml up -d hermes_agent
 # ============================================
 
 services:

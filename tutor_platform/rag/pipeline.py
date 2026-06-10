@@ -5,7 +5,7 @@ before reaching DeepTutor's chunking + embedding + indexing stages.
 
 Current stages:
   1. OCR scanned PDFs — detect pages without a text layer and transcribe
-     them via the configured multimodal LLM (e.g. MiniCPM-v4.6),
+     them via the configured multimodal LLM (e.g. Qwen2-VL),
      writing ``.ocr.md`` sidecars that DeepTutor indexes as normal text.
 
 The pipeline returns a (possibly augmented) list of file paths for

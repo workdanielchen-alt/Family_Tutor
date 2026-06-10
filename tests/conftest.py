@@ -16,6 +16,6 @@ def mock_llm_client() -> MagicMock:
     client = MagicMock()
     client.supports_multimodal_images.return_value = True
     client.config.binding = "ollama"
-    client.config.model = "minicpm-v4.6"
+    client.config.model = "qwen2-vl"
     client.complete = AsyncMock(return_value="Mocked OCR text content.")
     return client

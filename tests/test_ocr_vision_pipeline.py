@@ -260,9 +260,8 @@ class TestOcrDispatchFlow:
 
     @pytest.mark.asyncio
     @patch("provider_api._ocr_image_bytes_rkllama")
-    @patch("provider_api._ocr_image_bytes_ollama")
     async def test_provider_rkllama(
-        self, mock_ollama: AsyncMock, mock_rkllama: AsyncMock, monkeypatch
+        self, mock_rkllama: AsyncMock, monkeypatch
     ):
         """RKLLAMA provider → calls _ocr_image_bytes_rkllama."""
         from provider_api import _ocr_image_bytes
@@ -272,23 +271,20 @@ class TestOcrDispatchFlow:
         result = await _ocr_image_bytes(b"fake_image_bytes", "trace_001")
         assert result == "OCR识别结果：小明和小红去公园玩。"
         mock_rkllama.assert_awaited_once()
-        mock_ollama.assert_not_awaited()
 
     @pytest.mark.asyncio
-    @patch("provider_api._ocr_image_bytes_rkllama")
-    @patch("provider_api._ocr_image_bytes_ollama")
-    async def test_provider_ollama(
-        self, mock_ollama: AsyncMock, mock_rkllama: AsyncMock, monkeypatch
+    @patch("ocr_runner._ocr_page_qwen")
+    async def test_provider_qwen2vl(
+        self, mock_qwen: AsyncMock, monkeypatch
     ):
-        """OLLAMA provider → calls _ocr_image_bytes_ollama."""
+        """QWEN2VL provider → calls _ocr_page_qwen from ocr_runner."""
         from provider_api import _ocr_image_bytes
 
-        monkeypatch.setenv("OCR_PROVIDER", "ollama")
-        mock_ollama.return_value = "OCR结果：小明和小红去公园。"
+        monkeypatch.setenv("OCR_PROVIDER", "qwen2vl")
+        mock_qwen.return_value = "OCR结果：小明和小红去公园。"
         result = await _ocr_image_bytes(b"fake_image_bytes", "trace_002")
         assert result == "OCR结果：小明和小红去公园。"
-        mock_ollama.assert_awaited_once()
-        mock_rkllama.assert_not_awaited()
+        mock_qwen.assert_awaited_once()
 
     @pytest.mark.asyncio
     @patch("provider_api._ocr_image_bytes_rkllama")

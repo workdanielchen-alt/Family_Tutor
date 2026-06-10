@@ -10,6 +10,8 @@ RUN sed -i 's/deb.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list.d/debi
     apt-get update && apt-get install -y --no-install-recommends \
     avahi-utils \
     antiword \
+    libxcb1 \
+    libgl1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -20,7 +22,8 @@ COPY requirements/ ./requirements/
 COPY requirements.txt ./
 RUN pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/ && \
     pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir chromadb mcp "markitdown[all]" "qrcode[pil]" opencv-python-headless pymupdf pymupdf4llm && \
+    pip install --no-cache-dir chromadb mcp "markitdown[all]" "qrcode[pil]" pymupdf pymupdf4llm rapidocr-onnxruntime && \
+    pip install --no-cache-dir opencv-python-headless && \
     pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu && \
     pip install --no-cache-dir sentence-transformers
 

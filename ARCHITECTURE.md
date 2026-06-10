@@ -384,7 +384,7 @@ NPU LLM 服务，运行在 RK3576 NPU 上。
                   │    │    │
                   │    │    ├─ OpenCV 预处理 → OCR
                   │    │    │    ├─ rkllama (生产 RK3576 NPU)
-                  │    │    │    └─ Ollama MiniCPM-V (开发/PC 兜底)
+                  │    │    │    └─ Qwen2-VL (llama.cpp 推理)
                   │    │    │
                   │    │    ├─ OCR 结果检查
                   │    │    │    ├─ 有内容 → 入库 + 缓存上下文
@@ -498,13 +498,13 @@ SOUL.md 注入 (每次教学前):
     ├─ _handle_inbound_file() → extract_text() (extractors.py 统一入口)
     │    │
     │    ├─ 图片 (.jpg/.png/.heic/…)
-    │    │    └─ extract_image_text(): OpenCV 6步预处理 → MiniCPM-V OCR → 水平分割并行
-    │    │    └─ _describe_diagram(): MiniCPM 图形描述 (vision)
+    │    │    └─ extract_image_text(): OpenCV 预处理 → VL 模型 OCR → 水平分割并行
+    │    │    └─ _describe_diagram(): VL 模型 图形描述 (vision)
     │    │
     │    ├─ PDF
     │    │    └─ extract_pdf_text(ocr_enabled=True):
     │    │         ├─ pymupdf4llm.to_markdown() 结构化 Markdown
-    │    │         ├─ 扫描件 → ocr_function=MinicpmOCRFunc (MiniCPM-V, 无 Tesseract)
+    │    │         ├─ 扫描件 → ocr_function=MinicpmOCRFunc (Qwen2-VL / rkllama, 无 Tesseract)
     │    │         └─ pymupdf4llm 不可用 → _pdf_manual_ocr_fallback()
     │    │
     │    ├─ Office (.docx/.xlsx/.pptx)

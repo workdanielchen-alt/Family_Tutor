@@ -14,7 +14,7 @@ def preprocess_image_bytes(image_bytes: bytes) -> bytes:
     """Preprocess image for OCR: downscale → grayscale → denoise → CLAHE → deskew → threshold.
 
     Steps:
-      1. Downscale: cap longest side at 1800px (MiniCPM-V pixel limit)
+      1. Downscale: cap longest side at 600px (VL model pixel limit)
       2. Grayscale
       3. Conditional denoise: clean/high-contrast images skip the expensive step
       4. CLAHE contrast enhancement (noisy images only)
@@ -43,58 +43,16 @@ def preprocess_image_bytes(image_bytes: bytes) -> bytes:
         return image_bytes
 
     try:
-        # 1. Downscale: cap longest side AND total megapixels
-        #    For Qwen2-VL, each 28x28 patch generates ~1 token.
-        #    max_pixels ≈ 768 * 28 * 28 = 602K → Prefill快了60%+
-        _MAX_DIM = 1800
-        _MAX_PIXELS = 602_112  # ~776x776 square equivalent
+        # 1. Downscale: cap longest side at 600px (INTER_AREA for text edge clarity)
+        _MAX_EDGE = 600
         h, w = img.shape[:2]
-        scale = 1.0
-        if max(h, w) > _MAX_DIM:
-            scale = min(scale, _MAX_DIM / max(h, w))
-        if h * w > _MAX_PIXELS:
-            scale = min(scale, (_MAX_PIXELS / (h * w)) ** 0.5)
-        if scale < 1.0:
+        if max(h, w) > _MAX_EDGE:
+            scale = _MAX_EDGE / max(h, w)
             img = cv2.resize(img, (int(w * scale), int(h * scale)),
                              interpolation=cv2.INTER_AREA)
 
-        # 2. Grayscale
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-        # 3. Denoise only noisy images (clean screenshots skip the expensive step)
-        _is_clean = gray.std() > 40
-        if _is_clean:
-            enhanced = gray
-        else:
-            denoised = cv2.fastNlMeansDenoising(gray)
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-            enhanced = clahe.apply(denoised)
-
-        # 4. Deskew: detect text angle and rotate
-        coords = np.column_stack(np.where(enhanced < 128))
-        if len(coords) > 10:
-            angle = cv2.minAreaRect(coords)[-1]
-            if angle < -45:
-                angle = 90 + angle
-            if abs(angle) > 0.3:
-                h, w = enhanced.shape
-                center = (w // 2, h // 2)
-                M = cv2.getRotationMatrix2D(center, angle, 1.0)
-                enhanced = cv2.warpAffine(
-                    enhanced, M, (w, h),
-                    flags=cv2.INTER_CUBIC,
-                    borderMode=cv2.BORDER_REPLICATE,
-                )
-
-        # 5. Adaptive threshold (binarize)
-        binary = cv2.adaptiveThreshold(
-            enhanced, 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            11, 2,
-        )
-
-        _, buffer = cv2.imencode(".jpg", binary, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        # 2. Encode as JPEG (keep color, no binarization — Qwen2-VL handles raw input)
+        _, buffer = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])
         return buffer.tobytes()
     except Exception as e:
         logger.warning("Image preprocessing failed: %s, returning original", e)

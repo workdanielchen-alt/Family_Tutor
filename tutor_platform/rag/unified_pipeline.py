@@ -306,11 +306,11 @@ class UnifiedDocumentPipeline:
     async def _extract_pdf_text(
         cls, path: Path, doc_type: DocType, llm_client, stats: dict,
     ) -> str | None:
-        """Extract text from any PDF type via pymupdf4llm + MiniCPM-V OCR.
+        """Extract text from any PDF type via pymupdf4llm + Qwen2-VL OCR.
 
         Uses ``extract_pdf_text(ocr_enabled=True)`` which delegates to
         pymupdf4llm's hybrid OCR pipeline: text-layer pages pass through
-        unchanged, scanned regions are OCR'd via MiniCPM-V / rkllama.
+        unchanged, scanned regions are OCR'd via Qwen2-VL / rkllama.
         No Tesseract required.
         """
         loop = asyncio.get_running_loop()
@@ -468,7 +468,7 @@ def _extract_office_images(path: Path, ext: str) -> str | None:
     if not all_images:
         return None
 
-    # Build a description section — no MiniCPM OCR needed here,
+    # Build a description section — no VL model OCR needed here,
     # just note the images exist and their sizes for context
     lines = ["\n[文档内嵌图片]"]
     for i, img in enumerate(all_images[:8]):

@@ -1,7 +1,6 @@
 """Unified provider: LLM, OCR, vision, and vector store abstraction.
 
-Provides a singleton provider instance that wraps Ollama/DeepSeek APIs,
-ChromaDB vector store, and OCR capabilities.
+Wraps Qwen2-VL / DeepSeek / rkllama APIs, ChromaDB vector store, and OCR capabilities.
 """
 
 from __future__ import annotations
@@ -24,18 +23,17 @@ class UnifiedLocalProvider:
     """Unified provider for LLM, OCR, vision, and vector store operations."""
 
     def __init__(self):
-        self._ollama_url = os.getenv("OLLAMA_URL", "http://ollama:11434")
         self._deepseek_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
         self._chroma_dir = os.getenv("CHROMA_PERSIST_DIR", "/data/chromadb")
         self._client = httpx.AsyncClient(timeout=120)
-        self._ocr_model = os.getenv("OLLAMA_OCR_MODEL", "openbmb/minicpm-v4.6:q4_K_M")
-        self._ocr_url = os.getenv("OCR_URL", "").rstrip("/") or self._ollama_url
+        self._ocr_model = os.getenv("OLLAMA_OCR_MODEL", "qwen2-vl")
+        self._ocr_url = os.getenv("OCR_URL", "http://qwen2vl:8081")
         self._embed_fn = None
         # ChromaDB client 缓存 — ChromaDB 1.x Rust API 不允许重复创建 PersistentClient
         self._chroma_client = None
         logger.info(
-            "UnifiedLocalProvider: ollama=%s chroma=%s",
-            self._ollama_url,
+            "UnifiedLocalProvider: ocr=%s chroma=%s",
+            self._ocr_url,
             self._chroma_dir,
         )
 
@@ -339,7 +337,7 @@ class UnifiedLocalProvider:
                 "stream": False,
             }
             resp = await self._client.post(
-                f"{self._ollama_url}/v1/chat/completions",
+                f"{self._ocr_url}/v1/chat/completions",
                 json=payload,
             )
             if resp.status_code != 200:

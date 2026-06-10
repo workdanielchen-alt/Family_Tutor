@@ -1,4 +1,4 @@
-"""Phase 2: Block-level OCR and figure understanding via MiniCPM-V.
+"""Phase 2: Block-level OCR and figure understanding via multimodal VL model.
 
 Renders individual layout blocks as high-DPI images and sends them
 to a multimodal LLM with targeted prompts depending on block type.
@@ -144,7 +144,7 @@ class BlockContent:
 # ── OCR engine ───────────────────────────────────────────────────
 
 class BlockOCREngine:
-    """Renders layout blocks as images and sends them to MiniCPM-V.
+    """Renders layout blocks as images and sends them to the configured VL model.
 
     Usage::
 
@@ -220,7 +220,7 @@ class BlockOCREngine:
         page_layout: PageLayout,
         save_figures: bool,
     ) -> BlockContent:
-        """Render a block and send it to MiniCPM with the right prompt."""
+        """Render a block and send it to the VL model with the right prompt."""
         try:
             img_bytes = self._render_block(page, block)
             img_b64 = base64.b64encode(img_bytes).decode("ascii")
@@ -253,7 +253,7 @@ class BlockOCREngine:
         img_bytes: bytes,
         save_figures: bool,
     ) -> BlockContent:
-        """Send a text block image to MiniCPM for OCR."""
+        """Send a text block image to the VL model for OCR."""
         try:
             result = await self._llm.complete(
                 _TEXT_OCR_PROMPT,
@@ -283,7 +283,7 @@ class BlockOCREngine:
         img_bytes: bytes,
         save_figures: bool,
     ) -> BlockContent:
-        """Send a figure block image to MiniCPM for structured description."""
+        """Send a figure block image to the VL model for structured description."""
         prompt = _FIGURE_PROMPTS.get(block.figure_hint, _ILLUSTRATION_DESCRIBE_PROMPT)
         try:
             result = await self._llm.complete(

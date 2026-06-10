@@ -150,7 +150,7 @@ _FILE_CACHE_TTL_S = 1800  # 30 min
 # ── Unified pipeline concurrency control ──
 # "fire-and-forget" doesn't mean "fire unlimited."  Without a global gate,
 # N concurrent file uploads each spawn a pipeline task that internally fans
-# out to M MiniCPM calls — the backend melts.  The semaphore limits the
+# out to M VL model calls — the backend melts.  The semaphore limits the
 # total number of pipeline tasks that can run at once, regardless of
 # entry point.
 _UNIFIED_PIPELINE_SEMAPHORE = asyncio.Semaphore(
@@ -548,9 +548,9 @@ class _TTLock:
 # TTL 120s — HTTP release 可能因网络故障静默失败, TTL 兜底自动恢复.
 _llm_lock = _TTLock(ttl=120)
 
-# OCR 并发控制: 单请求 MiniCPM-V CPU 推理, 避免并发超时.
+# OCR 并发控制: 单请求 VL 模型推理, 避免并发超时.
 # asyncio.Semaphore(1) 保护同进程内的并发.  跨进程场景下 (docker exec + API)
-# 两个进程各自有独立的 semaphore, 但 ollama 单模型处理能力有限, 同时发送两个
+# 两个进程各自有独立的 semaphore, 但 VL 单模型处理能力有限, 同时发送两个
 # 请求自然排队.  如需统一调度可用 API 端点的 /api/kb/sync-from-dt 代替 docker exec.
 _ocr_semaphore = asyncio.Semaphore(1)
 
@@ -1009,8 +1009,8 @@ _trace_id_counter: int = 0
 
 
 async def _warm_ocr_model(trace_id: str = ""):
-    if os.getenv("OCR_PROVIDER", "rkllama") == "ollama":
-        logger.info("[%s] OCR warm skipped (Ollama loads on demand)", trace_id)
+    if os.getenv("OCR_PROVIDER", "rkllama") != "rkllama":
+        logger.info("[%s] OCR warm skipped (non-rkllama provider loads on demand)", trace_id)
         return
     try:
         rkllama_url = os.getenv("RKLLAMA_URL", "http://rkllama:8080")
@@ -1255,7 +1255,7 @@ async def _handle_inbound_file(
         File
         ├─ Image  → extract_text() (OpenCV + OCR) + vision description
         ├─ Text   → extract_text() (multi-encoding read + HTML sanitize)
-        ├─ PDF    → _handle_pdf() (pymupdf4llm + MiniCPM-V hybrid OCR)
+        ├─ PDF    → _handle_pdf() (pymupdf4llm + Qwen2-VL hybrid OCR)
         ├─ Office → extract_text() (dedicated libs) + embedded-image OCR
         └─ Unknown → extract_text() (best-effort)
     """
@@ -1297,6 +1297,18 @@ async def _handle_inbound_file(
             else:
                 logger.warning("[%s] OCR failed for %s", trace_id, file_path)
 
+            # Always embed the original image as base64 — child needs to see the photo
+            try:
+                import base64 as _b64
+                _raw = Path(file_path).read_bytes()
+                _img_b64 = _b64.b64encode(_raw).decode("ascii")
+                _original_image = (
+                    f'\n\n<img src="data:image/png;base64,{_img_b64}" '
+                    f'alt="原始图片" style="max-width:100%"/>\n\n'
+                )
+            except Exception:
+                _original_image = "\n\n[原始图片]\n\n"
+
             # Always run vision description on image files — don't rely on
             # OCR keyword detection (OCR may garble 如图/图5 → miss the trigger).
             # Vision is cached (1h TTL), so repeated calls are cheap.
@@ -1308,8 +1320,14 @@ async def _handle_inbound_file(
                 else:
                     content = f"[图片中的图形描述]\n{vision_desc}"
 
+            # Stitch: OCR text + vision description + original image
             if content:
-                _ocr_raw_len = len(content.strip())
+                content = f"{content}{_original_image}"
+            else:
+                content = f"{_original_image}"
+
+            if content and len(content.strip()) > len(_original_image.strip()):
+                _ocr_raw_len = len(content.strip()) - len(_original_image.strip())
                 if _ocr_raw_len < 80:
                     _guidance = (
                         "【系统提示】这张图片只识别出了部分文字。请用鼓励的语气请求学生："
@@ -1329,19 +1347,20 @@ async def _handle_inbound_file(
                 })
             # OCR failed — tiered fallback
             logger.warning("[%s] OCR failed and vision empty, using tiered fallback for %s", trace_id, file_path)
+            _fallback_text = (
+                "用户通过微信发送了一张图片，但图片中的文字未能被自动识别。\n"
+                "请用友好的语气引导学生：①把手机拿平拍 ②光线好一些不要反光 "
+                "③如果图片不清晰可以重新拍一张发给老师。\n"
+                "不方便拍照的话，也可以直接把题目打字发过来。"
+            )
             return _cache_res({
                 "ok": True,
-                "content": (
-                    "用户通过微信发送了一张图片，但图片中的文字未能被自动识别。\n"
-                    "请用友好的语气引导学生：①把手机拿平拍 ②光线好一些不要反光 "
-                    "③如果图片不清晰可以重新拍一张发给老师。\n"
-                    "不方便拍照的话，也可以直接把题目打字发过来。"
-                ),
+                "content": _fallback_text + _original_image,
                 "intent": "EDUCATION", "route": "ocr_fallback",
                 "storage": {"ok": False},
             })
 
-        # ── PDF: pymupdf4llm + MiniCPM-V hybrid OCR ──
+        # ── PDF: pymupdf4llm + Qwen2-VL hybrid OCR ──
         elif ext == ".pdf":
             _kb_name = meta.get("kb_name", "")
             _filename = meta.get("dt_filename") or meta.get("filename") or (os.path.basename(file_path) if file_path else "")
@@ -1451,7 +1470,7 @@ async def _handle_pdf(file_path: str, trace_id: str, kb_name: str = "", filename
     """Extract text from a PDF via pymupdf4llm with conditional hybrid OCR.
 
     For text-layer PDFs: pymupdf4llm extraction without OCR (fast).
-    For scanned PDFs (no/very little text): manual fitz render + MiniCPM-V OCR.
+    For scanned PDFs (no/very little text): manual fitz render + Qwen2-VL OCR (via ocr_runner).
 
     When ``kb_name`` and ``filename`` are provided, scanned-page OCR results
     are persisted to ChromaDB incrementally (batch of 5 pages) so interrupted
@@ -1469,11 +1488,10 @@ async def _handle_pdf(file_path: str, trace_id: str, kb_name: str = "", filename
         if text and len(text.strip()) > 50:
             return text
 
-    # Little/no text — likely scanned. Use manual OCR fallback (fitz render + MiniCPM-V).
-    # pymupdf4llm's ocr_function integration has known merge issues;
-    # the manual path via _pdf_manual_ocr_fallback is well-tested and reliable.
-    logger.info("[%s] PDF appears scanned, using MiniCPM-V manual OCR", trace_id)
-    return await _pdf_manual_ocr_fallback(file_path, trace_id, kb_name=kb_name, filename=filename)
+    # Little/no text — likely scanned. Use qwen2vl API OCR (ocr_runner).
+    logger.info("[%s] PDF appears scanned, using qwen2vl OCR", trace_id)
+    from ocr_runner import run_pdf_ocr
+    return await run_pdf_ocr(file_path, trace_id, filename=filename)
 
 
 async def _pdf_manual_ocr_fallback(file_path: str, trace_id: str, kb_name: str = "", filename: str = "") -> str:
@@ -1577,7 +1595,7 @@ async def _pdf_manual_ocr_fallback(file_path: str, trace_id: str, kb_name: str =
         except Exception as _e:
             logger.warning("[%s] Checkpoint save failed (non-fatal): %s", trace_id, _e)
 
-    # ── Retry failed pages once (ollama 500 / timeout under load) ──
+    # ── Retry failed pages once (VL model timeout under load) ──
     _failed = [i for i in range(num_pages) if not pages_text[i]]
     if _failed:
         logger.info("[%s] Retrying %d failed pages...", trace_id, len(_failed))
@@ -1631,79 +1649,16 @@ async def _pdf_manual_ocr_fallback(file_path: str, trace_id: str, kb_name: str =
 # ── OCR helpers ──
 
 
-async def _ocr_image_bytes_ollama(image_bytes: bytes, trace_id: str) -> str:
-    """OCR via local Ollama (MiniCPM-V 4.6) — /api/chat with Chinese prompt."""
-    img_b64 = base64.b64encode(image_bytes).decode("utf-8")
-    ollama_url = os.getenv("OLLAMA_URL", "http://ollama:11434")
-    model = os.getenv("OLLAMA_OCR_MODEL", "openbmb/minicpm-v4.6:q4_K_M")
-    keep_alive = os.getenv("OLLAMA_KEEP_ALIVE", "15m")
-    async with _ocr_semaphore:
-        try:
-            async with httpx.AsyncClient(timeout=120) as client:
-                # Use /api/chat with Chinese system prompt for better Chinese OCR.
-                # System role + structured rules + greedy decoding gives the most
-                # reliable text-only output from MiniCPM-V 4.6.
-                resp = await client.post(
-                    f"{ollama_url}/api/chat",
-                    json={
-                        "model": model,
-                        "messages": [
-                            {
-                                "role": "system",
-                                "content": (
-                                    "你是一个专业OCR文字识别引擎。\n\n"
-                                    "规则：\n"
-                                    "1. 只输出图片中实际存在的文字——不要添加任何描述、解释或额外内容\n"
-                                    "2. 中文文字直接输出纯文本（不要加$分隔符）\n"
-                                    "3. 数学公式用$LaTeX$行内或$$display$$块级\n"
-                                    "4. 保留原始换行和段落结构\n"
-                                    "5. 如果没有文字，返回空字符串"
-                                ),
-                            },
-                            {
-                                "role": "user",
-                                "content": "识别这张图片中的所有文字，只输出文字本身：",
-                                "images": [img_b64],
-                            },
-                        ],
-                        "stream": False,
-                        "keep_alive": keep_alive,
-                        "options": {"temperature": 0},
-                    },
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    content = (data.get("message", {}).get("content", "") or "").strip()
-                    # Post-process: strip explanation prefixes common in MiniCPM output
-                    import re
-                    m = re.search(r'[一-鿿]|\$\$?|\\\\\[', content)
-                    if m:
-                        content = content[m.start():]
-                    else:
-                        content = re.sub(
-                            r'^[\s\n]*(?:图片[中的上].*?[：:]|'
-                            r'识别结果[：:]|OCR[识别结果]*[：:]|'
-                            r'the (?:ocr|text|image).*?[：:])',
-                            '',
-                            content,
-                            flags=re.IGNORECASE,
-                        )
-                    content = re.sub(r'^[\s\n：:，,;.、]+', '', content).strip()
-                    return content
-                logger.warning("[%s] Ollama OCR returned HTTP %s", trace_id, resp.status_code)
-        except Exception as exc:
-            logger.warning("[%s] Ollama OCR request failed: %s", trace_id, exc)
-    return ""
-
-
 async def _ocr_image_bytes(image_bytes: bytes, trace_id: str) -> str:
-    """OCR dispatch: rkllama or Ollama based on OCR_PROVIDER.
+    """OCR dispatch: qwen2vl / rkllama based on OCR_PROVIDER.
 
     Result is validated — garbled output is treated as OCR failure (empty string).
     """
     provider = os.getenv("OCR_PROVIDER", "rkllama")
-    if provider == "ollama":
-        text = await _ocr_image_bytes_ollama(image_bytes, trace_id)
+    if provider == "qwen2vl":
+        from ocr_runner import _ocr_page_qwen
+        img_b64 = base64.b64encode(image_bytes).decode("utf-8")
+        text = await _ocr_page_qwen(img_b64, trace_id, 0)
     else:
         text = await _ocr_image_bytes_rkllama(image_bytes, trace_id)
 
@@ -1840,8 +1795,9 @@ _VISION_CACHE_MAX = 100
 
 
 async def _describe_diagram(file_path: str, trace_id: str) -> str:
-    """Use MiniCPM-V vision to describe math/physics diagrams in the image.
+    """Use VL model vision to describe math/physics diagrams in the image.
 
+    Routes via OCR_PROVIDER: qwen2vl (llama.cpp API) or rkllama (NPU fallback).
     Runs as a separate call after OCR so the diagram description can be fused
     into the teaching context alongside the extracted text.
     """
@@ -1857,57 +1813,75 @@ async def _describe_diagram(file_path: str, trace_id: str) -> str:
             raw_bytes = f.read()
         img_b64 = base64.b64encode(raw_bytes).decode("utf-8")
 
-        ollama_url = os.getenv("OLLAMA_URL", "http://ollama:11434")
-        model = os.getenv("OLLAMA_OCR_MODEL", "openbmb/minicpm-v4.6:q4_K_M")
+        system_prompt = (
+            "你是一个数学/物理图形分析助手。"
+            "仔细观察图片中的图形、图表、示意图等视觉元素。\n\n"
+            "规则：\n"
+            "1. 只描述视觉元素本身——禁止回答题目中的问题\n"
+            "2. 列出所有几何图形（三角形、圆、烧瓶等）及物理示意图\n"
+            "3. 标注所有字母（A/B/C等）、数字、角度符号（∠等）\n"
+            "4. 说明线段、角度、长度等几何关系\n"
+            "5. 如果有多个子图，分别描述每个子图\n"
+            "6. 描述图形的整体布局\n\n"
+            "禁止：\n"
+            "- 绝对不要回答题目的任何问题\n"
+            "- 绝对不要给出解题思路或答案\n"
+            "- 绝对不要推理实验现象或结论\n"
+            "- 只描述你看到了什么，不要解释它意味着什么"
+        )
 
-        # Use a separate semaphore for vision — shares Ollama resources
+        provider = os.getenv("OCR_PROVIDER", "rkllama")
+
         async with _ocr_semaphore:
-            async with httpx.AsyncClient(timeout=90) as client:
-                resp = await client.post(
-                    f"{ollama_url}/api/chat",
-                    json={
-                        "model": model,
-                        "messages": [
-                            {
-                                "role": "system",
-                                "content": (
-                                    "你是一个数学/物理图形分析助手。"
-                                    "仔细观察图片中的图形、图表、示意图等视觉元素。\n\n"
-                                    "规则：\n"
-                                    "1. 只描述视觉元素本身——禁止回答题目中的问题\n"
-                                    "2. 列出所有几何图形（三角形、圆、烧瓶等）及物理示意图\n"
-                                    "3. 标注所有字母（A/B/C等）、数字、角度符号（∠等）\n"
-                                    "4. 说明线段、角度、长度等几何关系\n"
-                                    "5. 如果有多个子图，分别描述每个子图\n"
-                                    "6. 描述图形的整体布局\n\n"
-                                    "禁止：\n"
-                                    "- 绝对不要回答题目的任何问题\n"
-                                    "- 绝对不要给出解题思路或答案\n"
-                                    "- 绝对不要推理实验现象或结论\n"
-                                    "- 只描述你看到了什么，不要解释它意味着什么"
-                                ),
-                            },
-                            {
-                                "role": "user",
-                                "content": "描述这张图片中的图形和视觉元素：",
-                                "images": [img_b64],
-                            },
-                        ],
-                        "stream": False,
-                        "options": {"temperature": 0},
-                    },
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    desc = (data.get("message", {}).get("content", "") or "").strip()
-                    if desc:
-                        _VISION_DESC_CACHE[ckey] = (time.time(), desc)
-                        if len(_VISION_DESC_CACHE) > _VISION_CACHE_MAX:
-                            _VISION_DESC_CACHE.pop(next(iter(_VISION_DESC_CACHE)))
-                        return desc
-                logger.warning(
-                    "[%s] Vision API returned HTTP %s", trace_id, resp.status_code
-                )
+            desc = ""
+            if provider == "qwen2vl":
+                qwen_url = os.getenv("QWEN2VL_URL", "http://qwen2vl:8081")
+                async with httpx.AsyncClient(timeout=120) as client:
+                    resp = await client.post(
+                        f"{qwen_url}/v1/chat/completions",
+                        json={
+                            "model": "qwen2-vl",
+                            "messages": [
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": [
+                                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
+                                    {"type": "text", "text": "描述这张图片中的图形和视觉元素："},
+                                ]},
+                            ],
+                            "max_tokens": 1024,
+                            "temperature": 0.1,
+                        },
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        desc = (data.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
+                    else:
+                        logger.warning("[%s] Vision API (qwen2vl) HTTP %s", trace_id, resp.status_code)
+            else:
+                # rkllama — send to NPU OCR endpoint as fallback
+                rkllama_url = os.getenv("RKLLAMA_URL", "http://rkllama:8080")
+                async with httpx.AsyncClient(timeout=90) as client:
+                    resp = await client.post(
+                        f"{rkllama_url}/v1/ocr",
+                        json={
+                            "image": img_b64,
+                            "language": "zh",
+                            "return_formulas": False,
+                            "return_layout": False,
+                        },
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        desc = (data.get("text", "") or "").strip()
+                    else:
+                        logger.warning("[%s] Vision API (rkllama) HTTP %s", trace_id, resp.status_code)
+
+        if desc:
+            _VISION_DESC_CACHE[ckey] = (time.time(), desc)
+            if len(_VISION_DESC_CACHE) > _VISION_CACHE_MAX:
+                _VISION_DESC_CACHE.pop(next(iter(_VISION_DESC_CACHE)))
+            return desc
+
     except Exception as exc:
         logger.warning("[%s] Vision description failed: %s", trace_id, exc)
     return ""
@@ -1917,7 +1891,6 @@ async def _describe_diagram(file_path: str, trace_id: str) -> str:
 
 
 _MD_INSTANCE: MarkItDown | None = None
-_MD_WITH_OCR: MarkItDown | None = None
 
 
 def _get_markitdown() -> MarkItDown:
@@ -1925,69 +1898,6 @@ def _get_markitdown() -> MarkItDown:
     if _MD_INSTANCE is None:
         _MD_INSTANCE = MarkItDown()
     return _MD_INSTANCE
-
-
-def _get_markitdown_with_ocr() -> MarkItDown:
-    """Get a MarkItDown instance with OCR layer enabled for embedded images.
-
-    markitdown >= 0.1.5 supports an OCR service layer (#1541) that
-    can describe/caption embedded images in documents using an LLM.
-    We reuse the same Ollama MiniCPM-V endpoint used by `_describe_diagram`.
-    """
-    global _MD_WITH_OCR
-    if _MD_WITH_OCR is None:
-        # Use the same Ollama endpoint as _describe_diagram
-        try:
-            _MD_WITH_OCR = MarkItDown(
-                llm_client=_create_markitdown_llm_client(),
-                llm_model=os.getenv("OLLAMA_MODEL", "minicpm-v"),
-            )
-        except Exception:
-            logger.warning("Failed to create MarkItDown OCR instance, falling back to basic")
-            _MD_WITH_OCR = _get_markitdown()
-    return _MD_WITH_OCR
-
-
-def _create_markitdown_llm_client():
-    """Create a simple LLM client compatible with markitdown's OCR layer API."""
-    import requests as _requests
-
-    class _OllamaMarkItDownClient:
-        """Thin adapter for markitdown's LLM client protocol → Ollama API."""
-
-        def __init__(self):
-            self.ollama_url = os.getenv("OLLAMA_URL", "http://ollama:11434")
-
-        def complete(self, prompt: str, **kwargs) -> str:
-            """Call Ollama /api/chat with an image for markitdown OCR."""
-            images = kwargs.get("images", [])
-            payload = {
-                "model": os.getenv("OLLAMA_MODEL", "minicpm-v"),
-                "messages": [{
-                    "role": "user",
-                    "content": prompt,
-                    **({"images": images} if images else {}),
-                }],
-                "stream": False,
-                "options": {"temperature": 0},
-            }
-            try:
-                resp = _requests.post(
-                    f"{self.ollama_url}/api/chat",
-                    json=payload,
-                    timeout=60,
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    return data.get("message", {}).get("content", "")
-            except Exception as ex:
-                logger.debug("markitdown LLM call failed: %s", ex)
-            return ""
-
-        def is_multimodal(self) -> bool:
-            return True
-
-    return _OllamaMarkItDownClient()
 
 
 def _extract_with_markitdown(file_path: str) -> str:
@@ -2129,7 +2039,7 @@ def _sanitize_ocr_text(text: str) -> str:
 
 
 def _ocr_output_is_garbled(text: str) -> bool:
-    """Detect garbled OCR output from MiniCPM or other unreliable sources.
+    """Detect garbled OCR output from VL models or other unreliable sources.
 
     Returns True when the text is likely useless (garbled/placeholder) so the
     caller can treat it as OCR failure and trigger the ocr_fallback path.
@@ -2168,10 +2078,10 @@ def _ocr_output_is_garbled(text: str) -> bool:
 
 
 async def _ocr_office_images(file_path: str, ext: str, trace_id: str) -> str:
-    """Extract embedded images from an Office doc and OCR them via Ollama.
+    """Extract embedded images from an Office doc, OCR them, and save to .figures/."""
 
-    Timed out at 30s to prevent blocking the HTTP response for too long.
-    """
+    from pathlib import Path as _Path
+
     media_prefixes: list[str] = []
     if ext in {".docx", ".docm"}:
         media_prefixes = ["word/media/"]
@@ -2194,7 +2104,6 @@ async def _ocr_office_images(file_path: str, ext: str, trace_id: str) -> str:
 
     if not all_images:
         # Old OLE-based .doc/.ppt/.pps/.xls: try scanning streams for image signatures
-        # Timebox the OLE scan at 20s to avoid blocking the request.
         if ext in {".doc", ".ppt", ".pps", ".xls"}:
             try:
                 loop = asyncio.get_running_loop()
@@ -2211,19 +2120,39 @@ async def _ocr_office_images(file_path: str, ext: str, trace_id: str) -> str:
         if not all_images:
             return ""
 
-    logger.info(
-        "[%s] OCR: %d embedded images found in %s", trace_id, len(all_images), file_path
-    )
-    ocr_texts = []
-    for img_bytes in all_images[:5]:  # at most 5 images
+    # ── Save images to .figures/ directory ──
+    _src = _Path(file_path)
+    _fig_dir = _src.parent / f"{_src.stem}.figures"
+    _fig_dir.mkdir(exist_ok=True)
+    _saved_paths: list[str] = []
+
+    for i, img_bytes in enumerate(all_images[:100]):  # cap at 100
         try:
-            ocr_result = await asyncio.wait_for(
-                _ocr_image_bytes(preprocess_image_bytes(img_bytes), trace_id), timeout=15
-            )
+            import hashlib as _hl
+            _hash = _hl.sha256(img_bytes).hexdigest()[:12]
+            _fp = _fig_dir / f"{_hash}_{i}.png"
+            _fp.write_bytes(img_bytes)
+            _saved_paths.append(str(_fp))
+        except OSError:
+            pass
+
+    logger.info(
+        "[%s] OCR: %d images found, %d saved to %s",
+        trace_id, len(all_images), len(_saved_paths), _fig_dir,
+    )
+
+    # ── OCR with RapidOCR (fast path, 2-3s per image) ──
+    ocr_texts = []
+    for img_bytes in all_images[:100]:
+        try:
+            from tutor_platform.rag.rapid_ocr import ocr_text_only
+
+            loop = asyncio.get_running_loop()
+            ocr_result = await loop.run_in_executor(None, ocr_text_only, img_bytes)
             if ocr_result:
                 ocr_texts.append(ocr_result)
-        except asyncio.TimeoutError:
-            logger.warning("[%s] Embedded image OCR timed out in %s", trace_id, file_path)
+        except Exception as exc:
+            logger.debug("[%s] Embedded image OCR failed: %s", trace_id, exc)
 
     if ocr_texts:
         combined = "\n\n[图片文字识别结果]\n" + "\n---\n".join(ocr_texts)
@@ -2273,11 +2202,13 @@ async def _ingest_to_kb(
     source: str,
     trace_id: str,
     subject: str = "",
+    source_file_path: str = "",
 ) -> None:
     """异步将提取的文本内容入库平台 ChromaDB + DT LlamaIndex 向量索引.
 
     v2: 增强 metadata，支持按 type/subject/grade 过滤检索。
     入库时优先生成教学摘要（v3），失败时回退到原文本。
+    source_file_path: 原始文件路径，用于 figure 提取（Office docs 等）。
     """
     if not content or not content.strip():
         return
@@ -2288,7 +2219,11 @@ async def _ingest_to_kb(
 
     # v3: Generate teaching summary for pedagogical value.
     # Async, best-effort — if it fails, fall back to raw OCR text.
-    _teaching_summary = await _generate_teaching_summary(content, _detected_subject, trace_id)
+    # For chemistry/math/physics: keep raw content (preserves formulas like 2H₂ + O₂ → 2H₂O)
+    _stem_subjects = frozenset({"chemistry", "math", "physics"})
+    _teaching_summary = ""
+    if _detected_subject not in _stem_subjects:
+        _teaching_summary = await _generate_teaching_summary(content, _detected_subject, trace_id)
     _indexed_content = _teaching_summary if _teaching_summary else content
     _content_type = "teaching_summary" if _teaching_summary else "raw_ocr"
 
@@ -2402,8 +2337,7 @@ async def _ingest_to_kb(
         from tutor_platform.rag.extractors import extract_figures
         from pathlib import Path as _Path
 
-        fig_file_path = meta.get("file_path", "") if isinstance(meta, dict) else ""
-        file_path_local = fig_file_path or _get_source_path(filename, trace_id)
+        file_path_local = source_file_path or _get_source_path(filename, trace_id)
         if file_path_local and os.path.isfile(file_path_local):
             _figures = await asyncio.get_running_loop().run_in_executor(
                 None,
@@ -2520,6 +2454,7 @@ async def _maybe_ingest_result(
     learner_id: str,
     source: str,
     trace_id: str,
+    source_file_path: str = "",
 ) -> None:
     """Persist extraction result to ChromaDB + DT (dual-write).
 
@@ -2555,6 +2490,7 @@ async def _maybe_ingest_result(
             learner_id=learner_id,
             source=source,
             trace_id=trace_id,
+            source_file_path=source_file_path,
         )
         logger.info(
             "[%s] Ingest dual-write: %d chars -> %s + DT (source=%s)",
@@ -3955,6 +3891,7 @@ async def api_kb_ingest_file(
                 learner_id=learner_id,
                 source="web_ui",
                 trace_id=trace_id,
+                source_file_path=tmp_path,
             )
             logger.info(
                 "[%s] Web UI KB ingest (dual-write): %d chars -> %s + DT",
@@ -4056,10 +3993,30 @@ async def _sync_kb_from_dt(kb_name: str, trace_id: str = "") -> dict:
     )
     os.makedirs(_ckpt_dir, exist_ok=True)
 
+    # Preload all complete checkpoints for cross-reference (different filenames
+    # may share the same PDF — avoid duplicate OCR).
+    _all_complete_ckpts: dict[str, tuple[str, dict]] = {}
+    try:
+        for _cf in os.listdir(_ckpt_dir):
+            if not _cf.endswith(".json"):
+                continue
+            _cp = os.path.join(_ckpt_dir, _cf)
+            try:
+                _cd = json.loads(open(_cp, encoding="utf-8").read())
+            except Exception:
+                continue
+            _pp = _cd.get("page_texts", {})
+            _tp = _cd.get("total_pages", 0)
+            if _pp and _tp and len(_pp) >= _tp:
+                _all_complete_ckpts[_cf] = (_cp, _cd)
+    except Exception:
+        pass
+
     for filename in files:
         _ckpt_key = hashlib.sha256(filename.encode("utf-8")).hexdigest()[:16]
         _ckpt_path = os.path.join(_ckpt_dir, f"{_ckpt_key}.json")
         _ckpt_data: dict | None = None
+        _ckpt_alt_path: str | None = None  # fallback checkpoint from different filename
         try:
             if os.path.isfile(_ckpt_path):
                 _ckpt_data = json.loads(open(_ckpt_path, encoding="utf-8").read())
@@ -4070,6 +4027,23 @@ async def _sync_kb_from_dt(kb_name: str, trace_id: str = "") -> dict:
         if _ckpt_data and _ckpt_data.get("embedded"):
             logger.info("[%s] KB reindex skip (embedded): %s", trace_id, filename)
             continue
+
+        # Branch 1b: check ALL complete checkpoints for a page-count match
+        # (handles same PDF uploaded/synced under different filenames)
+        if not _ckpt_data or not _ckpt_data.get("page_texts"):
+            for _cf, (_cp, _cd) in _all_complete_ckpts.items():
+                if _cd.get("embedded"):
+                    continue
+                _pp = _cd.get("page_texts", {})
+                if len(_pp) >= _cd.get("total_pages", 0) and len(_pp) > 10:
+                    # Plausible match: use this checkpoint as fallback
+                    _ckpt_alt_path = _cp
+                    _ckpt_data = _cd
+                    logger.info(
+                        "[%s] KB reindex matched alt checkpoint %s for %s",
+                        trace_id, _cf[:12], filename,
+                    )
+                    break
 
         extracted: str = ""
         tmp_path: str = ""
@@ -4173,12 +4147,17 @@ async def _sync_kb_from_dt(kb_name: str, trace_id: str = "") -> dict:
             # 删除 page_texts 省磁盘
             _new_ckpt.pop("page_texts", None)
             _new_ckpt.pop("total_pages", None)
-            try:
-                with open(_ckpt_path + ".tmp", "w", encoding="utf-8") as _tf:
-                    json.dump(_new_ckpt, _tf, ensure_ascii=False)
-                os.replace(_ckpt_path + ".tmp", _ckpt_path)
-            except Exception:
-                pass
+            # Write to both filename-matched and alt checkpoints
+            _ckpt_paths_to_mark = [_ckpt_path]
+            if _ckpt_alt_path and _ckpt_alt_path != _ckpt_path:
+                _ckpt_paths_to_mark.append(_ckpt_alt_path)
+            for _mark_path in _ckpt_paths_to_mark:
+                try:
+                    with open(_mark_path + ".tmp", "w", encoding="utf-8") as _tf:
+                        json.dump(_new_ckpt, _tf, ensure_ascii=False)
+                    os.replace(_mark_path + ".tmp", _mark_path)
+                except Exception:
+                    pass
         except Exception as exc:
             logger.warning("[%s] KB embed error: %s: %s", trace_id, filename, exc)
 
@@ -4556,8 +4535,12 @@ async def api_process_file(request: Request):
     # 后续 auto-trigger 或 tutor_chat 会从缓存取 context 更新 SOUL.md
     # 跳过 ocr_fallback/passthrough 路线, 防止虚假上下文污染后续交互
     _ocr_content = result.get("content", "").strip()
-    # Sanitize OCR text: strip MS Office OLE garbage before caching
+    # Sanitize OCR text: strip MS Office OLE garbage + HTML img tags before caching
     _ocr_content = _sanitize_ocr_text(_ocr_content)
+    # Strip base64 img tags from teaching context — 50KB+ base64 would overwhelm
+    # the 2000-char budget in api_tutor_context, leaving zero room for text.
+    import re as _re2
+    _ocr_content = _re2.sub(r'<img[^>]*/?>', '', _ocr_content)
     if _ocr_content and result.get("ok") and result.get("route") not in ("ocr_fallback", "passthrough"):
         _last_tutor_context[learner_id] = _ocr_content
         if len(_last_tutor_context) > _MAX_CACHED_CONTEXTS:
@@ -4652,6 +4635,7 @@ async def api_ingest_file(
         learner_id=learner_id,
         source="mcp",
         trace_id=trace_id,
+        source_file_path=dest,
     )
 
     IngestStatusTracker.mark(

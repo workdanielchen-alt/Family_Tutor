@@ -1,60 +1,13 @@
 # ============================================
 # DeepTutor Production Override — OCR + Local LLM
 # ============================================
-# Adds Ollama with MiniCPM-v4.6 Q4_K_M for OCR/vision.
+# Qwen2-VL OCR via llama-mtmd-cli subprocess.
+# Embedding via BgeSmallEmbedding (in-process, no external service).
 # Usage:
 #   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 # ============================================
 
 services:
-  # ============================================
-  # rkllama — NPU 推理服务 (PC stub / RK3576 NPU)
-  # ============================================
-  rkllama:
-    image: deepseek-rkllama:latest
-    container_name: rkllama
-    restart: unless-stopped
-    ports:
-      - "8080:8080"
-    environment:
-      - RKLLM_PORT=8080
-      - RKLLM_STUB_MODE=true
-    networks:
-      - deeptutor-network
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health')\" || exit 1"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
-
-  # ============================================
-  # Ollama — BGE embedding model (ChromaDB)
-  # ============================================
-  ollama:
-    image: ollama/ollama:0.30.6
-    container_name: ollama
-    restart: unless-stopped
-    ports:
-      # Host 11434 may be taken by Windows Ollama → use 11435
-      - "11435:11434"
-    environment:
-      - OLLAMA_MODELS=/models
-    volumes:
-      # Mount existing model storage (D:\ollama_models → /models)
-      - //d/ollama_models:/models
-    deploy:
-      resources:
-        limits:
-          memory: 4G
-    networks:
-      - deeptutor-network
-    healthcheck:
-      test: ["CMD", "ollama", "list"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
 
   # ============================================
   # Hermes Agent — WeChat iLink dual-bot gateway
@@ -122,6 +75,7 @@ services:
     image: python:3.11-slim
     container_name: qwen2vl
     restart: unless-stopped
+    mem_limit: 6G
     ports:
       - "8082:8081"
     volumes:
@@ -130,17 +84,24 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        apt-get update -qq && apt-get install -y -qq libgomp1 2>/dev/null
+        apt-get update -qq && apt-get install -y -qq libgomp1 2>/dev/null || true
         export LD_LIBRARY_PATH=/server
         /server/llama-server \
           --host 0.0.0.0 --port 8081 \
           -m /models/Qwen2-VL-2B-Instruct-Q4_K_M.gguf \
           --mmproj /models/mmproj-Qwen2-VL-2B-Instruct-Q8_0.gguf \
-          -c 4096 --threads 4 --threads-batch 4 \
-          --flash-attn on --mlock \
-          --batch-size 4096 --ubatch-size 1024 \
-          --cache-type-k q8_0 --cont-batching \
-          --cache-reuse 256
+          -t 12 \
+          -c 4096 \
+          -b 512 \
+          -ub 128 \
+          -np 1 \
+          --mlock \
+          --no-mmap \
+          --cache-type-k q8_0 \
+          --cache-type-v q8_0 \
+          --flash-attn on \
+          --image-min-tokens 1024 \
+          -fit off
     networks:
       - deeptutor-network
     healthcheck:
@@ -154,9 +115,10 @@ services:
   # Platform — enable OCR via qwen2vl
   # ============================================
   platform:
+    mem_limit: 8g
     environment:
-      - OLLAMA_URL=http://ollama:11434
       - OCR_URL=http://qwen2vl:8081
+      - OCR_PROVIDER=qwen2vl
       - HERMES_CONTAINER=hermes_agent
       - HERMES_AGENT_URL=http://hermes_agent:8004
       - RKLLM_SERVER_URL=http://rkllama:8080
@@ -166,7 +128,11 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./docker/platform/provider_api.py:/app/provider_api.py:ro
+      - ./docker/platform/ocr_runner.py:/app/ocr_runner.py:ro
       - ./docker/platform/mcp_server.py:/app/mcp_server.py:ro
+      # llama.cpp 工具链 + Qwen2-VL 模型 (OCR 子进程)
+      - ./data/llamacpp/llama-b9553:/llamacpp:ro
+      - ./data/qwen2-vl-gguf:/models:ro
       # 教学引擎 YAML 提示词 — 修改后无需重启，TeachPromptManager 自动热重载
       - ./config/teach-prompts.yaml:/app/config/teach-prompts.yaml:ro
       # 教学引擎代码 — 热重载逻辑 live 同步 (含 max_pixels 优化)
@@ -174,8 +140,6 @@ services:
     networks:
       - deeptutor-network
     depends_on:
-      ollama:
-        condition: service_healthy
       hermes_agent:
         condition: service_started
       qwen2vl:

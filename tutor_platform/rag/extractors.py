@@ -9,7 +9,7 @@ Principles:
   * python-docx / openpyxl / python-pptx for modern Office — rich structured output.
   * markitdown for EPUB / audio / YouTube / old Office fallback — wide format support.
   * FileTypeRouter for plain text / source code — multi-encoding chain.
-  * No Tesseract — OCR is handled by LLM (MiniCPM / rkllama) downstream when needed.
+  * No Tesseract — OCR is handled by LLM (Qwen2-VL / rkllama) downstream when needed.
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ def extract_pdf_text(
 
     When ``ocr_enabled=True``, pymupdf4llm's hybrid OCR pipeline is activated:
     only pages/regions without a text layer are OCR'd via the configured
-    OCR backend (MiniCPM-V / rkllama via ``ocr_adapters.py``).  Text-layer
+    OCR backend (Qwen2-VL / rkllama via ``ocr_adapters.py``).  Text-layer
     pages pass through unchanged.  No Tesseract required.
 
     Falls back to raw pymupdf page.get_text() when pymupdf4llm is unavailable
@@ -246,7 +246,7 @@ def extract_image_text(file_path: str | Path, *, trace_id: str = "") -> str:
     Steps:
       1. Read raw bytes
       2. OpenCV preprocess (deskew, denoise, CLAHE, threshold)
-      3. OCR via Ollama MiniCPM-V / rkllama NPU
+      3. OCR via configured provider (Qwen2-VL / rkllama)
       4. If full-image OCR fails, try horizontal segment-based OCR
 
     This function is sync-safe — it blocks the calling thread while
@@ -267,10 +267,12 @@ def extract_image_text(file_path: str | Path, *, trace_id: str = "") -> str:
     except Exception:
         processed = raw_bytes
 
+    from tutor_platform.rag.ocr_adapters import _ocr_pixmap_bytes
+
     # ── Run async OCR inside a temporary event loop ──
     async def _do_ocr() -> str:
         # Try full-image OCR first
-        text = await _ocr_bytes_async(processed, trace_id)
+        text = await _ocr_pixmap_bytes(processed, trace_id)
         if text:
             return text
 
@@ -283,7 +285,7 @@ def extract_image_text(file_path: str | Path, *, trace_id: str = "") -> str:
             "[%s] Splitting image into %d segments for parallel OCR",
             trace_id, len(segments),
         )
-        tasks = [_ocr_bytes_async(seg, trace_id) for seg in segments]
+        tasks = [_ocr_pixmap_bytes(seg, trace_id) for seg in segments]
         results = await _asyncio.gather(*tasks)
         combined = "\n".join(r for r in results if r)
         if combined:
@@ -303,93 +305,6 @@ def extract_image_text(file_path: str | Path, *, trace_id: str = "") -> str:
     import concurrent.futures
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         return pool.submit(_asyncio.run, _do_ocr).result()
-
-
-async def _ocr_bytes_async(image_bytes: bytes, trace_id: str) -> str:
-    """OCR image bytes via Ollama MiniCPM-V → rkllama NPU fallback.
-
-    Reuses the same endpoints as the MiniCPM OCR adapter in ocr_adapters.py.
-    """
-    import base64 as _base64
-    import httpx as _httpx
-
-    # Preprocessing already applied by caller
-    img_b64 = _base64.b64encode(image_bytes).decode("utf-8")
-
-    provider = os.environ.get("OCR_PROVIDER", "rkllama")
-    if provider == "ollama":
-        ollama_url = os.environ.get("OLLAMA_URL", "http://ollama:11434")
-        model = os.environ.get("OLLAMA_OCR_MODEL", "openbmb/minicpm-v4.6:q4_K_M")
-        keep_alive = os.environ.get("OLLAMA_KEEP_ALIVE", "15m")
-        try:
-            async with _httpx.AsyncClient(timeout=120) as client:
-                resp = await client.post(
-                    f"{ollama_url}/api/chat",
-                    json={
-                        "model": model,
-                        "messages": [
-                            {
-                                "role": "system",
-                                "content": (
-                                    "你是一个专业OCR文字识别引擎。\n\n"
-                                    "规则：\n"
-                                    "1. 只输出图片中实际存在的文字\n"
-                                    "2. 中文文字直接输出纯文本\n"
-                                    "3. 数学公式用$LaTeX$行内或$$display$$块级\n"
-                                    "4. 保留原始换行和段落结构\n"
-                                    "5. 如果没有文字，返回空字符串"
-                                ),
-                            },
-                            {
-                                "role": "user",
-                                "content": "识别这张图片中的所有文字，只输出文字本身：",
-                                "images": [img_b64],
-                            },
-                        ],
-                        "stream": False,
-                        "keep_alive": keep_alive,
-                        "options": {"temperature": 0},
-                    },
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    content = (data.get("message", {}).get("content", "") or "").strip()
-                    import re as _re
-                    m = _re.search(r'[一-鿿]|\$\$?|\\\\\[', content)
-                    if m:
-                        content = content[m.start():]
-                    else:
-                        content = _re.sub(
-                            r'^[\s\n]*(?:图片[中的上].*?[：:]|识别结果[：:]|'
-                            r'OCR[识别结果]*[：:]|the (?:ocr|text|image).*?[：:])',
-                            '', content, flags=_re.IGNORECASE,
-                        )
-                    content = _re.sub(r'^[\s\n：:，,;.、]+', '', content).strip()
-                    return content
-                logger.warning("[%s] Ollama OCR HTTP %s", trace_id, resp.status_code)
-        except Exception as exc:
-            logger.warning("[%s] Ollama OCR failed: %s", trace_id, exc)
-    else:
-        rkllama_url = os.environ.get("RKLLAMA_URL", "http://rkllama:8080")
-        try:
-            async with _httpx.AsyncClient(timeout=120) as client:
-                resp = await client.post(
-                    f"{rkllama_url}/v1/ocr",
-                    json={
-                        "image": img_b64,
-                        "language": "zh",
-                        "return_formulas": False,
-                        "return_layout": False,
-                    },
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    return (data.get("text", "") or "").strip()
-                logger.warning("[%s] rkllama OCR HTTP %s", trace_id, resp.status_code)
-        except Exception as exc:
-            logger.warning("[%s] rkllama OCR failed: %s", trace_id, exc)
-
-    return ""
 
 
 def _split_image_segments(image_bytes: bytes) -> list[bytes]:
@@ -643,7 +558,7 @@ def extract_text(file_path: str | Path, *, trace_id: str = "") -> str:
       - .docx → python-docx (headings + tables)
       - .xlsx → openpyxl (GFM tables per sheet)
       - .pptx → python-pptx (slide-by-slide)
-      - .jpg/.png/… → OpenCV preprocess + LLM OCR (MiniCPM-V / rkllama)
+      - .jpg/.png/… → OpenCV preprocess + LLM OCR (Qwen2-VL / rkllama)
       - .html → multi-encoding read + XSS sanitization
       - .txt/.md/.py/… → multi-encoding read
       - .doc/.ppt/.xls/.odt/.rtf/.epub → markitdown fallback
@@ -1016,7 +931,7 @@ def _extract_pdf_figures(
     max_figures: int = 20,
 ) -> list[dict]:
     """Extract figures from a PDF via ``extract_pdf_embedded_images()`` +
-    optional MiniCPM-V structured description.
+    optional multimodal VL structured description.
 
     If a ``.exam.json`` sidecar already exists next to the PDF, its
     ``QuestionFigure`` entries are reused instead of re-running the LLM.
@@ -1063,8 +978,17 @@ def _extract_pdf_figures(
                 logger.warning("[%s] LLM OCR failed for PDF figure %d: %s",
                                trace_id, idx, exc)
         else:
-            # Without an LLM, mark the figure exists but has no content
-            fig.ocr_text = f"[Figure {idx + 1}]"
+            # ── RapidOCR fallback (no LLM client available) ──
+            try:
+                from tutor_platform.rag.rapid_ocr import ocr_text_only
+                ocr_result = ocr_text_only(img_bytes)
+                if ocr_result:
+                    fig.ocr_text = ocr_result
+                    fig.fig_type = _infer_fig_type_from_text(ocr_result)
+            except ImportError:
+                pass
+            except Exception as exc:
+                logger.debug("[%s] RapidOCR figure fallback failed: %s", trace_id, exc)
 
         figures.append(_figure_to_dict(fig))
 
@@ -1169,6 +1093,17 @@ def _extract_office_figures(
             except Exception as exc:
                 logger.warning("[%s] Office figure OCR failed for %s img %d: %s",
                                trace_id, path.name, idx, exc)
+        else:
+            # ── RapidOCR fallback (no LLM client available) ──
+            try:
+                from tutor_platform.rag.rapid_ocr import ocr_text_only
+                ocr_result = ocr_text_only(img_bytes)
+                if ocr_result:
+                    fig.ocr_text = ocr_result
+            except ImportError:
+                pass
+            except Exception as exc:
+                logger.debug("[%s] RapidOCR figure fallback failed: %s", trace_id, exc)
 
         figures.append(_figure_to_dict(fig))
 

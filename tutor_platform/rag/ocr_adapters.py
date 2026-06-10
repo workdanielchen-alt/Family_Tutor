@@ -1,4 +1,4 @@
-"""OCR adapters for pymupdf4llm — plug MiniCPM-V into the hybrid OCR pipeline.
+"""OCR adapters for pymupdf4llm — plug multimodal VL models into the hybrid OCR pipeline.
 
 pymupdf4llm's ``to_markdown(use_ocr=True, ocr_function=...)`` auto-detects which
 pages/regions need OCR (no text layer, garbled characters, character-like vectors,
@@ -11,8 +11,8 @@ regions.  This gives us:
   * Selective OCR (only regions that actually need it → ~50% fewer calls)
   * Seamless merge of OCR'd and native text into one Markdown
 
-We provide a ``MinicpmOCRFunc`` callable that wraps the existing Ollama MiniCPM-V /
-rkllama NPU OCR infrastructure.
+We provide a ``MinicpmOCRFunc`` callable that wraps the multimodal VL OCR
+infrastructure (Qwen2-VL / rkllama NPU).
 
 Usage::
 
@@ -24,7 +24,7 @@ Usage::
         ocr_function=get_minicpm_ocr_function(trace_id="my-task"),
     )
 
-No Tesseract required — OCR runs through the same Ollama / rkllama endpoints that
+No Tesseract required — OCR runs through the same Qwen2-VL / rkllama endpoints that
 the rest of the platform already uses.
 """
 
@@ -64,11 +64,16 @@ def _run_async(coro):
 
 
 async def _ocr_pixmap_bytes(image_bytes: bytes, trace_id: str = "") -> str:
-    """OCR raw image bytes via Ollama MiniCPM-V → rkllama NPU fallback.
+    """OCR raw image bytes — RapidOCR (fast) with Qwen2-VL formula crop fallback.
 
-    Preprocessing (OpenCV deskew / denoise / CLAHE) is applied before OCR.
+    1. RapidOCR (PP-OCRv4, ~2-3s) for plain-text pages.
+    2. If formulas are detected, crop formula regions and send to Qwen2-VL.
+    3. No formulas → return RapidOCR text immediately.
+
+    Preprocessing (OpenCV resize/encode) is applied before OCR.
     Garbled output is treated as OCR failure (empty string).
     """
+    import asyncio, cv2, numpy as np
     from tutor_platform.tools.preprocess import preprocess_image_bytes
 
     # Preprocess
@@ -78,14 +83,89 @@ async def _ocr_pixmap_bytes(image_bytes: bytes, trace_id: str = "") -> str:
         logger.warning("[%s] OCR preprocess failed: %s, using raw bytes", trace_id, exc)
         processed = image_bytes
 
-    img_b64 = base64.b64encode(processed).decode("utf-8")
+    # ── Fast path: RapidOCR ──
+    try:
+        from tutor_platform.rag.rapid_ocr import (
+            ocr_image_bytes as _rapid_ocr,
+            has_formula,
+            crop_formula_regions,
+            merge_formula_lines,
+        )
 
-    # ── Route: Ollama (env OCR_PROVIDER=ollama) → rkllama (default) ──
+        loop = asyncio.get_running_loop()
+        text, boxes = await loop.run_in_executor(None, _rapid_ocr, processed)
+        if text and not has_formula(text):
+            logger.info(
+                "[%s] RapidOCR fast path: %d chars, %d lines",
+                trace_id, len(text), len(boxes),
+            )
+            return text
+
+        if text and boxes:
+            # ── Formula crops from preprocessed (600px) image ──
+            nparr = np.frombuffer(processed, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if img is not None:
+                crops = await loop.run_in_executor(
+                    None,
+                    crop_formula_regions,
+                    img,
+                    boxes,
+                    1.0,  # scale_x
+                    1.0,  # scale_y (already 600px)
+                )
+                if crops:
+                    logger.info(
+                        "[%s] Formula detected, %d crops → Qwen2-VL",
+                        trace_id, len(crops),
+                    )
+                    try:
+                        from ocr_runner import _ocr_page_qwen_formula
+                    except ImportError:
+                        _ocr_page_qwen_formula = None
+
+                    if _ocr_page_qwen_formula is not None:
+                        formula_texts: list[str] = []
+                        for crop_bytes in crops:
+                            img_b64 = base64.b64encode(crop_bytes).decode("utf-8")
+                            crop_res = await _ocr_page_qwen_formula(img_b64, trace_id)
+                            if crop_res:
+                                formula_texts.append(crop_res)
+
+                        if formula_texts:
+                            stitched = text + "\n\n[公式]\n" + "\n".join(formula_texts)
+                            return stitched
+
+            # Fall through to RapidOCR text if crop/Qwen failed → merge formula lines
+            _merged = "\n".join(merge_formula_lines(text.split("\n")))
+            _annotated = (
+                "【AI注意】以下内容由OCR识别，化学式下标可能丢失"
+                "（如H2→H₂, CuSO4→CuSO₄），请根据化学常识推断，并以原始图片为准。\n\n"
+                + _merged
+            )
+            logger.info(
+                "[%s] Formula crops failed, using RapidOCR text (%d chars) with annotations",
+                trace_id, len(_annotated),
+            )
+            return _annotated
+
+        if text:
+            logger.info(
+                "[%s] Formula detected, falling back to Qwen2-VL (%d chars)",
+                trace_id, len(text),
+            )
+    except ImportError:
+        logger.debug("[%s] rapid_ocr not available, using Qwen2-VL path", trace_id)
+    except Exception as exc:
+        logger.warning("[%s] RapidOCR fast path failed: %s", trace_id, exc)
+
+    # ── Fallback: Qwen2-VL / rkllama full-image (no crops available) ──
+    img_b64 = base64.b64encode(processed).decode("utf-8")
     provider = os.getenv("OCR_PROVIDER", "rkllama")
     async with _ocr_semaphore:
         text = ""
-        if provider == "ollama":
-            text = await _ocr_via_ollama(img_b64, trace_id)
+        if provider == "qwen2vl":
+            text = await _ocr_via_qwen2vl(img_b64, trace_id)
         else:
             text = await _ocr_via_rkllama(img_b64, trace_id)
 
@@ -94,69 +174,6 @@ async def _ocr_pixmap_bytes(image_bytes: bytes, trace_id: str = "") -> str:
         logger.warning("[%s] OCR output garbled (%d chars), treating as failure", trace_id, len(text))
         return ""
     return text
-
-
-async def _ocr_via_ollama(img_b64: str, trace_id: str) -> str:
-    """OCR via Ollama /api/chat (MiniCPM-V 4.6)."""
-    import httpx
-
-    ollama_url = os.getenv("OLLAMA_URL", "http://ollama:11434")
-    model = os.getenv("OLLAMA_OCR_MODEL", "openbmb/minicpm-v4.6:q4_K_M")
-    keep_alive = os.getenv("OLLAMA_KEEP_ALIVE", "15m")
-
-    try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post(
-                f"{ollama_url}/api/chat",
-                json={
-                    "model": model,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": (
-                                "你是一个专业OCR文字识别引擎。\n\n"
-                                "规则：\n"
-                                "1. 只输出图片中实际存在的文字——不要添加任何描述、解释或额外内容\n"
-                                "2. 中文文字直接输出纯文本（不要加$分隔符）\n"
-                                "3. 数学公式用$LaTeX$行内或$$display$$块级\n"
-                                "4. 保留原始换行和段落结构\n"
-                                "5. 如果没有文字，返回空字符串"
-                            ),
-                        },
-                        {
-                            "role": "user",
-                            "content": "识别这张图片中的所有文字，只输出文字本身：",
-                            "images": [img_b64],
-                        },
-                    ],
-                    "stream": False,
-                    "keep_alive": keep_alive,
-                    "options": {"temperature": 0},
-                },
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                content = (data.get("message", {}).get("content", "") or "").strip()
-                # Strip common MiniCPM explanation prefixes
-                import re
-                m = re.search(r'[一-鿿]|\$\$?|\\\\\[', content)
-                if m:
-                    content = content[m.start():]
-                else:
-                    content = re.sub(
-                        r'^[\s\n]*(?:图片[中的上].*?[：:]|'
-                        r'识别结果[：:]|OCR[识别结果]*[：:]|'
-                        r'the (?:ocr|text|image).*?[：:])',
-                        '',
-                        content,
-                        flags=re.IGNORECASE,
-                    )
-                content = re.sub(r'^[\s\n：:，,;.、]+', '', content).strip()
-                return content
-            logger.warning("[%s] Ollama OCR returned HTTP %s", trace_id, resp.status_code)
-    except Exception as exc:
-        logger.warning("[%s] Ollama OCR request failed: %s", trace_id, exc)
-    return ""
 
 
 async def _ocr_via_rkllama(img_b64: str, trace_id: str) -> str:
@@ -184,6 +201,59 @@ async def _ocr_via_rkllama(img_b64: str, trace_id: str) -> str:
     return ""
 
 
+async def _ocr_via_qwen2vl(img_b64: str, trace_id: str) -> str:
+    """OCR via Qwen2-VL-2B (llama.cpp server, /v1/chat/completions).
+
+    Image already preprocessed (600px max) by preprocess_image_bytes upstream.
+    """
+    import httpx
+
+    qwen_url = os.getenv("QWEN2VL_URL", "http://qwen2vl:8081")
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(
+                f"{qwen_url}/v1/chat/completions",
+                json={
+                    "model": "qwen2-vl",
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "你是一个精通理科教材的OCR专家。请精准提取图片中的所有中文和化学方程式。化学方程式请使用标准的文本或LaTeX格式表达（如2H2+O2=2H2O）。不要输出任何坐标框，不要废话，直接输出识别结果。"
+                        },
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": f"data:image/png;base64,{img_b64}"},
+                                },
+                                {
+                                    "type": "text",
+                                    "text": "请提取本页教材的全部内容：",
+                                },
+                            ],
+                        }
+                    ],
+                    "max_tokens": 1500,
+                    "temperature": 0.1,
+                },
+                timeout=120,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                text = (data.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
+                if text:
+                    import re as _re
+                    text = _re.sub(r'\(\d+,\d+\),?\(?\d*\,?\d*\)?', '', text)
+                    text = _re.sub(r'\n{3,}', '\n\n', text).strip()
+                    logger.info("[%s] Qwen2-VL OCR returned %d chars", trace_id, len(text))
+                return text
+            logger.warning("[%s] Qwen2-VL OCR returned HTTP %s", trace_id, resp.status_code)
+    except Exception as exc:
+        logger.warning("[%s] Qwen2-VL OCR request failed: %s", trace_id, exc)
+    return ""
+
+
 def _is_garbled(text: str) -> bool:
     """Heuristic: detect likely garbled OCR output.
 
@@ -206,7 +276,7 @@ def _is_garbled(text: str) -> bool:
 # ── Public adapter class ────────────────────────────────────────────
 
 class MinicpmOCRFunc:
-    """pymupdf4llm-compatible OCR callable wrapping MiniCPM-V / rkllama.
+    """pymupdf4llm-compatible OCR callable wrapping Qwen2-VL / rkllama.
 
     Implements the ``ocr_function`` protocol::
 
@@ -217,7 +287,7 @@ class MinicpmOCRFunc:
 
     pymupdf4llm passes a ``fitz.Pixmap`` for each region that needs OCR.
     We convert it to PNG bytes, preprocess with OpenCV, and route to the
-    configured OCR backend (Ollama MiniCPM-V or rkllama NPU).
+    configured OCR backend (Qwen2-VL / rkllama NPU).
     """
 
     __slots__ = ("trace_id",)
