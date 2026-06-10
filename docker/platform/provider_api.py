@@ -2193,6 +2193,98 @@ def _infer_grade(content: str) -> str:
     return ""
 
 
+
+async def _store_figures_from_file(
+    provider,
+    file_path: str,
+    kb_name: str,
+    trace_id: str,
+) -> int:
+    """Extract figures from a document file, persist PNGs + index in ChromaDB.
+
+    Called from every ingestion path (Web UI, MCP, WeChat proxy) after text
+    ingestion to guarantee consistent figure storage regardless of entry point.
+
+    Returns the number of figures indexed in ChromaDB.
+    """
+    if not file_path or not os.path.isfile(file_path):
+        return 0
+
+    try:
+        from tutor_platform.rag.extractors import extract_figures
+        from pathlib import Path as _Path
+
+        _figures = await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: extract_figures(file_path, trace_id=trace_id),
+        )
+        if not _figures:
+            return 0
+
+        # Persist figure PNGs to .figures/ directory alongside source
+        _src = _Path(file_path)
+        _fig_dir = _src.parent / f"{_src.stem}.figures"
+        _fig_dir.mkdir(exist_ok=True)
+        _textbook = _src.stem  # e.g. "义务教育教科书·化学九年级上册"
+
+        for _f in _figures:
+            _img = _f.get("image_bytes")
+            if _img:
+                _fp = _fig_dir / f"{_f['figure_id']}.png"
+                try:
+                    _fp.write_bytes(_img)
+                    _f["image_path"] = str(_fp)
+                except OSError:
+                    pass
+            _f.pop("image_bytes", None)
+
+            # ── Enrich description with textbook context ──
+            # RapidOCR produces very short text for most figures ("口", "1", "H").
+            # Without textbook-name context, these embeddings never match
+            # long exam queries (cosine distance > 1.3).  Prepending the
+            # textbook name makes every figure findable by subject queries.
+            _ocr = (_f.get("ocr_text") or "").strip()
+            # Preserve the extractor's original caption if present, otherwise
+            # use the textbook name as a fallback caption for search context.
+            if not _f.get("caption"):
+                _f["caption"] = _textbook
+            _f["description_text"] = (
+                f"教材：{_textbook}"
+                + (f"；图中文字：{_ocr}" if _ocr and len(_ocr) > 2 else "")
+            )
+
+        # Write a sidecar listing for quick reference
+        try:
+            import json as _json
+            _fig_list = [{
+                "figure_id": f["figure_id"],
+                "fig_type": f["fig_type"],
+                "caption": f.get("caption", ""),
+                "description_text": f.get("description_text", ""),
+                "image_path": f.get("image_path", ""),
+            } for f in _figures]
+            (_fig_dir / "_index.json").write_text(
+                _json.dumps(_fig_list, ensure_ascii=False, indent=2),
+            )
+        except Exception:
+            pass
+
+        _chroma_kb = _chromadb_kb_name(kb_name)
+        await provider.add_figures(
+            kb_name=_chroma_kb,
+            figures=_figures,
+        )
+        _with_ocr = sum(1 for f in _figures if (f.get("ocr_text") or "").strip())
+        logger.info(
+            "[%s] Figure storage: %d figures -> %s + .figures/ (%d with OCR text)",
+            trace_id, len(_figures), _chroma_kb, _with_ocr,
+        )
+        return _indexed
+    except Exception as exc:
+        logger.debug("[%s] Figure extraction skipped for %s: %s", trace_id, file_path, exc)
+        return 0
+
+
 async def _ingest_to_kb(
     provider,
     content: str,
@@ -2213,8 +2305,9 @@ async def _ingest_to_kb(
     if not content or not content.strip():
         return
 
-    # Detect subject & grade from content for metadata enrichment.
-    _detected_subject = subject or _detect_exam_subject(content)
+    # Detect subject: prefer filename-based inference (textbook names are unambiguous),
+    # fall back to keyword matching for exam/teaching content without a filename.
+    _detected_subject = subject or _subject_from_filename(filename) or _detect_exam_subject(content)
     _detected_grade = _infer_grade(content)
 
     # v3: Generate teaching summary for pedagogical value.
@@ -2333,59 +2426,8 @@ async def _ingest_to_kb(
                 pass
 
     # ── Step 3: Figure extraction + storage + disk persistence ──
-    try:
-        from tutor_platform.rag.extractors import extract_figures
-        from pathlib import Path as _Path
-
-        file_path_local = source_file_path or _get_source_path(filename, trace_id)
-        if file_path_local and os.path.isfile(file_path_local):
-            _figures = await asyncio.get_running_loop().run_in_executor(
-                None,
-                lambda: extract_figures(file_path_local, trace_id=trace_id),
-            )
-            if _figures:
-                # Persist figure PNGs to .figures/ directory alongside source
-                _src = _Path(file_path_local)
-                _fig_dir = _src.parent / f"{_src.stem}.figures"
-                _fig_dir.mkdir(exist_ok=True)
-                for _f in _figures:
-                    _img = _f.get("image_bytes")
-                    if _img:
-                        _fp = _fig_dir / f"{_f['figure_id']}.png"
-                        try:
-                            _fp.write_bytes(_img)
-                            _f["image_path"] = str(_fp)
-                        except OSError:
-                            pass
-                    _f.pop("image_bytes", None)
-
-                # Also write a sidecar listing for quick reference
-                try:
-                    import json as _json
-                    _fig_list = [{
-                        "figure_id": f["figure_id"],
-                        "fig_type": f["fig_type"],
-                        "fig_type": f["fig_type"],
-                        "caption": f.get("caption", ""),
-                        "description_text": f.get("description_text", ""),
-                        "image_path": f.get("image_path", ""),
-                    } for f in _figures]
-                    (_fig_dir / "_index.json").write_text(
-                        _json.dumps(_fig_list, ensure_ascii=False, indent=2),
-                    )
-                except Exception:
-                    pass
-
-                await provider.add_figures(
-                    kb_name=_chroma_kb,
-                    figures=_figures,
-                )
-                logger.info(
-                    "[%s] Figure storage: %d figures -> %s + .figures/",
-                    trace_id, len(_figures), _chroma_kb,
-                )
-    except Exception as exc:
-        logger.debug("[%s] Figure extraction skipped: %s", trace_id, exc)
+    _fig_path = source_file_path or _get_source_path(filename, trace_id)
+    await _store_figures_from_file(provider, _fig_path, kb_name, trace_id)
 
 
 def _get_source_path(filename: str, trace_id: str) -> str:
@@ -2503,7 +2545,7 @@ async def _maybe_ingest_result(
         docs = _split_content_for_ingest(content, filename)
         ids = [f"{_content_hash}_{i}" for i in range(len(docs))]
         _chroma_kb = _chromadb_kb_name(kb_name)
-        _detected_subject = _detect_exam_subject(content)
+        _detected_subject = _subject_from_filename(filename) or _detect_exam_subject(content)
         _detected_grade = _infer_grade(content)
         metadatas = [
             {
@@ -2528,6 +2570,9 @@ async def _maybe_ingest_result(
             "[%s] Ingest ChromaDB-only: %d chunks -> %s (source=%s)",
             trace_id, len(docs), kb_name, source,
         )
+
+        # ── Figure extraction: always run regardless of OCR/text route ──
+        await _store_figures_from_file(provider, source_file_path, kb_name, trace_id)
 
 
 async def _generate_teaching_summary(
@@ -3807,6 +3852,33 @@ def _html_escape(s: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+_SUSPICIOUS_FILENAME_PATTERNS = re.compile(
+    r"^(test|untitled|未命名|新建|tmp|temp|sample|demo)[_\-.0-9]",
+    re.IGNORECASE,
+)
+
+
+def _reject_suspicious_filename(filename: str, size: int) -> str:
+    """Return a rejection reason if the filename looks like test/garbage data.
+
+    Only applied at KB intake endpoints — WeChat/teaching uploads are not gated here.
+    """
+    if not filename:
+        return "empty filename"
+
+    _ext = os.path.splitext(filename)[1].lower()
+
+    # Obvious test / temp filenames (skip .txt — could be legitimate notes)
+    if _ext != ".txt" and _SUSPICIOUS_FILENAME_PATTERNS.search(filename.strip()):
+        return f"test/temp filename not allowed in knowledge base: {filename}"
+
+    # Suspiciously small files (< 50 bytes) that aren't plain-text formats
+    if size < 50 and _ext not in {".txt", ".md", ".csv", ".json", ".yaml", ".yml"}:
+        return f"file too small for knowledge base ({size}B): {filename}"
+
+    return ""
+
+
 async def _check_kb_exists_on_dt(kb_name: str) -> bool:
     """Verify a KB exists in DeepTutor before allowing any writes to it."""
     try:
@@ -3846,6 +3918,12 @@ async def api_kb_ingest_file(
     if not await _check_kb_exists_on_dt(kb_name):
         logger.warning("[%s] Web UI ingest blocked — KB '%s' does not exist.", trace_id, kb_name)
         return {"ok": False, "error": f"KB '{kb_name}' does not exist", "trace_id": trace_id}
+
+    # ── Gate: reject obviously test / garbage filenames ──
+    _rejection = _reject_suspicious_filename(file.filename or "", len(raw))
+    if _rejection:
+        logger.warning("[%s] KB ingest blocked — suspicious file '%s': %s", trace_id, file.filename, _rejection)
+        return {"ok": False, "error": f"Rejected: {_rejection}", "trace_id": trace_id}
 
     import tempfile
 
@@ -3925,6 +4003,10 @@ async def api_kb_ingest_file(
                 "[%s] Web UI KB ingest (ChromaDB only): %d chunks -> %s",
                 trace_id, len(docs), kb_name,
             )
+
+            # ── Figure extraction: always run regardless of OCR/text route ──
+            await _store_figures_from_file(provider, tmp_path, kb_name, trace_id)
+
         return {
             "ok": True,
             "trace_id": trace_id,
@@ -3972,6 +4054,26 @@ async def _sync_kb_from_dt(kb_name: str, trace_id: str = "") -> dict:
         file_list = raw_data if isinstance(raw_data, list) else raw_data.get("files", [])
         files = [f if isinstance(f, str) else f.get("name", "") for f in file_list]
         files = [f for f in files if f]  # filter empties
+
+        # ── Filter out extraction sidecars ──
+        # _ingest_to_kb uploads OCR text to DT as "<original>.pdf.txt" etc.
+        # These sidecars loop back into ChromaDB on the next sync, creating
+        # duplicate chunks and polluting the KB.  Only sync original documents.
+        _SIDECAR_SUFFIXES: frozenset[str] = frozenset({
+            ".pdf.txt", ".docx.txt", ".doc.txt", ".pptx.txt", ".ppt.txt",
+            ".ppsx.txt", ".xlsx.txt", ".xls.txt", ".png.txt", ".jpg.txt",
+            ".jpeg.txt", ".webp.txt", ".bmp.txt", ".htm.txt", ".html.txt",
+        })
+        _ORIGINAL_COUNT = len(files)
+        files = [
+            f for f in files
+            if not any(f.lower().endswith(sfx) for sfx in _SIDECAR_SUFFIXES)
+        ]
+        if len(files) < _ORIGINAL_COUNT:
+            logger.info(
+                "[%s] Filtered %d extraction sidecars from DT file list",
+                trace_id, _ORIGINAL_COUNT - len(files),
+            )
 
     if not files:
         return {"ok": True, "files_processed": 0, "total_chunks": 0, "trace_id": trace_id}
@@ -4218,8 +4320,21 @@ async def api_ingest_proxy(
     error = _validate_file(file.filename, len(content))
     if error:
         return {"ok": False, "error": error}
-    tool_name = request.headers.get("X-Tool-Name", "") if request else ""
+
     trace_id = _extract_trace_id(request) if request else _generate_trace_id()
+
+    # ── Gate: KB must exist in DT ──
+    if not await _check_kb_exists_on_dt(kb_name):
+        logger.warning("[%s] Ingest proxy blocked — KB '%s' does not exist.", trace_id, kb_name)
+        return {"ok": False, "error": f"KB '{kb_name}' does not exist"}
+
+    # ── Gate: reject test / garbage uploads ──
+    _rejection = _reject_suspicious_filename(file.filename or "", len(content))
+    if _rejection:
+        logger.warning("[%s] Ingest proxy blocked — suspicious file '%s': %s", trace_id, file.filename, _rejection)
+        return {"ok": False, "error": f"Rejected: {_rejection}"}
+
+    tool_name = request.headers.get("X-Tool-Name", "") if request else ""
     sources_dir = SOURCES_DIR
     os.makedirs(sources_dir, exist_ok=True)
     safe = os.path.basename(file.filename or "unknown")
@@ -4265,6 +4380,7 @@ async def api_ingest_proxy(
         learner_id=learner_id,
         source="web",
         trace_id=trace_id,
+        source_file_path=dest,
     )
     IngestStatusTracker.mark(
         trace_id,
@@ -4315,6 +4431,12 @@ async def api_create_kb_and_ingest(
         logger.warning("Ingest proxy blocked — KB '%s' does not exist.", kb_name)
         return {"ok": False, "error": f"KB '{kb_name}' does not exist"}
 
+    # ── Gate: reject test / garbage uploads ──
+    _rejection = _reject_suspicious_filename(file.filename or "", len(content))
+    if _rejection:
+        logger.warning("Ingest proxy blocked — suspicious file '%s': %s", file.filename, _rejection)
+        return {"ok": False, "error": f"Rejected: {_rejection}"}
+
     tool_name = request.headers.get("X-Tool-Name", "") if request else ""
     trace_id = _extract_trace_id(request) if request else _generate_trace_id()
     sources_dir = SOURCES_DIR
@@ -4359,6 +4481,7 @@ async def api_create_kb_and_ingest(
         learner_id=learner_id,
         source="web",
         trace_id=trace_id,
+        source_file_path=dest,
     )
     IngestStatusTracker.mark(
         trace_id,
@@ -4508,6 +4631,7 @@ async def api_process_file(request: Request):
             learner_id=learner_id,
             source="web",
             trace_id=trace_id,
+            source_file_path=file_path_ref,
         )
 
     IngestStatusTracker.mark(
@@ -4563,6 +4687,7 @@ async def api_process_file(request: Request):
                     learner_id=learner_id,
                     source="weixin",
                     trace_id=trace_id,
+                    source_file_path=file_path_ref,
                 )
             )
 
@@ -4976,6 +5101,33 @@ async def api_tutor_context(request: Request):
     return {"ok": True, "teaching_context": teaching_context, "trace_id": trace_id}
 
 
+_SUBJECT_FROM_FILENAME: dict[str, str] = {
+    "化学": "chemistry",
+    "数学": "math",
+    "物理": "physics",
+    "语文": "chinese",
+    "英语": "english",
+    "生物": "biology",
+    "地理": "geography",
+    "历史": "history",
+    "政治": "politics",
+}
+
+
+def _subject_from_filename(filename: str) -> str:
+    """Detect subject from a textbook filename (e.g. '义务教育教科书·化学九年级上册.pdf' → 'chemistry').
+
+    Much more reliable than content-based keyword matching for textbook chunks,
+    since chemistry keywords like "元素"/"反应"/"分解" appear in math/physics texts too.
+    """
+    if not filename:
+        return ""
+    for keyword, subject in _SUBJECT_FROM_FILENAME.items():
+        if keyword in filename:
+            return subject
+    return ""
+
+
 _SUBJECT_KEYWORDS = {
     "chemistry": [
         "化学", "初三化学", "初中化学", "高考化学",
@@ -5348,12 +5500,13 @@ async def _build_teaching_persona(
             for _doc_item in _kb_results:
                 _figs = _doc_item.get("figures", [])
                 for _f in _figs:
-                    _fid = _f.get("figure_id", "")
+                    _fmeta = _f.get("metadata", {}) if isinstance(_f, dict) else {}
+                    _fid = _fmeta.get("figure_id", "") or _f.get("figure_id", "")
                     if not _fid or _fid in _figures_injected:
                         continue
                     _figures_injected.add(_fid)
-                    _ftype = _f.get("fig_type", "unknown")
-                    _fdesc = _f.get("description_text", "") or _f.get("caption", "")
+                    _ftype = _fmeta.get("fig_type", "unknown") or _f.get("fig_type", "unknown")
+                    _fdesc = _f.get("content", "") or _fmeta.get("description_text", "") or _fmeta.get("caption", "")
                     # Use proxy-friendly URL (deeptutor:3782 → platform:8100)
                     _img_url = f"/api/platform/api/kb/figures/{_fid}/image?kb_name=初中教材"
                     _fig_lines.append(
@@ -5369,12 +5522,13 @@ async def _build_teaching_persona(
                     _cached = []
                     for _doc_item in _kb_results:
                         for _f in _doc_item.get("figures", []):
-                            _fid = _f.get("figure_id", "")
+                            _fmeta = _f.get("metadata", {}) if isinstance(_f, dict) else {}
+                            _fid = _fmeta.get("figure_id", "") or _f.get("figure_id", "")
                             if _fid and _fid not in {c["figure_id"] for c in _cached}:
                                 _cached.append({
                                     "figure_id": _fid,
-                                    "fig_type": _f.get("fig_type", ""),
-                                    "description_text": _f.get("description_text", ""),
+                                    "fig_type": _fmeta.get("fig_type", "") or _f.get("fig_type", ""),
+                                    "description_text": _f.get("content", "") or _fmeta.get("description_text", ""),
                                     "image_url": f"/api/platform/api/kb/figures/{_fid}/image?kb_name={kb_name}",
                                 })
                     if _cached:

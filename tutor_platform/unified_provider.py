@@ -251,10 +251,13 @@ class UnifiedLocalProvider:
                             "type": "figure",
                         })
                     # Merge figures into main result
+                    # NOTE: Figure descriptions are short (textbook name + OCR text),
+                    # so cosine distance to long exam texts is typically 1.0-1.4.
+                    # Use a relaxed threshold to catch textbook-name matches.
                     for d in docs:
                         d["figures"] = [
                             f for f in fig_docs
-                            if f["distance"] < 0.8
+                            if f["distance"] < 1.3
                         ][:3]
                 except Exception:
                     pass  # No figure collection exists yet = no figures to return
