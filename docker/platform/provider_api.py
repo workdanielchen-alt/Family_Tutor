@@ -189,8 +189,6 @@ def _hash_file(file_path: str) -> str:
 # Phase C protocol handler (e.g. student answers "B"), the cached context
 # is auto-injected so DT TutorBot has the teaching context.
 _last_tutor_context: dict[str, str] = {}
-# ── 教学图形缓存：_build_teaching_persona 注入后供 _tutor_chat_core 后处理使用 ──
-_last_teaching_figures: dict[str, list[dict]] = {}
 _MAX_CACHED_CONTEXTS = 100
 
 
@@ -2078,9 +2076,7 @@ def _ocr_output_is_garbled(text: str) -> bool:
 
 
 async def _ocr_office_images(file_path: str, ext: str, trace_id: str) -> str:
-    """Extract embedded images from an Office doc, OCR them, and save to .figures/."""
-
-    from pathlib import Path as _Path
+    """Extract embedded images from an Office doc and OCR their text content."""
 
     media_prefixes: list[str] = []
     if ext in {".docx", ".docm"}:
@@ -2119,27 +2115,6 @@ async def _ocr_office_images(file_path: str, ext: str, trace_id: str) -> str:
 
         if not all_images:
             return ""
-
-    # ── Save images to .figures/ directory ──
-    _src = _Path(file_path)
-    _fig_dir = _src.parent / f"{_src.stem}.figures"
-    _fig_dir.mkdir(exist_ok=True)
-    _saved_paths: list[str] = []
-
-    for i, img_bytes in enumerate(all_images[:100]):  # cap at 100
-        try:
-            import hashlib as _hl
-            _hash = _hl.sha256(img_bytes).hexdigest()[:12]
-            _fp = _fig_dir / f"{_hash}_{i}.png"
-            _fp.write_bytes(img_bytes)
-            _saved_paths.append(str(_fp))
-        except OSError:
-            pass
-
-    logger.info(
-        "[%s] OCR: %d images found, %d saved to %s",
-        trace_id, len(all_images), len(_saved_paths), _fig_dir,
-    )
 
     # ── OCR with RapidOCR (fast path, 2-3s per image) ──
     ocr_texts = []
@@ -2192,97 +2167,6 @@ def _infer_grade(content: str) -> str:
         return "middle"
     return ""
 
-
-
-async def _store_figures_from_file(
-    provider,
-    file_path: str,
-    kb_name: str,
-    trace_id: str,
-) -> int:
-    """Extract figures from a document file, persist PNGs + index in ChromaDB.
-
-    Called from every ingestion path (Web UI, MCP, WeChat proxy) after text
-    ingestion to guarantee consistent figure storage regardless of entry point.
-
-    Returns the number of figures indexed in ChromaDB.
-    """
-    if not file_path or not os.path.isfile(file_path):
-        return 0
-
-    try:
-        from tutor_platform.rag.extractors import extract_figures
-        from pathlib import Path as _Path
-
-        _figures = await asyncio.get_running_loop().run_in_executor(
-            None,
-            lambda: extract_figures(file_path, trace_id=trace_id),
-        )
-        if not _figures:
-            return 0
-
-        # Persist figure PNGs to .figures/ directory alongside source
-        _src = _Path(file_path)
-        _fig_dir = _src.parent / f"{_src.stem}.figures"
-        _fig_dir.mkdir(exist_ok=True)
-        _textbook = _src.stem  # e.g. "义务教育教科书·化学九年级上册"
-
-        for _f in _figures:
-            _img = _f.get("image_bytes")
-            if _img:
-                _fp = _fig_dir / f"{_f['figure_id']}.png"
-                try:
-                    _fp.write_bytes(_img)
-                    _f["image_path"] = str(_fp)
-                except OSError:
-                    pass
-            _f.pop("image_bytes", None)
-
-            # ── Enrich description with textbook context ──
-            # RapidOCR produces very short text for most figures ("口", "1", "H").
-            # Without textbook-name context, these embeddings never match
-            # long exam queries (cosine distance > 1.3).  Prepending the
-            # textbook name makes every figure findable by subject queries.
-            _ocr = (_f.get("ocr_text") or "").strip()
-            # Preserve the extractor's original caption if present, otherwise
-            # use the textbook name as a fallback caption for search context.
-            if not _f.get("caption"):
-                _f["caption"] = _textbook
-            _f["description_text"] = (
-                f"教材：{_textbook}"
-                + (f"；图中文字：{_ocr}" if _ocr and len(_ocr) > 2 else "")
-            )
-
-        # Write a sidecar listing for quick reference
-        try:
-            import json as _json
-            _fig_list = [{
-                "figure_id": f["figure_id"],
-                "fig_type": f["fig_type"],
-                "caption": f.get("caption", ""),
-                "description_text": f.get("description_text", ""),
-                "image_path": f.get("image_path", ""),
-            } for f in _figures]
-            (_fig_dir / "_index.json").write_text(
-                _json.dumps(_fig_list, ensure_ascii=False, indent=2),
-            )
-        except Exception:
-            pass
-
-        _chroma_kb = _chromadb_kb_name(kb_name)
-        await provider.add_figures(
-            kb_name=_chroma_kb,
-            figures=_figures,
-        )
-        _with_ocr = sum(1 for f in _figures if (f.get("ocr_text") or "").strip())
-        logger.info(
-            "[%s] Figure storage: %d figures -> %s + .figures/ (%d with OCR text)",
-            trace_id, len(_figures), _chroma_kb, _with_ocr,
-        )
-        return _indexed
-    except Exception as exc:
-        logger.debug("[%s] Figure extraction skipped for %s: %s", trace_id, file_path, exc)
-        return 0
 
 
 async def _ingest_to_kb(
@@ -2425,30 +2309,6 @@ async def _ingest_to_kb(
             except Exception:
                 pass
 
-    # ── Step 3: Figure extraction + storage + disk persistence ──
-    _fig_path = source_file_path or _get_source_path(filename, trace_id)
-    await _store_figures_from_file(provider, _fig_path, kb_name, trace_id)
-
-
-def _get_source_path(filename: str, trace_id: str) -> str:
-    """Try to locate the source file for figure extraction.
-
-    Looks in SOURCES_DIR for files matching the filename or trace_id.
-    """
-    import glob as _glob
-    sources_dir = os.environ.get("SOURCES_DIR", "/data/sources")
-    # Try by trace_id first
-    trace_pattern = os.path.join(sources_dir, f"*{trace_id}*")
-    matches = _glob.glob(trace_pattern)
-    if matches:
-        return matches[0]
-    # Try by filename
-    name_pattern = os.path.join(sources_dir, "**", filename)
-    matches = _glob.glob(name_pattern, recursive=True)
-    if matches:
-        return matches[0]
-    return ""
-
 
 def _split_content_for_ingest(content: str, filename: str, chunk_size: int = 800) -> list[str]:
     """Split content into chunks for KB ingestion.
@@ -2570,9 +2430,6 @@ async def _maybe_ingest_result(
             "[%s] Ingest ChromaDB-only: %d chunks -> %s (source=%s)",
             trace_id, len(docs), kb_name, source,
         )
-
-        # ── Figure extraction: always run regardless of OCR/text route ──
-        await _store_figures_from_file(provider, source_file_path, kb_name, trace_id)
 
 
 async def _generate_teaching_summary(
@@ -3636,208 +3493,6 @@ def api_kb_search(query: str = "", kb_name: str = "初中教材", top_k: int = 5
         return {"ok": False, "error": str(e), "source": "chromadb"}
 
 
-@app.get("/api/kb/figures/search")
-def api_kb_figures_search(
-    kb_name: str = "",
-    query: str = "",
-    top_k: int = 20,
-):
-    """搜索图形 collection，返回含 image_url 的搜索结果。"""
-    if not query.strip():
-        return {"ok": False, "error": "query is required"}
-
-    # 用 provider 的内部 ChromaDB 查（避免 SharedSystemClient 冲突）
-    from tutor_platform.unified_provider import _sanitize_collection_name
-    import chromadb
-
-    fig_coll = _sanitize_collection_name(f"{kb_name}_figures") if kb_name else ""
-    if not fig_coll:
-        return {"ok": True, "results": [], "total": 0}
-
-    try:
-        client = chromadb.PersistentClient(path="/data/chromadb")
-        coll = client.get_collection(fig_coll)
-    except Exception:
-        return {"ok": True, "results": [], "total": 0}
-
-    from tutor_platform.tools.embeddings import BgeSmallEmbedding
-    try:
-        _ef = BgeSmallEmbedding()
-        _qvec = _ef([query])
-        results = coll.query(query_embeddings=_qvec, n_results=top_k)
-    except Exception:
-        return {"ok": True, "results": [], "total": 0}
-
-    docs = results.get("documents", [[]])[0] or []
-    metas = results.get("metadatas", [[]])[0] or []
-    dists = results.get("distances", [[]])[0] or []
-
-    items = []
-    for i, doc in enumerate(docs):
-        meta = metas[i] if i < len(metas) else {}
-        dist = float(dists[i]) if i < len(dists) else 1.0
-        fid = meta.get("figure_id", "")
-        items.append({
-            "figure_id": fid,
-            "fig_type": meta.get("fig_type", "unknown"),
-            "caption": meta.get("caption", ""),
-            "source_file": meta.get("source_file", ""),
-            "page_num": int(meta.get("page_num", 0)),
-            "description": (doc or "")[:300],
-            "score": round(1.0 - min(dist, 1.0), 3),
-            "image_url": f"/api/kb/figures/{fid}/image?kb_name={kb_name}" if fid else "",
-        })
-
-    return {"ok": True, "results": items, "total": len(items)}
-
-    docs = results.get("documents", [[]])[0]
-    metas = results.get("metadatas", [[]])[0] or []
-    distances = results.get("distances", [[]])[0] or []
-
-    items = []
-    for i, doc in enumerate(docs):
-        meta = metas[i] if i < len(metas) else {}
-        dist = float(distances[i]) if i < len(distances) else 1.0
-        fid = meta.get("figure_id", "")
-
-        items.append({
-            "figure_id": fid,
-            "fig_type": meta.get("fig_type", "unknown"),
-            "caption": meta.get("caption", ""),
-            "source_file": meta.get("source_file", ""),
-            "page_num": int(meta.get("page_num", 0)),
-            "description": doc[:300],
-            "score": round(1.0 - min(dist, 1.0), 3),
-            "image_url": f"/api/kb/figures/{fid}/image?kb_name={kb_name}" if fid else "",
-        })
-
-    return {"ok": True, "results": items, "total": len(items)}
-
-
-@app.get("/api/kb/figures/{figure_id}/image")
-def api_kb_figure_image(figure_id: str, kb_name: str = ""):
-    """返回图形裁剪 PNG 的二进制内容。"""
-    import glob as _glob
-
-    if not figure_id:
-        return Response(status_code=404)
-
-    # 在所有已知的 .figures 目录中搜索 figure_id.png
-    _search_roots = [
-        os.environ.get("SOURCES_DIR", "/data/sources"),
-        "/data/knowledge_bases",
-        "/data/sources",
-    ]
-
-    for _root in _search_roots:
-        if not os.path.isdir(_root):
-            continue
-        for _pattern in (f"**/*.figures/{figure_id}.png", f"**/*.figures/{figure_id}.jpg"):
-            matches = _glob.glob(os.path.join(_root, _pattern), recursive=True)
-            if matches:
-                _fp = matches[0]
-                _mt = "image/png" if _fp.endswith(".png") else f"image/{_fp.rsplit('.', 1)[-1]}"
-                return Response(
-                    content=Path(_fp).read_bytes(),
-                    media_type=_mt,
-                    headers={"Cache-Control": "public, max-age=3600"},
-                )
-
-    return Response(status_code=404)
-
-
-@app.get("/api/kb/figures/gallery")
-def api_kb_figures_gallery(kb_name: str = ""):
-    """图形浏览 HTML 页面——纯服务端渲染，直接展示所有图形缩略图。"""
-    from fastapi.responses import HTMLResponse
-
-    if not kb_name:
-        kb_name = "child_knowledge_base"
-
-    # 服务端直接查图库，避免 JS 转义问题
-    try:
-        from tutor_platform.tools.embeddings import BgeSmallEmbedding
-        import chromadb
-        from chromadb.config import Settings
-        from tutor_platform.unified_provider import _sanitize_collection_name
-
-        client = chromadb.PersistentClient(path="/data/chromadb", settings=Settings(anonymized_telemetry=False))
-        col_name = _sanitize_collection_name(f"{kb_name}_figures")
-        col = client.get_collection(col_name)
-        ef = BgeSmallEmbedding()
-        qvec = ef(["图"])
-        results = col.query(query_embeddings=qvec, n_results=100)
-    except Exception:
-        results = {"documents": [[]], "metadatas": [[]], "distances": [[]]}
-
-    docs = results.get("documents", [[]])[0] or []
-    metas = results.get("metadatas", [[]])[0] or []
-    dists = results.get("distances", [[]])[0] or []
-
-    cards_html = ""
-    if docs:
-        for i, doc in enumerate(docs):
-            meta = metas[i] if i < len(metas) else {}
-            dist = float(dists[i]) if i < len(dists) else 1.0
-            fid = meta.get("figure_id", "")
-            fig_type = meta.get("fig_type", "unknown")
-            caption = meta.get("caption", "")
-            img_url = f"/api/kb/figures/{fid}/image?kb_name={kb_name}" if fid else ""
-
-            type_label = {"geometry": "几何图", "function_graph": "函数图", "table": "表格", "illustration": "插图"}.get(fig_type, fig_type)
-            desc = (doc or "")[:200]
-
-            card = f"""<div class="card">"""
-            if img_url:
-                card += f"""<img class="card-img" src="{img_url}" loading="lazy" />"""
-            card += f"""<div class="card-body">
-        <div class="card-tags"><span class="tag">{type_label}</span></div>"""
-            if caption:
-                card += f"""<div class="card-title">{_html_escape(caption)}</div>"""
-            if desc:
-                card += f"""<div class="card-desc">{_html_escape(desc)}</div>"""
-            card += f"""<div class="card-source">{_html_escape(meta.get("source_file", "").split("/")[-1])}</div>"""
-            card += "</div></div>"
-            cards_html += card
-
-    if not cards_html:
-        body = """<div class="empty"><p>🖼️</p><p>该知识库暂无入库的图形</p></div>"""
-    else:
-        body = f"""<div class="gallery">{cards_html}</div>"""
-
-    html = f"""<!DOCTYPE html>
-<html lang="zh">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>图形浏览 - {_html_escape(kb_name)}</title>
-<style>
-  * {{margin:0;padding:0;box-sizing:border-box}}
-  body {{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#f5f5f7;color:#1d1d1f}}
-  .header {{background:#fff;border-bottom:1px solid #d2d2d7;padding:16px 24px}}
-  .header h1 {{font-size:18px;font-weight:600}}
-  .header p {{font-size:12px;color:#86868b;margin-top:2px}}
-  .gallery {{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px;padding:24px}}
-  .card {{background:#fff;border-radius:12px;overflow:hidden;border:1px solid #e8e8ed}}
-  .card-img {{width:100%;height:200px;object-fit:contain;background:#fafafa;display:block}}
-  .card-body {{padding:10px 14px 14px}}
-  .card-tags {{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px}}
-  .tag {{font-size:10px;padding:2px 8px;border-radius:10px;background:#e8f0fe;color:#0071e3;font-weight:500}}
-  .card-title {{font-size:13px;font-weight:500;margin-bottom:4px}}
-  .card-desc {{font-size:12px;color:#515154;line-height:1.5;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}}
-  .card-source {{font-size:10px;color:#86868b;margin-top:6px}}
-  .empty {{text-align:center;padding:60px 20px;color:#86868b;font-size:14px}}
-</style>
-</head>
-<body>
-<div class="header">
-  <h1>🔍 图形浏览: {_html_escape(kb_name)}</h1>
-  <p>共 {len(docs)} 个图形</p>
-</div>
-{body}
-</body>
-</html>"""
-    return HTMLResponse(html)
 
 
 def _html_escape(s: str) -> str:
@@ -4003,9 +3658,6 @@ async def api_kb_ingest_file(
                 "[%s] Web UI KB ingest (ChromaDB only): %d chunks -> %s",
                 trace_id, len(docs), kb_name,
             )
-
-            # ── Figure extraction: always run regardless of OCR/text route ──
-            await _store_figures_from_file(provider, tmp_path, kb_name, trace_id)
 
         return {
             "ok": True,
@@ -5385,10 +5037,6 @@ async def _build_teaching_persona(
 
     Pure data assembly — no HTTP calls.  The caller can cache the result and
     skip HTTP PATCH if the persona hasn't changed from the previous build.
-
-    When figure images are found in the KB search results, their URLs are
-    injected into the persona and also cached in ``_last_teaching_figures``
-    so ``_tutor_chat_core`` can append them to the teaching response.
     """
     _persona = _TEACHER_EXPLAIN_SOUL if mode == "explain" else _TEACHER_SOUL
     # Replace hint_level placeholder with current value (for Hint Ladder).
@@ -5494,10 +5142,8 @@ async def _build_teaching_persona(
         provider = await _get_provider()
         _kb_results = await provider.query(
             _chromadb_kb_name(kb_name), [_exam], n_results=10,
-            include_figures=True,
         )
         _kb_found = []
-        _figures_injected: set[str] = set()
         if _exam:
             # Pass 1: prefer teaching_summary entries matching current subject.
             for _doc_item in _kb_results:
@@ -5538,51 +5184,6 @@ async def _build_teaching_persona(
             )
             for _dc in _kb_found:
                 _persona += f"- {_dc}\n"
-
-            # ── Inject figure images referenced by knowledge chunks ──
-            _fig_lines: list[str] = []
-            for _doc_item in _kb_results:
-                _figs = _doc_item.get("figures", [])
-                for _f in _figs:
-                    _fmeta = _f.get("metadata", {}) if isinstance(_f, dict) else {}
-                    _fid = _fmeta.get("figure_id", "") or _f.get("figure_id", "")
-                    if not _fid or _fid in _figures_injected:
-                        continue
-                    _figures_injected.add(_fid)
-                    _ftype = _fmeta.get("fig_type", "unknown") or _f.get("fig_type", "unknown")
-                    _fdesc = _f.get("content", "") or _fmeta.get("description_text", "") or _fmeta.get("caption", "")
-                    # Use proxy-friendly URL (deeptutor:3782 → platform:8100)
-                    _img_url = f"/api/platform/api/kb/figures/{_fid}/image?kb_name=初中教材"
-                    _fig_lines.append(
-                        f"![{_fdesc}]({_img_url})"
-                    )
-            if _fig_lines:
-                _persona += "\n### 相关图形\n以下是与当前知识点相关的图形，可作为教学辅助：\n"
-                for _line in _fig_lines:
-                    _persona += _line + "\n"
-
-                # ── 缓存图形数据，供 _tutor_chat_core 后处理注入回复 ──
-                try:
-                    _cached = []
-                    for _doc_item in _kb_results:
-                        for _f in _doc_item.get("figures", []):
-                            _fmeta = _f.get("metadata", {}) if isinstance(_f, dict) else {}
-                            _fid = _fmeta.get("figure_id", "") or _f.get("figure_id", "")
-                            if _fid and _fid not in {c["figure_id"] for c in _cached}:
-                                _cached.append({
-                                    "figure_id": _fid,
-                                    "fig_type": _fmeta.get("fig_type", "") or _f.get("fig_type", ""),
-                                    "description_text": _f.get("content", "") or _fmeta.get("description_text", ""),
-                                    "image_url": f"/api/platform/api/kb/figures/{_fid}/image?kb_name={kb_name}",
-                                })
-                    if _cached:
-                        _last_teaching_figures[learner_id] = _cached
-                        logger.debug(
-                            "[%s] Cached %d figures for learner %s",
-                            learner_id, len(_cached), learner_id,
-                        )
-                except Exception:
-                    pass
 
     except Exception as _kb_err:
         logger.warning("KB query failed for %s: %s", learner_id, _kb_err)
@@ -8003,22 +7604,8 @@ async def _tutor_chat_core(
         except Exception as _ae:
             logger.warning("[%s] Auto-create session failed: %s", trace_id, _ae)
 
-    # ── 图形注入：将知识库中关联的图形追加到教学回复末尾 ──
-    if result.get("ok") and result.get("content"):
-        _figs = _last_teaching_figures.get(learner_id, [])
-        if _figs and _phase in ("FIRST_QUESTION", "EVALUATE_ANSWER"):
-            _fig_md_parts: list[str] = []
-            for _f in _figs[:2]:  # 最多 2 张图
-                _url = _f.get("image_url", "")
-                _desc = _f.get("description_text", "") or _f.get("fig_type", "图形")
-                if _url:
-                    _fig_md_parts.append(f"![{_desc}]({_url})")
-            if _fig_md_parts:
-                result["content"] += "\n\n" + "\n".join(_fig_md_parts)
-                logger.debug(
-                    "[%s] Injected %d figures into teaching response for %s",
-                    trace_id, len(_fig_md_parts), learner_id,
-                )
+    # ── 图形注入已移除 ── Figures are now handled by LlamaIndex ImageNode (multimodal path).
+    # _last_teaching_figures cache was used here; both removed.
 
     logger.info(
         "[%s] tutor_chat timing: bot_setup=%.2fs total=%.2fs msg=%s profile_switched=%s",
