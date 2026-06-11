@@ -7213,6 +7213,8 @@ async def _tutor_chat_core(
                     )
 
         # ── Legacy marker parsing (only when JSON eval is unavailable) ──
+        _dt_eval_result = ""
+        _dt_eval_kp = ""
         if not _json_evaluation:
             # Parse and store [ANSWER_KEY:] marker (for future use if LLM outputs it)
             _ak_m = _ANSWER_KEY_RE.search(content)
