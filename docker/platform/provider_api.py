@@ -10459,7 +10459,7 @@ async def _stream_teach_events(
         f"学生的答案：{_student}"
     )
     if _rag_text:
-        user_prompt += f"\n\n### 教材参考\n{_rag_text[:1000]}"
+        user_prompt += f"\n\n### 教材参考（已追加到回复末尾，讲解时可引用）\n{_rag_text[:1000]}"
 
     # ── SSE: 流式调 DeepSeek ──
     _full_content = ""
@@ -10501,6 +10501,10 @@ async def _stream_teach_events(
         return
 
     # ── 完成事件 ──
+    # 🆕 SSE: 追加教材参考到学生可见回复
+    if _rag_text:
+        yield _emit("content", content=f"\n\n---\n\n📖 **教材参考**\n\n{_rag_text[:1200]}")
+    
     # 从回复中解析 JSON 结构化数据
     from tutor_platform.teach_question import parse_teach_response, parse_evaluation_from_json, parse_question_from_json
     _parsed = parse_teach_response(_full_content)

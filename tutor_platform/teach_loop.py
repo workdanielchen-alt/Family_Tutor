@@ -494,6 +494,12 @@ async def _run_first_question(
         result.content = q1_text
         if guidance:
             result.content += f"\n\n{guidance}"
+        # 🆕 追加教材参考到学生可见回复
+        _kb = getattr(state, "kb_context", "")
+        if _kb:
+            result.content += (
+                f"\n\n---\n\n📖 **教材参考**\n{_kb[:1200]}"
+            )
         result.question = q1.to_dict()
         result.current = 1
         result.total_questions = state.total_questions
@@ -670,6 +676,12 @@ async def _run_evaluate_answer(
 
             result.ok = True
             result.content = _final_text
+            # 🆕 追加教材参考到学生可见回复
+            _kb = getattr(state, "kb_context", "")
+            if _kb:
+                result.content += (
+                    f"\n\n---\n\n📖 **教材参考**\n{_kb[:1200]}"
+                )
             result.hint_level = state.hint_level
 
             # 如果全部完成，附加 REVIEW 总结
@@ -744,6 +756,9 @@ async def _run_review(
     if content:
         result.ok = True
         result.content = content
+        # 🆕 追加教材参考到复习总结
+        if _kb:
+            result.content += f"\n\n---\n\n📖 **教材参考**\n{_kb[:1200]}"
         result.done = True
     else:
         result.ok = False
@@ -1163,9 +1178,7 @@ def _build_eval_context(state: TeachLoopState) -> str:
     if state.mastery_context:
         parts.append(state.mastery_context)
 
-    # 🆕 教材参考 (每题自动查询)
-    if getattr(state, "kb_context", ""):
-        parts.append(state.kb_context)
+    # KB context is appended directly to result.content — not needed in eval context
 
     return "\n\n".join(parts)
 
@@ -1223,9 +1236,10 @@ def _build_agentic_system(
     if state.mastery_context:
         system += f"\n\n{state.mastery_context}"
 
-    # 🆕 注入教材参考 (每题自动查询)
-    if getattr(state, "kb_context", ""):
-        system += f"\n\n{state.kb_context}\n\n(以上为自动查询的教材原文，可引用来辅助讲解)"
+    # 🆕 注入教材参考提示 (Kb内容已直接追加到学生可见回复)
+    _kb = getattr(state, "kb_context", "")
+    if _kb:
+        system += "\n\n## 📖 教材参考已提供\n系统已自动检索教材相关内容并追加到回复末尾。讲解时可引用教材中的知识辅助说明。"
 
 
     # 注入自适应教学指令
