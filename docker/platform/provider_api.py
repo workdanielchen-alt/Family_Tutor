@@ -6930,7 +6930,7 @@ async def _tutor_chat_core(
     #    4a. DeepSeek Direct API  (~3-5s, primary path)
     #    4b. Local NPU (rkllama)  (~10-30s, when lock available)
     #    4c. DT WebSocket path    (~30-80s, last resort)
-    _skip_ws = False
+    _skip_ws = False if not _agentic_loop_used else True
 
     # 4a. Direct DeepSeek API — fastest path, bypasses DT AgentLoop entirely.
     # Use _last_persona (built by _update_soul_with_context above) as system
