@@ -1,0 +1,57 @@
+diff --git a/deeptutor/knowledge/manager.py b/deeptutor/knowledge/manager.py
+index 31218eb1..4240fd34 100644
+--- a/deeptutor/knowledge/manager.py
++++ b/deeptutor/knowledge/manager.py
+@@ -975,8 +975,52 @@ class KnowledgeBaseManager:
+             self.config["default"] = sorted(remaining)[0] if remaining else None
+ 
+         self._save_config()
++
++        # Notify platform to clean up corresponding ChromaDB collections.
++        # Best-effort: platform may be unreachable (no-op in dev without platform).
++        logger.info("KB '%s' deleted from filesystem — notifying platform for ChromaDB cleanup", name)
++        self._notify_platform_kb_deleted(name)
++
+         return True
+ 
++    @staticmethod
++    def _platform_url() -> str | None:
++        env = os.environ.get("PLATFORM_URL") or os.environ.get("PLATFORM_API_URL") or ""
++        return env.strip().rstrip("/") or None
++
++    @classmethod
++    def _notify_platform_kb_deleted(cls, kb_name: str) -> None:
++        """Notify platform to clean up ChromaDB collections for a deleted KB.
++
++        Best-effort: failures are logged but never block deletion.
++        """
++        platform_url = cls._platform_url()
++        if not platform_url:
++            return
++        try:
++            import json as _json
++            import urllib.request as _req
++
++            cleanup_url = f"{platform_url}/api/kb/cleanup-chromadb"
++            payload = _json.dumps({"kb_name": kb_name}).encode("utf-8")
++            req = _req.Request(
++                cleanup_url,
++                data=payload,
++                headers={"Content-Type": "application/json"},
++                method="POST",
++            )
++            with _req.urlopen(req, timeout=10) as resp:
++                result = _json.loads(resp.read().decode("utf-8"))
++                deleted = result.get("deleted", [])
++                if deleted:
++                    logger.info(
++                        "Platform ChromaDB cleanup for '%s': deleted %s", kb_name, deleted
++                    )
++        except Exception as exc:
++            logger.warning(
++                "Platform ChromaDB cleanup for '%s' failed (non-fatal): %s", kb_name, exc
++            )
++
+     def clean_rag_storage(self, name: str | None = None, backup: bool = True) -> bool:
+         """
+         Clean (delete) index storage for a knowledge base.

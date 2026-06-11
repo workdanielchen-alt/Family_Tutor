@@ -4309,6 +4309,50 @@ async def api_kb_sync_from_dt(
     return await _sync_kb_from_dt(kb_name, trace_id)
 
 
+@app.post("/api/kb/cleanup-chromadb")
+async def api_kb_cleanup_chromadb(request: Request):
+    """Deeptutor 删除 KB 时回调 — 清理平台侧 ChromaDB 集合。
+
+    由 deeptutor manager.delete_knowledge_base() 在 rmtree 后调用。
+    清理目标：主集合 + figures 集合（两种命名模式都覆盖）。
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    kb_name = (body.get("kb_name") or "").strip()
+    if not kb_name:
+        raise HTTPException(status_code=400, detail="kb_name required")
+
+    from tutor_platform.unified_provider import _sanitize_collection_name
+    import chromadb as _ch
+    from chromadb.config import Settings as _CS
+
+    chroma_kb = _chromadb_kb_name(kb_name)
+    fig_via_sanitize = _sanitize_collection_name(f"{kb_name}_figures")
+    fig_via_append = f"{chroma_kb}_figures"
+
+    # Remove duplicate candidates
+    candidates = list(dict.fromkeys([chroma_kb, fig_via_sanitize, fig_via_append]))
+
+    _c = _ch.PersistentClient(
+        path="/data/chromadb",
+        settings=_CS(anonymized_telemetry=False),
+    )
+    deleted: list[str] = []
+    for name in candidates:
+        if not name or len(name) < 3:
+            continue
+        try:
+            _c.delete_collection(name)
+            deleted.append(name)
+            logger.info("ChromaDB cleanup: deleted collection '%s' (KB '%s' removed)", name, kb_name)
+        except Exception as exc:
+            logger.warning("ChromaDB cleanup: failed to delete '%s': %s", name, exc)
+
+    return {"ok": True, "kb_name": kb_name, "deleted": deleted}
+
+
 @app.post("/api/ingest/proxy/{kb_name}")
 async def api_ingest_proxy(
     kb_name: str,
