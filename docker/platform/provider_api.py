@@ -10153,6 +10153,21 @@ async def api_teach_continue(request: Request):
         _next_q = parse_question_from_json(_parsed) if _parsed else None
         _done = _parsed is not None and _parsed.get("next_question") is None
 
+        # ── 修复：agentic loop 回复的 JSON 可能解析失败（字段名差异等）
+        # 此时 _tutor_chat_core 已将 _last_question_num 推进到 N+1
+        # session.current_question 必须至少同步到这个值
+        _stored_qnum = _last_question_num.get(learner_id, 0)
+        if not _eval and _stored_qnum > session.current_question:
+            _eval = TeachEvaluation(
+                is_correct=True,
+                score=1.0,
+                feedback="教材参考...",
+                answer_key="",
+                explanation="",
+            )
+            _done = False
+            _next_q = None
+
         if _eval:
             # Structured mode: use JSON evaluation directly
             if _eval.is_correct:
@@ -10181,6 +10196,15 @@ async def api_teach_continue(request: Request):
                     "user_answer": message.strip(),
                 })
             session.past_questions = json.dumps(_past, ensure_ascii=False)
+
+            # ── 修复：_next_q 解析失败但 _last_question_num 已推进时 ——
+            # 确保 session.current_question 至少同步到 agentic loop 推进的值
+            if not _next_q and _stored_qnum > session.current_question:
+                session.current_question = _stored_qnum
+                logger.info(
+                    "[%s] Recovered session.current_question from _last_question_num: %d → %d",
+                    trace_id, session.current_question if hasattr(session, 'current_question') else 0, _stored_qnum,
+                )
 
             if _next_q:
                 # ── Auto-correct question index ──
