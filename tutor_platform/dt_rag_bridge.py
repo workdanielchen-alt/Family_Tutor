@@ -67,6 +67,7 @@ class _BgeEmbedAdapter(BaseEmbedding):
 
 
 _embed_adapter: _BgeEmbedAdapter | None = None
+_index_cache: dict[str, Any] = {}  # kb_name → loaded index
 
 
 def _get_embed_model() -> _BgeEmbedAdapter:
@@ -113,8 +114,13 @@ async def retrieve_from_dt_index(
 def _retrieve_sync(storage_dir: str, query: str, top_k: int) -> str:
     _configure_settings()
 
-    storage_context = StorageContext.from_defaults(persist_dir=storage_dir)
-    index = load_index_from_storage(storage_context)
+    # Cache the loaded index — loading from disk costs ~7s
+    kb_name = Path(storage_dir).parent.name
+    if kb_name not in _index_cache:
+        storage_context = StorageContext.from_defaults(persist_dir=storage_dir)
+        _index_cache[kb_name] = load_index_from_storage(storage_context)
+        logger.info("DT index cached: %s", kb_name)
+    index = _index_cache[kb_name]
 
     # Try hybrid (BM25 + vector), fall back to vector-only
     bm25_dir = Path(storage_dir) / "bm25_retriever"

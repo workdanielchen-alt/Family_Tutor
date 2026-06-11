@@ -473,8 +473,7 @@ async def _run_first_question(
         # 掌握度：预查第一题对应知识点的掌握情况
         await _enrich_with_mastery(state, trace_id)
 
-        # 🆕 KB 注入: 出第一题时查教材参考
-        state.kb_context = await _enrich_with_kb(state, trace_id)
+        # KB 查询推迟到 EVALUATE_ANSWER 阶段（第一题不需要教材参考就能出题）
 
         # Trace: PLAN 阶段
         _add_trace(state, "PLAN", "plan_strategy",

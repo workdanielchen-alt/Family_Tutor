@@ -290,6 +290,7 @@ def _normalize_qnum(text: str) -> str:
 # the student sends multiple messages in quick succession.
 _learner_locks: dict[str, asyncio.Lock] = {}
 _learner_locks_lock = asyncio.Lock()
+_session_processing: set[str] = set()  # session IDs currently generating first_question
 
 
 async def _get_learner_lock(learner_id: str) -> asyncio.Lock:
@@ -9863,13 +9864,14 @@ async def api_teach_start(request: Request):
         store.mark_active(consume_sid)
         logger.info("[%s] Reusing pending session %s for learner %s", trace_id, consume_sid, learner_id)
 
-        # ── Resume: if past questions exist, return cached state ──
+        # ── Already have past answers → resume ──
         _past_questions = []
         if session.past_questions:
             try:
                 _past_questions = json.loads(session.past_questions)
             except (json.JSONDecodeError, TypeError):
                 pass
+
         # ── First visit: session has V2 JSON but no past_questions yet ──
         # Return the stored question directly, don't call LLM again.
         _cached_q = None
@@ -9952,9 +9954,35 @@ async def api_teach_start(request: Request):
         )
         store.mark_active(session.session_id)
 
-        # ── Phase 3: 预提取已移至 _tutor_chat_core FIRST_QUESTION 阶段执行 ──
+        # ── Phase 3: 生成第一题 ──
+        # 防重复：同一 session 正在生成中，等待而不是重复执行
 
     try:
+        _sid = session.session_id
+        if _sid in _session_processing:
+            logger.info("[%s] Session %s already processing, waiting for existing generation", trace_id, _sid)
+            # Re-read session (may have been updated by the other request)
+            await asyncio.sleep(2)
+            _reloaded = store.get(_sid)
+            if _reloaded and _reloaded.first_question:
+                try:
+                    _cq = json.loads(_reloaded.first_question)
+                    if isinstance(_cq, dict) and "question_type" in _cq:
+                        return {
+                            "ok": True,
+                            "teach_session_id": _sid,
+                            "first_question": _cq,
+                            "total_questions": _reloaded.total_questions,
+                            "source": _source,
+                            "current": 1,
+                            "title": _title,
+                            "task_type": _task_type,
+                        }
+                except Exception:
+                    pass
+            return {"ok": False, "error": "processing", "teach_session_id": _sid, "wait": True}
+        _session_processing.add(_sid)
+
         # ── 调用 _tutor_chat_core 出第一题（传入已创建的 session_id）──
         result = await _tutor_chat_core(
             message="",
@@ -10031,6 +10059,8 @@ async def api_teach_start(request: Request):
     except Exception as exc:
         logger.error("[%s] /api/teach/start failed: %s", trace_id, exc)
         return {"ok": False, "error": f"教学启动失败: {exc}"}
+    finally:
+        _session_processing.discard(session.session_id)
 
 
 @app.post("/api/teach/continue")
