@@ -846,12 +846,17 @@ async def _enrich_with_kb(state: TeachLoopState, trace_id: str) -> str:
             _label = "扩展阅读" if state.is_correct else "精准教材参考"
             state.tool_results.append({
                 "tool": "rag_lookup",
-                "args": {"kp_id": _q.knowledge_point},
+                "args": {"kp_id": _q.knowledge_point, "label": _label},
                 "result": _kb_text[:800],
             })
             _add_trace(state, "TOOL", "rag_lookup",
-                       f"查询教材: {_q.knowledge_point} ({_label})", _kb_text[:300])
-            _kb_header = f"\n\n## 📖 教材参考 ({_label})\n{_kb_text}\n"
+                       f"📖 {_label}: {_q.knowledge_point}", _kb_text[:300])
+            _kb_header = (
+                f"\n\n## 📖 教材参考 ({_label})\n"
+                f"{_kb_text}\n\n"
+                "以上为自动检索的教材内容。讲解时请自然地引用，"
+                "如有直接引用请标注「根据教材…」。\n"
+            )
             # Store on state for prompt builders to use
             state.kb_context = _kb_header
             logger.info("[%s] KB context injected for %s (%s, %d chars)",

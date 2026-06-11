@@ -10409,7 +10409,7 @@ async def _stream_teach_events(
                     _parts.append("### 教材原文\n" + _dt_text)
                 _rag_text = "\n\n".join(_parts)
                 if _rag_text:
-                    yield _emit("tool_result", content=f"教材查询完成 ({len(_rag_text)} chars)", tool="rag_lookup")
+                    yield _emit("tool_result", content=f"教材查询完成 ({_label}, {len(_rag_text)} chars)", tool="rag_lookup", metadata={"label": _label})
         except Exception:
             pass
 
