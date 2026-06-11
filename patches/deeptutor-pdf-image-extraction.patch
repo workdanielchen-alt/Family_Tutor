@@ -1,0 +1,115 @@
+diff --git a/deeptutor/services/rag/pipelines/llamaindex/document_loader.py b/deeptutor/services/rag/pipelines/llamaindex/document_loader.py
+index 2d3323d4..5e0739bc 100644
+--- a/deeptutor/services/rag/pipelines/llamaindex/document_loader.py
++++ b/deeptutor/services/rag/pipelines/llamaindex/document_loader.py
+@@ -17,6 +17,11 @@ from deeptutor.services.rag.file_routing import FileTypeRouter
+ from deeptutor.utils.document_extractor import DocumentExtractionError, extract_text_from_path
+ from deeptutor.utils.document_validator import DocumentValidator
+ 
++try:
++    import fitz  # pymupdf
++except ImportError:  # pragma: no cover
++    fitz = None  # type: ignore[assignment]
++
+ IMAGE_DESCRIPTION_SYSTEM_PROMPT = (
+     "You describe images for a retrieval-augmented knowledge base. "
+     "Be factual, concise, and include any visible text, labels, diagrams, "
+@@ -46,6 +51,11 @@ class LlamaIndexDocumentLoader:
+             text = self._extract_parser_text(file_path)
+             self._append_if_nonempty(documents, file_path, text)
+ 
++            # Extract embedded images from PDFs
++            if file_path.suffix.lower() == ".pdf":
++                image_nodes = await self._extract_pdf_images(file_path)
++                documents.extend(image_nodes)
++
+         for file_path_str in classification.text_files:
+             file_path = Path(file_path_str)
+             self.logger.info(f"Parsing text: {file_path.name}")
+@@ -73,6 +83,86 @@ class LlamaIndexDocumentLoader:
+             self.logger.error(f"Failed to extract {file_path.name}: {exc}")
+             return ""
+ 
++    async def _extract_pdf_images(self, file_path: Path) -> list[Document]:
++        """Extract embedded images from a PDF and create Document nodes with page context.
++
++        Images are NOT written to disk — only text Document nodes are created,
++        each carrying the page number and surrounding text so the image can be
++        discovered via text search even without multimodal embedding.  The
++        original PDF + page number serve as the canonical reference.
++        """
++        if fitz is None:
++            self.logger.warning("Cannot extract PDF images: pymupdf not installed")
++            return []
++
++        nodes: list[Document] = []
++
++        try:
++            doc = fitz.open(file_path)
++        except Exception as exc:
++            self.logger.error("Failed to open PDF for image extraction: %s: %s", file_path.name, exc)
++            return []
++
++        image_count = 0
++
++        try:
++            for page_num, page in enumerate(doc, 1):
++                image_list = page.get_images(full=True)
++                if not image_list:
++                    continue
++
++                page_text = (page.get_text() or "").strip()[:300]
++
++                for img_idx, img_info in enumerate(image_list):
++                    xref = img_info[0]
++                    try:
++                        base_image = doc.extract_image(xref)
++                    except Exception:
++                        continue
++
++                    if not base_image.get("image"):
++                        continue
++
++                    image_count += 1
++
++                    text_parts = [
++                        f"[PDF Image] {file_path.name} — Page {page_num}, Image {img_idx + 1}",
++                    ]
++                    if page_text:
++                        text_parts.append(f"Surrounding text: {page_text}")
++                    text = "\n".join(text_parts)
++
++                    nodes.append(
++                        Document(
++                            text=text,
++                            metadata={
++                                "file_name": file_path.name,
++                                "file_path": str(file_path),
++                                "page_number": page_num,
++                                "image_index": img_idx + 1,
++                                "content_type": "pdf_image",
++                                "image_width": base_image.get("width"),
++                                "image_height": base_image.get("height"),
++                            },
++                        )
++                    )
++
++            doc.close()
++        except Exception as exc:
++            self.logger.error("Error extracting images from %s: %s", file_path.name, exc)
++            try:
++                doc.close()
++            except Exception:
++                pass
++
++        if image_count > 0:
++            self.logger.info(
++                "Indexed %d image context(s) from %s (no files saved to raw/)",
++                image_count,
++                file_path.name,
++            )
++        return nodes
++
+     async def _load_image_nodes(self, file_paths: list[str]) -> list[ImageNode]:
+         embedding_client = get_embedding_client()
+         llm_client = get_llm_client()

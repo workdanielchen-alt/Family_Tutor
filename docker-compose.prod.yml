@@ -69,6 +69,32 @@ services:
       start_period: 60s
 
   # ============================================
+  # rkllama — 本地 NPU LLM 推理服务 (PC 开发: STUB 模式)
+  # ============================================
+  rkllama:
+    build:
+      context: ./docker/rkllama
+      dockerfile: Dockerfile
+    image: deepseek-rkllama:latest
+    container_name: rkllama
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - RKLLM_PORT=8080
+      - RKLLM_STUB_MODE=true
+    volumes:
+      - ./data/rkllama:/app/data
+    networks:
+      - deeptutor-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ============================================
   # Qwen2-VL-2B — OCR via llama.cpp (替代 MiniCPM-V)
   # ============================================
   qwen2vl:

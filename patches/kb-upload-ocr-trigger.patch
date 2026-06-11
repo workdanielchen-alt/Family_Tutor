@@ -1,0 +1,61 @@
+diff --git a/deeptutor/api/routers/knowledge.py b/deeptutor/api/routers/knowledge.py
+index b44b9710..29af2364 100644
+--- a/deeptutor/api/routers/knowledge.py
++++ b/deeptutor/api/routers/knowledge.py
+@@ -501,6 +501,32 @@ def _matching_index_is_valid(kb_name: str, matching_version: dict | None) -> boo
+         return False
+ 
+ 
++async def _trigger_ocr_for_pdfs(task_id: str, kb_name: str, raw_dir: Path) -> None:
++    """Fire-and-forget: trigger platform OCR for all PDFs in raw_dir."""
++    try:
++        import httpx
++        supported = [f for f in Path(raw_dir).iterdir() if f.suffix.lower() == ".pdf" and f.is_file()]
++        if not supported:
++            return
++        for fp in supported:
++            try:
++                with open(fp, "rb") as fh:
++                    r = httpx.post(
++                        "http://platform:8100/api/kb/ingest-file",
++                        data={"kb_name": kb_name},
++                        files={"file": (fp.name, fh, "application/pdf")},
++                        timeout=10,
++                    )
++                if r.status_code == 200:
++                    _task_log(task_id, f"OCR triggered for {fp.name}")
++                else:
++                    _task_log(task_id, f"OCR trigger HTTP {r.status_code} for {fp.name}", level="warning")
++            except Exception as exc:
++                _task_log(task_id, f"OCR trigger failed for {fp.name}: {exc}", level="warning")
++    except Exception:
++        pass  # fire-and-forget: never crash the caller
++
++
+ async def run_initialization_task(initializer: KnowledgeBaseInitializer, task_id: str):
+     """Background task for knowledge base initialization"""
+     task_manager = TaskIDManager.get_instance()
+@@ -523,6 +549,11 @@ async def run_initialization_task(initializer: KnowledgeBaseInitializer, task_id
+             _task_log(task_id, "Finalizing initialization")
+             indexed_count = len(FileTypeRouter.collect_supported_files(initializer.raw_dir))
+ 
++            # ── OCR 补写（异步触发，不阻塞初始化）──
++            asyncio.ensure_future(_trigger_ocr_for_pdfs(
++                task_id, initializer.kb_name, initializer.raw_dir,
++            ))
++
+             initializer.progress_tracker.update(
+                 ProgressStage.COMPLETED,
+                 "Knowledge base initialization complete!",
+@@ -653,6 +684,11 @@ async def run_upload_processing_task(
+ 
+             adder.update_metadata(len(processed_files) if processed_files else 0)
+ 
++            # ── OCR 补写（异步触发，不阻塞上传后续流程）──
++            asyncio.ensure_future(_trigger_ocr_for_pdfs(
++                task_id, kb_name, Path(base_dir) / kb_name / "raw",
++            ))
++
+             if folder_id and processed_files:
+                 try:
+                     manager = get_kb_manager()
