@@ -1232,14 +1232,17 @@ def _build_agentic_system(
 
     system += label_protocol
 
-    # ── 教材参考 (每题自动查询) ──
-    # 注入系统提示供 LLM 自然引用，而非 dump 给学生
-    _kb = getattr(state, "kb_context", "")
-    if _kb:
-        system += "\n\n## 📖 教材参考资料（可引用，勿全文复制给学生）\n"
-        system += "以下是从教材中自动检索的相关内容。讲解时如涉及相关知识点，"
-        system += "请自然地引用（如「根据教材，…」），不要机械复制原文。\n\n"
-        system += _kb[:2000]
+    # ── 自适应教学 ──
+    if state.adaptive_action:
+        _action_hint = {
+            "skip_if_mastered": "该生已多次答对该知识点，掌握度>70%。简洁确认即可。但必须附带一句教材引用（如「根据教材，…」）。",
+            "needs_review": "该生已连续答错2次+，需重点巩固。基于教材内容给出正确答案并补充基础概念。",
+            "full_explain": "该生已连续答错3次+，基于教材内容直接给出完整解题过程。",
+            "more_hints": "该生掌握度低，基于教材内容给更详细的引导。",
+        }
+        _hint = _action_hint.get(state.adaptive_action, "")
+        if _hint:
+            system += "\n\n## 📋 自适应指令\n{_hint}"
 
     # ── 教学策略 ──
     if state.plan_strategy:
@@ -1249,17 +1252,15 @@ def _build_agentic_system(
     if state.mastery_context:
         system += f"\n\n{state.mastery_context}"
 
-    # ── 自适应教学 ──
-    if state.adaptive_action:
-        _action_hint = {
-            "skip_if_mastered": "该生已多次答对该知识点，掌握度>70%。如再次答对，简洁确认即可，不需展开。",
-            "needs_review": "该生已连续答错2次+，需重点巩固。给出正确答案后补充基础概念和相关例题。",
-            "full_explain": "该生已连续答错3次+，直接给出完整解题过程，不需再提问。",
-            "more_hints": "该生掌握度低，给更详细的引导和提示。",
-        }
-        _hint = _action_hint.get(state.adaptive_action, "")
-        if _hint:
-            system += f"\n\n## 📋 自适应指令\n{_hint}"
+    # ── 教材参考 (每题自动查询) ──
+    # 🔴 重要：放在系统提示最后，确保 LLM 优先阅读
+    _kb = getattr(state, "kb_context", "")
+    if _kb:
+        system += "\n\n## 📖 教材参考资料\n"
+        system += "以下是自动检索的教材相关内容。🔴 回复中必须引用教材。"
+        system += "即使「简洁确认」，也至少附带一句「根据教材，…」。"
+        system += "不要机械复制全文，自然地融入讲解中：\n\n"
+        system += _kb[:2000]
 
     return system
 
