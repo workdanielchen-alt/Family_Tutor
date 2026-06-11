@@ -200,7 +200,7 @@ index b44b9710..6a4e7780 100644
              return {
                  "message": (
 diff --git a/deeptutor/services/rag/pipelines/llamaindex/document_loader.py b/deeptutor/services/rag/pipelines/llamaindex/document_loader.py
-index 2d3323d4..1450d499 100644
+index 2d3323d4..1cb83642 100644
 --- a/deeptutor/services/rag/pipelines/llamaindex/document_loader.py
 +++ b/deeptutor/services/rag/pipelines/llamaindex/document_loader.py
 @@ -17,6 +17,11 @@ from deeptutor.services.rag.file_routing import FileTypeRouter
@@ -227,7 +227,7 @@ index 2d3323d4..1450d499 100644
          for file_path_str in classification.text_files:
              file_path = Path(file_path_str)
              self.logger.info(f"Parsing text: {file_path.name}")
-@@ -73,6 +83,90 @@ class LlamaIndexDocumentLoader:
+@@ -73,6 +83,95 @@ class LlamaIndexDocumentLoader:
              self.logger.error(f"Failed to extract {file_path.name}: {exc}")
              return ""
  
@@ -262,7 +262,10 @@ index 2d3323d4..1450d499 100644
 +
 +                page_text = (page.get_text() or "").strip()[:300]
 +
-+                # One node per page: list all image sizes found on this page
++                # One node per page: list all image sizes found on this page.
++                # Skip images smaller than 16px in either dimension — they are
++                # nearly always layout noise or 1px spacers, never meaningful
++                # textbook figures.
 +                img_infos: list[str] = []
 +                for img_idx, img_info in enumerate(image_list):
 +                    try:
@@ -270,6 +273,8 @@ index 2d3323d4..1450d499 100644
 +                        if base_image.get("image"):
 +                            w = base_image.get("width", "?")
 +                            h = base_image.get("height", "?")
++                            if (isinstance(w, int) and w < 16) or (isinstance(h, int) and h < 16):
++                                continue
 +                            img_infos.append(f"  Image {img_idx + 1}: {w}×{h}px")
 +                    except Exception:
 +                        continue
