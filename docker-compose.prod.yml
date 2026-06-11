@@ -83,6 +83,7 @@ services:
     environment:
       - RKLLM_PORT=8080
       - RKLLM_STUB_MODE=true
+      - TZ=Asia/Shanghai
     volumes:
       - ./data/rkllama:/app/data
     networks:
@@ -145,6 +146,7 @@ services:
     environment:
       - OCR_URL=http://qwen2vl:8081
       - OCR_PROVIDER=qwen2vl
+      - TZ=Asia/Shanghai
       - HERMES_CONTAINER=hermes_agent
       - HERMES_AGENT_URL=http://hermes_agent:8004
       - RKLLM_SERVER_URL=http://rkllama:8080
