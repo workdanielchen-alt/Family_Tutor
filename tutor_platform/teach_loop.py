@@ -473,6 +473,9 @@ async def _run_first_question(
         # 掌握度：预查第一题对应知识点的掌握情况
         await _enrich_with_mastery(state, trace_id)
 
+        # 🆕 KB 注入: 出第一题时查教材参考
+        state.kb_context = await _enrich_with_kb(state, trace_id)
+
         # Trace: PLAN 阶段
         _add_trace(state, "PLAN", "plan_strategy",
                    f"分析第1题 ({q1.question_type}, {q1.difficulty}, KP={q1.knowledge_point})",
@@ -581,8 +584,8 @@ async def _run_evaluate_answer(
                    f"平台判题: {_status} (得分 {state.score})",
                    f"学生答案: {state.student_answer} | 正确答案: {state.correct_answer}")
 
-    # ── Step 0.5: 答错时自动 RAG 查询教材 ──
-    await _auto_rag_if_wrong(state, trace_id)
+    # ── Step 0.5: 每题都查双库教材参考（答对给扩展，答错给精准参考）──
+    await _enrich_with_kb(state, trace_id)
 
     # ── Step 0.6: 掌握度查询 — 了解学生对当前知识点的熟练度 ──
     await _enrich_with_mastery(state, trace_id)
@@ -730,6 +733,11 @@ async def _run_review(
     if state.exam_context:
         user_prompt += f"\n试卷上下文：\n{state.exam_context[:2000]}"
 
+    # 🆕 Review 阶段也注入 KB 上下文
+    _kb = getattr(state, "kb_context", "")
+    if _kb:
+        user_prompt += f"\n\n教材参考：\n{_kb[:1500]}"
+
     content, usage = await _call_deepseek(system_prompt, user_prompt, trace_id=trace_id)
     result.usage = usage
 
@@ -796,45 +804,62 @@ def _detect_subject(kp_id: str) -> str:
     return "math"
 
 
-async def _auto_rag_if_wrong(state: TeachLoopState, trace_id: str) -> None:
-    """平台判题发现答错时，自动查询 ChromaDB 教材原文并注入工具结果。
+async def _enrich_with_kb(state: TeachLoopState, trace_id: str) -> str:
+    """每道题都查询双库教材参考 (ChromaDB + DT LlamaIndex)。
 
-    让 LLM 在评改时可以参考教材原文，减少幻觉。
-    仅在以下条件全部满足时触发：
-      1. 学生答错（state.is_correct is False）
-      2. 有预提取试卷数据（state.extracted_exam）
-      3. 当前题目有知识点 ID
+    返回格式化的 KB 文本，供注入 LLM prompt。
+    答案正确时提供扩展阅读，答错时提供精准教材参考。
     """
-    if state.is_correct is not False:
-        return
     if not state.extracted_exam:
-        return
+        return ""
 
     try:
         _q = get_question_by_index(state.extracted_exam, state.current_question)
         if not _q or not _q.knowledge_point:
-            return
+            return ""
 
         _subject = _detect_subject(_q.knowledge_point)
-        _rag_result = await rag_lookup(
+
+        # 答对时：2 条扩展阅读；答错时：5 条精准参考
+        _top_k = 2 if state.is_correct else 5
+        _chroma_result = await rag_lookup(
             kp_id=_q.knowledge_point,
             subject=_subject,
             query_text=_q.content,
         )
-        if not _rag_result:
-            return
+        # DT LlamaIndex 双库联查
+        from tutor_platform.teach_tools import rag_dt_lookup
+        _dt_result = await rag_dt_lookup(
+            kp_id=_q.knowledge_point,
+            query_text=_q.content,
+            top_k=_top_k,
+        )
 
-        state.tool_results.append({
-            "tool": "rag_lookup",
-            "args": {"kp_id": _q.knowledge_point},
-            "result": _rag_result[:500],
-        })
-        _add_trace(state, "TOOL", "rag_lookup",
-                   f"查询教材: {_q.knowledge_point}", _rag_result[:300])
-        logger.info("[%s] Auto RAG injected for %s (wrong answer)",
-                    trace_id, _q.knowledge_point)
+        _parts: list[str] = []
+        if _chroma_result:
+            _parts.append("### 教学摘要\n" + _chroma_result)
+        if _dt_result:
+            _parts.append("### 教材原文\n" + _dt_result)
+        _kb_text = "\n\n".join(_parts) if _parts else ""
+
+        if _kb_text:
+            _label = "扩展阅读" if state.is_correct else "精准教材参考"
+            state.tool_results.append({
+                "tool": "rag_lookup",
+                "args": {"kp_id": _q.knowledge_point},
+                "result": _kb_text[:800],
+            })
+            _add_trace(state, "TOOL", "rag_lookup",
+                       f"查询教材: {_q.knowledge_point} ({_label})", _kb_text[:300])
+            _kb_header = f"\n\n## 📖 教材参考 ({_label})\n{_kb_text}\n"
+            # Store on state for prompt builders to use
+            state.kb_context = _kb_header
+            logger.info("[%s] KB context injected for %s (%s, %d chars)",
+                        trace_id, _q.knowledge_point, _label, len(_kb_text))
+        return _kb_text
     except Exception as e:
-        logger.debug("[%s] Auto RAG failed (non-fatal): %s", trace_id, e)
+        logger.debug("[%s] KB enrichment failed (non-fatal): %s", trace_id, e)
+        return ""
 
 
 # ── Trace 事件辅助 ─────────────────────────────────────────────
@@ -1133,6 +1158,10 @@ def _build_eval_context(state: TeachLoopState) -> str:
     if state.mastery_context:
         parts.append(state.mastery_context)
 
+    # 🆕 教材参考 (每题自动查询)
+    if getattr(state, "kb_context", ""):
+        parts.append(state.kb_context)
+
     return "\n\n".join(parts)
 
 
@@ -1159,7 +1188,7 @@ def _build_agentic_system(
         "分析学生答案，决定需要查询什么资料或直接回复。\n\n"
         "### TOOL — 调用工具\n"
         "格式: TOOL tool_name kp_id=xxx subject=xxx\n"
-        "可用工具: rag, curriculum, review, weak_points, "
+        "可用工具: rag(教材教学摘要), rag_dt(教材PDF原文), curriculum(课程体系), review(到期复习), weak_points(薄弱点), "
         "geogebra(交互几何/函数绘图), funcplot(SVG函数图像), numberline(数轴)\n\n"
         "### FINISH — 输出最终回复\n"
         "生成评改结果和下一题，JSON 格式。\n\n"
@@ -1188,6 +1217,11 @@ def _build_agentic_system(
     # 注入掌握度信息（战略调整教学深度）
     if state.mastery_context:
         system += f"\n\n{state.mastery_context}"
+
+    # 🆕 注入教材参考 (每题自动查询)
+    if getattr(state, "kb_context", ""):
+        system += f"\n\n{state.kb_context}\n\n(以上为自动查询的教材原文，可引用来辅助讲解)"
+
 
     # 注入自适应教学指令
     if state.adaptive_action:

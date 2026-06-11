@@ -10387,19 +10387,27 @@ async def _stream_teach_events(
     else:
         yield _emit("thinking", content="未找到标准答案，交由 AI 判断")
 
-    # ── 答错时自动 RAG ──
+    # ── 每题都查教材参考（答对给扩展阅读，答错给精准参考）──
     _rag_text = ""
-    if not _is_correct and _extracted_exams.get(learner_id):
+    if _extracted_exams.get(learner_id):
         try:
             _q = get_question_by_index(_extracted_exams[learner_id], _qnum)
             if _q and _q.knowledge_point:
-                yield _emit("tool_call", content=f"查询教材: {_q.knowledge_point}", tool="rag_lookup")
-                from tutor_platform.teach_tools import rag_lookup
+                _label = "扩展阅读" if _is_correct else "精准教材参考"
+                yield _emit("tool_call", content=f"查询教材 ({_label}): {_q.knowledge_point}", tool="rag_lookup")
+                from tutor_platform.teach_tools import rag_lookup, rag_dt_lookup
                 _subject = "math"
                 if "物理" in _q.knowledge_point: _subject = "physics"
                 elif "化学" in _q.knowledge_point: _subject = "chemistry"
                 elif "英语" in _q.knowledge_point: _subject = "english"
-                _rag_text = await rag_lookup(kp_id=_q.knowledge_point, subject=_subject, query_text=_q.content)
+                _chroma_text = await rag_lookup(kp_id=_q.knowledge_point, subject=_subject, query_text=_q.content)
+                _dt_text = await rag_dt_lookup(kp_id=_q.knowledge_point, query_text=_q.content)
+                _parts = []
+                if _chroma_text:
+                    _parts.append(_chroma_text)
+                if _dt_text:
+                    _parts.append("### 教材原文\n" + _dt_text)
+                _rag_text = "\n\n".join(_parts)
                 if _rag_text:
                     yield _emit("tool_result", content=f"教材查询完成 ({len(_rag_text)} chars)", tool="rag_lookup")
         except Exception:

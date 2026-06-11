@@ -19,6 +19,101 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
+# ── 双库联查 — 同时查询平台 ChromaDB 和 DT LlamaIndex ────────────
+
+
+async def get_kb_context_for_question(
+    kp_id: str,
+    subject: str = "math",
+    query_text: str = "",
+) -> str:
+    """Return unified KB context for a single question.
+
+    Queries BOTH sources in parallel:
+      1. Platform ChromaDB (OCR teaching_summary) 
+      2. DT LlamaIndex (PDF original text + [PDF Image] nodes)
+
+    Merges results into a single formatted block suitable for LLM injection.
+    """
+    from tutor_platform.teach_tools import rag_lookup
+
+    _chroma_task = asyncio.create_task(
+        rag_lookup(kp_id=kp_id, subject=subject, query_text=query_text)
+    )
+    _dt_task = asyncio.create_task(
+        rag_dt_lookup(kp_id=kp_id, query_text=query_text)
+    )
+
+    _chroma = await _chroma_task
+    _dt = await _dt_task
+
+    if not _chroma and not _dt:
+        return ""
+
+    parts: list[str] = ["## 📖 教材参考\n"]
+    if _chroma:
+        parts.append("### 教学摘要\n" + _chroma + "\n")
+    if _dt:
+        parts.append("### 教材原文\n" + _dt + "\n")
+    return "\n".join(parts)
+
+
+async def rag_dt_lookup(
+    kp_id: str = "",
+    query_text: str = "",
+    *,
+    top_k: int = 3,
+) -> str:
+    """Query DT LlamaIndex for original PDF text + [PDF Image] nodes.
+
+    Returns formatted教材原文引用, or empty string on failure.
+    """
+    if not kp_id and not query_text:
+        return ""
+
+    try:
+        from tutor_platform.dt_rag_bridge import retrieve_from_dt_index
+
+        _kp_name = kp_id.split("/")[-1] if "/" in kp_id else kp_id
+        _search = f"{_kp_name} {query_text}".strip() or _kp_name
+
+        _default_kb = _read_dt_default_kb()
+        _text = await retrieve_from_dt_index(
+            query=_search,
+            kb_name=_default_kb,
+            top_k=top_k,
+        )
+        if not _text:
+            return ""
+        return _text
+    except Exception as exc:
+        logger.debug("rag_dt_lookup failed (non-fatal): %s", exc)
+        return ""
+
+
+_default_kb_name: str | None = None
+
+
+def _read_dt_default_kb() -> str:
+    """Read default KB name from DT config (cached per process)."""
+    global _default_kb_name
+    if _default_kb_name is not None:
+        return _default_kb_name
+
+    import urllib.request
+    dt_url = os.getenv("DEEPTUTOR_URL", "http://deeptutor:8001")
+    try:
+        with urllib.request.urlopen(
+            f"{dt_url}/api/v1/knowledge/default", timeout=5
+        ) as resp:
+            data = json.loads(resp.read().decode())
+        _default_kb_name = data.get("default_kb") or "初中教材"
+    except Exception:
+        _default_kb_name = "初中教材"
+        logger.warning("DT default KB unreachable, fallback to '%s'", _default_kb_name)
+    return _default_kb_name
+
+
 # ── RAG 查询工具 ──────────────────────────────────────────────────
 
 
@@ -470,6 +565,11 @@ async def execute_teach_tool(
         ),
         "get_review_context": lambda: get_review_context(learner_id),
         "get_weak_points_context": lambda: get_weak_points_context(learner_id),
+        # 🆕 DT LlamaIndex 原文检索
+        "rag_dt": lambda: rag_dt_lookup(
+            kp_id=kp_id,
+            query_text=query_text or question_content,
+        ),
     }
     # ── 可视化工具 (GeoGebra / 函数绘图) ──
     if tool_name == "geogebra":
@@ -485,6 +585,17 @@ async def execute_teach_tool(
     if tool_name == "numberline":
         return await generate_numberline(
             kp_id=kp_id,
+            query_text=query_text or question_content,
+        )
+    if tool_name == "rag_dt":
+        return await rag_dt_lookup(
+            kp_id=kp_id,
+            query_text=query_text or question_content,
+        )
+    if tool_name == "rag":
+        return await rag_lookup(
+            kp_id=kp_id,
+            subject=subject,
             query_text=query_text or question_content,
         )
 
