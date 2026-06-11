@@ -824,29 +824,46 @@ async def _enrich_with_kb(state: TeachLoopState, trace_id: str) -> str:
 
     返回格式化的 KB 文本，供注入 LLM prompt。
     答案正确时提供扩展阅读，答错时提供精准教材参考。
+    当 extracted_exam 不可用时，从 exam_context 中推断学科并直接搜索。
     """
-    if not state.extracted_exam:
+    _kp_id = ""
+    _subject = "math"
+    _query_text = ""
+
+    if state.extracted_exam:
+        _q = get_question_by_index(state.extracted_exam, state.current_question)
+        if _q and _q.knowledge_point:
+            _kp_id = _q.knowledge_point
+            _subject = _detect_subject(_q.knowledge_point)
+            _query_text = _q.content or ""
+            _top_k = 2 if state.is_correct else 5
+
+    # Fallback: no extracted_exam — use exam context text directly
+    if not _kp_id and state.exam_context:
+        _ctx_lower = state.exam_context.lower()
+        if "化学" in _ctx_lower:
+            _subject = "chemistry"
+        elif "物理" in _ctx_lower:
+            _subject = "physics"
+        elif "数学" in _ctx_lower:
+            _subject = "math"
+        _query_text = (state.student_message or "")[:300] or state.exam_context[:300]
+        _kp_id = f"{_subject}/auto"
+        _top_k = 3
+
+    if not _kp_id:
         return ""
 
     try:
-        _q = get_question_by_index(state.extracted_exam, state.current_question)
-        if not _q or not _q.knowledge_point:
-            return ""
-
-        _subject = _detect_subject(_q.knowledge_point)
-
-        # 答对时：2 条扩展阅读；答错时：5 条精准参考
-        _top_k = 2 if state.is_correct else 5
         _chroma_result = await rag_lookup(
-            kp_id=_q.knowledge_point,
+            kp_id=_kp_id,
             subject=_subject,
-            query_text=_q.content,
+            query_text=_query_text,
         )
-        # DT LlamaIndex 双库联查
         from tutor_platform.teach_tools import rag_dt_lookup
         _dt_result = await rag_dt_lookup(
-            kp_id=_q.knowledge_point,
-            query_text=_q.content,
+            kp_id=_kp_id,
+            query_text=_query_text,
             top_k=_top_k,
         )
 
@@ -859,13 +876,15 @@ async def _enrich_with_kb(state: TeachLoopState, trace_id: str) -> str:
 
         if _kb_text:
             _label = "扩展阅读" if state.is_correct else "精准教材参考"
+            if not state.extracted_exam:
+                _label = "教材参考"
             state.tool_results.append({
                 "tool": "rag_lookup",
-                "args": {"kp_id": _q.knowledge_point, "label": _label},
+                "args": {"kp_id": _kp_id, "label": _label},
                 "result": _kb_text[:800],
             })
             _add_trace(state, "TOOL", "rag_lookup",
-                       f"📖 {_label}: {_q.knowledge_point}", _kb_text[:300])
+                       f"📖 {_label}: {_kp_id}", _kb_text[:300])
             _kb_header = (
                 f"\n\n## 📖 教材参考 ({_label})\n"
                 f"{_kb_text}\n\n"
@@ -875,7 +894,7 @@ async def _enrich_with_kb(state: TeachLoopState, trace_id: str) -> str:
             # Store on state for prompt builders to use
             state.kb_context = _kb_header
             logger.info("[%s] KB context injected for %s (%s, %d chars)",
-                        trace_id, _q.knowledge_point, _label, len(_kb_text))
+                        trace_id, _kp_id, _label, len(_kb_text))
         return _kb_text
     except Exception as e:
         logger.debug("[%s] KB enrichment failed (non-fatal): %s", trace_id, e)
