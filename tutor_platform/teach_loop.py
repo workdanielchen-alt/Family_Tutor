@@ -494,12 +494,6 @@ async def _run_first_question(
         result.content = q1_text
         if guidance:
             result.content += f"\n\n{guidance}"
-        # 🆕 追加教材参考到学生可见回复
-        _kb = getattr(state, "kb_context", "")
-        if _kb:
-            result.content += (
-                f"\n\n---\n\n📖 **教材参考**\n{_kb[:1200]}"
-            )
         result.question = q1.to_dict()
         result.current = 1
         result.total_questions = state.total_questions
@@ -676,12 +670,6 @@ async def _run_evaluate_answer(
 
             result.ok = True
             result.content = _final_text
-            # 🆕 追加教材参考到学生可见回复
-            _kb = getattr(state, "kb_context", "")
-            if _kb:
-                result.content += (
-                    f"\n\n---\n\n📖 **教材参考**\n{_kb[:1200]}"
-                )
             result.hint_level = state.hint_level
 
             # 如果全部完成，附加 REVIEW 总结
@@ -756,9 +744,8 @@ async def _run_review(
     if content:
         result.ok = True
         result.content = content
-        # 🆕 追加教材参考到复习总结
         if _kb:
-            result.content += f"\n\n---\n\n📖 **教材参考**\n{_kb[:1200]}"
+            result.content += f"\n\n## 📖 教材参考\n{_kb[:1200]}"
         result.done = True
     else:
         result.ok = False
@@ -885,14 +872,10 @@ async def _enrich_with_kb(state: TeachLoopState, trace_id: str) -> str:
             })
             _add_trace(state, "TOOL", "rag_lookup",
                        f"📖 {_label}: {_kp_id}", _kb_text[:300])
-            _kb_header = (
-                f"\n\n## 📖 教材参考 ({_label})\n"
-                f"{_kb_text}\n\n"
-                "以上为自动检索的教材内容。讲解时请自然地引用，"
-                "如有直接引用请标注「根据教材…」。\n"
+            # Store clean KB content on state (system prompt builder uses it)
+            state.kb_context = (
+                f"### {_label}\n{_kb_text}"
             )
-            # Store on state for prompt builders to use
-            state.kb_context = _kb_header
             logger.info("[%s] KB context injected for %s (%s, %d chars)",
                         trace_id, _kp_id, _label, len(_kb_text))
         return _kb_text
@@ -1208,70 +1191,78 @@ def _build_agentic_system(
     iteration: int,
     tool_used: bool,
 ) -> str:
-    """构建 Agentic Loop 的 system prompt"""
-    system = prompts.get_phase_prompt("EVALUATE_ANSWER", "system")
-    if not system:
-        system = _build_default_eval_system(prompts)
+    """构建 Agentic Loop 的 system prompt。
 
-    # JSON schema
+    以 SOUL.md 教学人格为基础（含 KB 参考/课程大纲/掌握度/复习提醒），
+    叠加 agentic loop 的标签协议。让 LLM 在苏格拉底引导式教学中
+    自然地引用教材知识，而非机械 dump 教材原文。
+    """
+    # ── 基础人格：从 SOUL.md 中获取（_build_teaching_persona 已注入 KB 参考）──
+    _teacher_soul = prompts.get_teacher_soul("guide")
+    _base = _teacher_soul or _build_default_eval_system(prompts)
+
+    # ── JSON schema ──
+    system = _base
     json_override = prompts.get_json_schema_override()
     if json_override:
         system = json_override + "\n" + system
 
-    # 标签协议
+    # ── 标签协议 ──
     label_protocol = (
-        "\n\n# 🏷️ 标签协议（每轮必须用以下标签之一开头）\n\n"
-        "### THINK — 思考下一步\n"
-        "分析学生答案，决定需要查询什么资料或直接回复。\n\n"
-        "### TOOL — 调用工具\n"
+        "\n\n# 🏷️ 输出协议\n\n"
+        "你是一位苏格拉底式引导教师。回复第一行必须写以下标签之一：\n\n"
+        "### THINK — 思考\n"
+        "分析学生回答，判断：是否需要查教材原文来更好地解释？"
+        " 是否需要知识库来补充背景？是否需要可视化工具？\n\n"
+        "### TOOL — 查阅参考资料\n"
         "格式: TOOL tool_name kp_id=xxx subject=xxx\n"
-        "可用工具: rag(教材教学摘要), rag_dt(教材PDF原文), curriculum(课程体系), review(到期复习), weak_points(薄弱点), "
-        "geogebra(交互几何/函数绘图), funcplot(SVG函数图像), numberline(数轴)\n\n"
-        "### FINISH — 输出最终回复\n"
-        "生成评改结果和下一题，JSON 格式。\n\n"
-        "🔴 每轮只能输出一个标签。按 THINK → TOOL → FINISH 顺序推进。\n"
-        "🔴 如果上一轮已调用过 TOOL，本轮必须输出 FINISH（不得重复调用工具）。\n"
-        "\n📐 可视化工具使用提示:\n"
-        "- geogebra: 二次/一次/反比例函数图像、三角形、圆、勾股定理等几何图形\n"
-        "- funcplot: 函数曲线 SVG 图（y=x^2, y=2x+1, y=sin(x) 等）\n"
-        "- numberline: 数轴标点、不等式解集、区间可视化\n"
+        "可用工具:\n"
+        "- rag: 教材教学摘要 (适合查概念定义/知识点说明)\n"
+        "- rag_dt: 教材PDF原文 (适合查精确公式/图表)\n"
+        "- curriculum: 课程章节大纲\n"
+        "- review: 到期复习项\n"
+        "- weak_points: 薄弱知识点\n"
+        "- geogebra/funcplot/numberline: 可视化数学工具\n\n"
+        "### FINISH — 给出教学回复\n"
+        "JSON 格式，含评改结果和下题。引用教材时自然融入，如「根据教材…」。\n\n"
+        "🔴 每轮一个标签。THINK→TOOL→FINISH 序。TOOL 后必 FINISH。\n"
+        "🔴 当教材参考中已有该知识点的教学摘要时，优先用摘要讲解；\n"
+        "   如需精确公式或原图，再调用 rag_dt 查 PDF 原文。\n"
     )
 
-    # 如果已用过工具，提示直接 FINISH
     if tool_used:
-        label_protocol += "\n## ⚠️ 已调用过工具，本轮必须直接输出 FINISH\n"
+        label_protocol += "\n## ⚠️ 已调用工具，本轮必须直接输出 FINISH\n"
 
     system += label_protocol
 
-    # 注入教学策略
+    # ── 教材参考 (每题自动查询) ──
+    # 注入系统提示供 LLM 自然引用，而非 dump 给学生
+    _kb = getattr(state, "kb_context", "")
+    if _kb:
+        system += "\n\n## 📖 教材参考资料（可引用，勿全文复制给学生）\n"
+        system += "以下是从教材中自动检索的相关内容。讲解时如涉及相关知识点，"
+        system += "请自然地引用（如「根据教材，…」），不要机械复制原文。\n\n"
+        system += _kb[:2000]
+
+    # ── 教学策略 ──
     if state.plan_strategy:
         system += f"\n\n## 当前教学策略: {state.plan_strategy}"
 
-    # 注入试卷上下文（如果还有效）
-    if state.exam_context and state.phase == TeachPhase.FIRST_QUESTION:
-        system += f"\n\n### 试卷上下文\n{state.exam_context[:3000]}"
-
-    # 注入掌握度信息（战略调整教学深度）
+    # ── 掌握度 ──
     if state.mastery_context:
         system += f"\n\n{state.mastery_context}"
 
-    # 🆕 注入教材参考提示 (Kb内容已直接追加到学生可见回复)
-    _kb = getattr(state, "kb_context", "")
-    if _kb:
-        system += "\n\n## 📖 教材参考已提供\n系统已自动检索教材相关内容并追加到回复末尾。讲解时可引用教材中的知识辅助说明。"
-
-
-    # 注入自适应教学指令
+    # ── 自适应教学 ──
     if state.adaptive_action:
         _action_hint = {
-            "skip_if_mastered": "该生已连续多次答对该知识点题目，掌握度超过70%。如再次答对，请直接跳过详细的引导步骤，用简洁方式确认即可。",
-            "needs_review": "该生已连续答错2次以上，需要重点巩固。在给出正确答案后，请额外补充基础概念讲解和相关例题。",
-            "full_explain": "该生已连续答错3次以上，不需要再提问引导。请直接给出完整的解题过程和正确答案。",
-            "more_hints": "该生在此知识点上掌握度较低，请给出更详细的引导和提示。",
+            "skip_if_mastered": "该生已多次答对该知识点，掌握度>70%。如再次答对，简洁确认即可，不需展开。",
+            "needs_review": "该生已连续答错2次+，需重点巩固。给出正确答案后补充基础概念和相关例题。",
+            "full_explain": "该生已连续答错3次+，直接给出完整解题过程，不需再提问。",
+            "more_hints": "该生掌握度低，给更详细的引导和提示。",
         }
         _hint = _action_hint.get(state.adaptive_action, "")
         if _hint:
-            system += f"\n\n## 📋 自适应教学指令\n{_hint}"
+            system += f"\n\n## 📋 自适应指令\n{_hint}"
 
     return system
 
