@@ -89,7 +89,7 @@ enabled = true   # language server tools; servers launch lazily when used
 # Rules are "Tool" or "Tool(specifier)"; e.g. Bash(go test:*), Edit(src/**).
 mode  = "ask"
 # deny = ["Bash(rm -rf*)", "Bash(git push*)"]   # hard-blocked in every mode
-allow = ["Bash(docker logs deeptutor --tail 40 2>&1)"]
+allow = ["Bash(docker logs deeptutor --tail 40 2>&1)", "Bash(docker restart deeptutor && sleep 12 && echo \"=== 测试1: 全部已索引 → 应跳过 ===\" && curl -s -X POST \"http://localhost:3782/api/v1/knowledge/%E5%88%9D%E4%B8%AD%E6%95%99%E6%9D%90/reindex\" -H \"Content-Type: application/json\" 2>&1)"]
 # ask = ["Edit(src/**)"]   # force a prompt even if otherwise allowed
 
 [sandbox]

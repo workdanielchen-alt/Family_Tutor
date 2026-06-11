@@ -1,5 +1,206 @@
+diff --git a/deeptutor/api/routers/knowledge.py b/deeptutor/api/routers/knowledge.py
+index b44b9710..6a4e7780 100644
+--- a/deeptutor/api/routers/knowledge.py
++++ b/deeptutor/api/routers/knowledge.py
+@@ -1314,6 +1314,68 @@ async def run_reindex_task(kb_name: str, base_dir: str, task_id: str, signature_
+ 
+             rag_service = RAGService(kb_base_dir=str(base_path), provider=DEFAULT_PROVIDER)
+ 
++            # ── 去重：计算 SHA256，跳过已索引的文件 ──
++            import hashlib as _hl
++
++            metadata_file = kb_dir / "metadata.json"
++            metadata: dict = {}
++            if metadata_file.exists():
++                try:
++                    with open(metadata_file, encoding="utf-8") as handle:
++                        metadata = json.load(handle) if isinstance(json.load(handle), dict) else {}
++                except Exception:
++                    metadata = {}
++            # Re-read for the dict
++            if metadata_file.exists():
++                try:
++                    with open(metadata_file, encoding="utf-8") as handle:
++                        metadata = json.load(handle)
++                except Exception:
++                    pass
++            done_hashes: dict[str, str] = metadata.get("file_hashes", {})
++
++            _all = sorted(file_paths)
++            _new: list[str] = []
++            _skipped = 0
++            for _fp in _all:
++                _h = _hl.sha256(Path(_fp).read_bytes()).hexdigest()
++                if _h in done_hashes.values():
++                    _skipped += 1
++                    _task_log(task_id, f"Skipping '{Path(_fp).name}' (content unchanged, already indexed)")
++                    continue
++                _new.append(_fp)
++
++            if _skipped:
++                _task_log(
++                    task_id,
++                    f"Skipped {_skipped} unchanged file(s), {len(_new)} new/changed file(s) to index",
++                )
++
++            if not _new:
++                _task_log(task_id, "All files already indexed — nothing to do", level="success")
++                completed_at = datetime.now().isoformat()
++                metadata["last_updated"] = completed_at
++                metadata["last_indexed_at"] = completed_at
++                metadata["last_indexed_action"] = "reindex"
++                metadata["last_indexed_count"] = len(file_paths)
++                with open(metadata_file, "w", encoding="utf-8") as handle:
++                    json.dump(metadata, handle, indent=2, ensure_ascii=False)
++                progress_tracker.update(
++                    ProgressStage.COMPLETED,
++                    "All files already indexed",
++                    current=len(file_paths),
++                    total=len(file_paths),
++                    indexed_count=len(file_paths),
++                    index_changed=False,
++                    index_action="reindex",
++                )
++                task_manager.update_task_status(task_id, "completed")
++                task_stream_manager.emit_complete(task_id, f"All files already indexed in '{kb_name}'")
++                return
++
++            # ── 重建索引：逐本处理，每本完成后即时 checkpoint ──
++            # 如果 version-1 已存在(上次部分完成)，走增量 add_documents
++            # 否则先 initialize 第一本创建索引。
+             def _on_progress(batch_num: int, total_batches: int) -> None:
+                 progress_tracker.update(
+                     ProgressStage.PROCESSING_DOCUMENTS,
+@@ -1322,19 +1384,98 @@ async def run_reindex_task(kb_name: str, base_dir: str, task_id: str, signature_
+                     total=total_batches,
+                 )
+ 
+-            # The pipeline now raises the underlying error (embedding API
+-            # failure, parse error, etc.) so it surfaces in the task log
+-            # rather than being swallowed into a generic wrapper. A False
+-            # return is reserved for "no documents to index" — surface that
+-            # specifically too.
+-            success = await rag_service.initialize(
+-                kb_name=kb_name,
+-                file_paths=file_paths,
+-                progress_callback=_on_progress,
++            def _checkpoint(filename: str) -> None:
++                """Save this file's hash to metadata so restarts skip it."""
++                _ph = Path(filename)
++                _h = _hl.sha256(_ph.read_bytes()).hexdigest()
++                if metadata_file.exists():
++                    try:
++                        with open(metadata_file, encoding="utf-8") as handle:
++                            _md = json.load(handle)
++                    except Exception:
++                        _md = {}
++                else:
++                    _md = {}
++                _md.setdefault("file_hashes", {})[_ph.name] = _h
++                with open(metadata_file, "w", encoding="utf-8") as handle:
++                    json.dump(_md, handle, indent=2, ensure_ascii=False)
++
++            from deeptutor.services.rag.index_versioning import VERSION_PREFIX
++
++            _version_dirs = sorted(
++                p for p in kb_dir.iterdir()
++                if p.is_dir() and p.name.startswith(VERSION_PREFIX)
+             )
+-            if not success:
+-                raise RuntimeError(f"Re-index found no valid documents to index in '{kb_name}'.")
++            _has_existing_index = bool(_version_dirs)
++
++            if _has_existing_index:
++                # Partial reindex — add remaining files incrementally.
++                _task_log(task_id, f"Existing index found, adding {len(_new)} file(s) incrementally...")
++                for _idx, _fp in enumerate(_new, 1):
++                    _task_log(
++                        task_id,
++                        f"Adding '{Path(_fp).name}' ({_idx}/{len(_new)})...",
++                    )
++                    progress_tracker.update(
++                        ProgressStage.PROCESSING_DOCUMENTS,
++                        f"Indexing {Path(_fp).name} ({_idx}/{len(_new)})...",
++                        current=_idx + _skipped,
++                        total=len(file_paths),
++                    )
++                    await rag_service.add_documents(
++                        kb_name=kb_name,
++                        file_paths=[_fp],
++                    )
++                    _checkpoint(_fp)
++            else:
++                # Fresh rebuild — reset file_hashes since old hashes map to a
++                # now-deleted index version. Everything in raw/ must be re-ingested.
++                if done_hashes:
++                    _task_log(task_id, f"Clearing {len(done_hashes)} stale file hash(es) from previous index")
++                    if metadata_file.exists():
++                        try:
++                            with open(metadata_file, encoding="utf-8") as handle:
++                                _md = json.load(handle)
++                        except Exception:
++                            _md = {}
++                    else:
++                        _md = {}
++                    _md.pop("file_hashes", None)
++                    with open(metadata_file, "w", encoding="utf-8") as handle:
++                        json.dump(_md, handle, indent=2, ensure_ascii=False)
++                    # Re-collect: all files are now "new"
++                    _new = sorted(file_paths)
++                    _skipped = 0
++
++                _first, *_rest = _new
++                _task_log(task_id, f"Initializing index with '{Path(_first).name}'...")
++                success = await rag_service.initialize(
++                    kb_name=kb_name,
++                    file_paths=[_first],
++                    progress_callback=_on_progress,
++                )
++                if not success:
++                    raise RuntimeError(f"Re-index: failed to initialize with '{Path(_first).name}'")
++                _checkpoint(_first)
+ 
++                for _idx, _fp in enumerate(_rest, 2):
++                    _task_log(
++                        task_id,
++                        f"Adding '{Path(_fp).name}' ({_idx}/{len(_new)}; {_idx + _skipped}/{len(file_paths)} total)...",
++                    )
++                    progress_tracker.update(
++                        ProgressStage.PROCESSING_DOCUMENTS,
++                        f"Indexing {Path(_fp).name} ({_idx}/{len(_new)})...",
++                        current=_idx + _skipped,
++                        total=len(file_paths),
++                    )
++                    await rag_service.add_documents(
++                        kb_name=kb_name,
++                        file_paths=[_fp],
++                    )
++                    _checkpoint(_fp)
++
++            # ── 最终写入 metadata ──
+             completed_at = datetime.now().isoformat()
+             metadata_file = kb_dir / "metadata.json"
+             try:
+@@ -1443,11 +1584,17 @@ async def reindex_knowledge_base(
+         kb_dir = kb_base_dir / kb_name
+         matching_version = find_matching_version(kb_dir, signature)
+         matching_valid = _matching_index_is_valid(kb_name, matching_version)
++
++        # If a matching version exists but metadata tracks fewer files than
++        # raw/ actually contains, the index is incomplete (e.g. reindex was
++        # interrupted). Force a reindex so the pending files are ingested.
++        _raw_count = len(FileTypeRouter.collect_supported_files(kb_dir / "raw"))
+         if (
+             matching_version
+             and matching_version.get("layout") == "flat"
+             and matching_valid
+             and not force_reindex
++            and _raw_count == kb_entry.get("last_indexed_count", 0)
+         ):
+             return {
+                 "message": (
 diff --git a/deeptutor/services/rag/pipelines/llamaindex/document_loader.py b/deeptutor/services/rag/pipelines/llamaindex/document_loader.py
-index 2d3323d4..5e0739bc 100644
+index 2d3323d4..1450d499 100644
 --- a/deeptutor/services/rag/pipelines/llamaindex/document_loader.py
 +++ b/deeptutor/services/rag/pipelines/llamaindex/document_loader.py
 @@ -17,6 +17,11 @@ from deeptutor.services.rag.file_routing import FileTypeRouter
@@ -26,7 +227,7 @@ index 2d3323d4..5e0739bc 100644
          for file_path_str in classification.text_files:
              file_path = Path(file_path_str)
              self.logger.info(f"Parsing text: {file_path.name}")
-@@ -73,6 +83,86 @@ class LlamaIndexDocumentLoader:
+@@ -73,6 +83,90 @@ class LlamaIndexDocumentLoader:
              self.logger.error(f"Failed to extract {file_path.name}: {exc}")
              return ""
  
@@ -37,6 +238,9 @@ index 2d3323d4..5e0739bc 100644
 +        each carrying the page number and surrounding text so the image can be
 +        discovered via text search even without multimodal embedding.  The
 +        original PDF + page number serve as the canonical reference.
++
++        All images on the same page are aggregated into a single node to keep
++        the embedding batch size manageable for large textbooks.
 +        """
 +        if fitz is None:
 +            self.logger.warning("Cannot extract PDF images: pymupdf not installed")
@@ -50,8 +254,6 @@ index 2d3323d4..5e0739bc 100644
 +            self.logger.error("Failed to open PDF for image extraction: %s: %s", file_path.name, exc)
 +            return []
 +
-+        image_count = 0
-+
 +        try:
 +            for page_num, page in enumerate(doc, 1):
 +                image_list = page.get_images(full=True)
@@ -60,39 +262,42 @@ index 2d3323d4..5e0739bc 100644
 +
 +                page_text = (page.get_text() or "").strip()[:300]
 +
++                # One node per page: list all image sizes found on this page
++                img_infos: list[str] = []
 +                for img_idx, img_info in enumerate(image_list):
-+                    xref = img_info[0]
 +                    try:
-+                        base_image = doc.extract_image(xref)
++                        base_image = doc.extract_image(img_info[0])
++                        if base_image.get("image"):
++                            w = base_image.get("width", "?")
++                            h = base_image.get("height", "?")
++                            img_infos.append(f"  Image {img_idx + 1}: {w}×{h}px")
 +                    except Exception:
 +                        continue
 +
-+                    if not base_image.get("image"):
-+                        continue
++                if not img_infos:
++                    continue
 +
-+                    image_count += 1
++                text_parts = [
++                    f"[PDF Image] {file_path.name} — Page {page_num}, {len(img_infos)} image(s)",
++                ]
++                if page_text:
++                    text_parts.append(f"Surrounding text: {page_text}")
++                text_parts.append("Image details:")
++                text_parts.extend(img_infos)
++                text = "\n".join(text_parts)
 +
-+                    text_parts = [
-+                        f"[PDF Image] {file_path.name} — Page {page_num}, Image {img_idx + 1}",
-+                    ]
-+                    if page_text:
-+                        text_parts.append(f"Surrounding text: {page_text}")
-+                    text = "\n".join(text_parts)
-+
-+                    nodes.append(
-+                        Document(
-+                            text=text,
-+                            metadata={
-+                                "file_name": file_path.name,
-+                                "file_path": str(file_path),
-+                                "page_number": page_num,
-+                                "image_index": img_idx + 1,
-+                                "content_type": "pdf_image",
-+                                "image_width": base_image.get("width"),
-+                                "image_height": base_image.get("height"),
-+                            },
-+                        )
++                nodes.append(
++                    Document(
++                        text=text,
++                        metadata={
++                            "file_name": file_path.name,
++                            "file_path": str(file_path),
++                            "page_number": page_num,
++                            "image_count": len(img_infos),
++                            "content_type": "pdf_image",
++                        },
 +                    )
++                )
 +
 +            doc.close()
 +        except Exception as exc:
@@ -102,10 +307,10 @@ index 2d3323d4..5e0739bc 100644
 +            except Exception:
 +                pass
 +
-+        if image_count > 0:
++        if nodes:
 +            self.logger.info(
-+                "Indexed %d image context(s) from %s (no files saved to raw/)",
-+                image_count,
++                "Indexed %d page-image node(s) from %s (no files saved to raw/)",
++                len(nodes),
 +                file_path.name,
 +            )
 +        return nodes
