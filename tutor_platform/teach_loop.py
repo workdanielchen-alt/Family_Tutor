@@ -584,6 +584,34 @@ async def _run_evaluate_answer(
                    f"学生答案: {state.student_answer} | 正确答案: {state.correct_answer}")
 
     # ── Step 0.5: 每题都查双库教材参考（答对给扩展，答错给精准参考）──
+    # 🆕 恢复 extracted_exam: 当内存缓存未命中时从 teach session store 读取
+    if not state.extracted_exam and state.teach_session_id:
+        try:
+            import json as _json
+            _store_path = f"/data/teach_sessions/{state.teach_session_id}.json"
+            with open(_store_path) as _f:
+                _sd = _json.load(_f)
+            _ee_data = _sd.get("extracted_exam")
+            if _ee_data and _ee_data.get("questions"):
+                from tutor_platform.teach_question import TeachQuestion, ExtractedExam
+                _questions = [
+                    TeachQuestion(
+                        index=q["index"], total=_ee_data.get("total", len(_ee_data["questions"])),
+                        question_type=q.get("question_type", "short_answer"),
+                        content=q.get("content", ""),
+                        answer_key=q.get("answer_key", ""),
+                        explanation=q.get("explanation", ""),
+                        knowledge_point=q.get("knowledge_point", ""),
+                    ) for q in _ee_data["questions"]
+                ]
+                state.extracted_exam = ExtractedExam(
+                    questions=_questions,
+                    total=_ee_data.get("total", len(_questions)),
+                    raw_ocr=_sd.get("ocr_text", ""),
+                )
+        except Exception:
+            pass
+
     await _enrich_with_kb(state, trace_id)
 
     # ── Step 0.6: 掌握度查询 — 了解学生对当前知识点的熟练度 ──
@@ -831,7 +859,8 @@ async def _enrich_with_kb(state: TeachLoopState, trace_id: str) -> str:
             _subject = "physics"
         elif "数学" in _ctx_lower:
             _subject = "math"
-        _query_text = (state.student_message or "")[:300] or state.exam_context[:300]
+        # Use a longer chunk to catch question content, not just exam header
+        _query_text = state.exam_context[:2000]
         _kp_id = f"{_subject}/auto"
         _top_k = 3
 
