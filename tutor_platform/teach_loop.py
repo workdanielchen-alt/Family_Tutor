@@ -744,8 +744,6 @@ async def _run_review(
     if content:
         result.ok = True
         result.content = content
-        if _kb:
-            result.content += f"\n\n## 📖 教材参考\n{_kb[:1200]}"
         result.done = True
     else:
         result.ok = False
