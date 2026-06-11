@@ -12,7 +12,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -74,15 +76,43 @@ async def rag_lookup(
         return ""
 
 
+_default_kb_name: str | None = None
+
+
 def _subject_to_kb(subject: str) -> str:
-    """学科名 → ChromaDB knowledge base 名称."""
-    kb_map = {
-        "math": "math_textbook",
-        "physics": "physics_textbook",
-        "chemistry": "chemistry_textbook",
-        "english": "english_textbook",
-    }
-    return kb_map.get(subject, f"{subject}_textbook")
+    """From subject → ChromaDB collection name (same hash as _chromadb_kb_name).
+
+    Reads the default KB name from the DT knowledge system
+    (kb_config.json → defaults.default_kb) so users simply set the default
+    in the Web UI and teaching picks it up automatically.
+    """
+    import hashlib, base64, urllib.request
+
+    global _default_kb_name
+    if _default_kb_name is None:
+        dt_url = os.getenv("DEEPTUTOR_URL", "http://deeptutor:8001")
+        try:
+            with urllib.request.urlopen(
+                f"{dt_url}/api/v1/knowledge/default", timeout=5
+            ) as resp:
+                data = json.loads(resp.read().decode())
+            _default_kb_name = data.get("default_kb") or "初中教材"
+        except Exception:
+            _default_kb_name = "初中教材"
+            logger.warning(
+                "DT default KB unreachable, fallback to '%s'", _default_kb_name,
+            )
+
+    kb_name = _default_kb_name
+
+    # Same hash as _chromadb_kb_name
+    if all(c.isascii() and (c.isalnum() or c in "._-") for c in kb_name) and kb_name[0].isalnum():
+        return kb_name
+    safe = "".join(c if c.isascii() and (c.isalnum() or c in "._-") else "_" for c in kb_name)
+    safe = safe.strip("_")[:48] or "kb"
+    digest = hashlib.sha256(kb_name.encode()).digest()[:8]
+    suffix = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+    return f"{safe}_{suffix}"
 
 
 # ── 课程体系工具 ──────────────────────────────────────────────────
